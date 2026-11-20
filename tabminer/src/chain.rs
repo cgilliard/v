@@ -1,0 +1,754 @@
+//! The chain's proof: one proof that every block so far was proven.
+//!
+//! A **step** verifies two proofs: a block's ([`crate::block`]) and the
+//! chain's as it was before that block, and states where the chain now
+//! is ([`Statement`]). The proof before a chain's first block is of a
+//! computation that states where a chain begins ([`genesis_into`]),
+//! made to the step's own shape, so that a step verifies either with
+//! the same rows: it is the step's program for every block.
+//!
+//! # Which programs
+//!
+//! A proof is of a program, and a proof of anything else proves
+//! nothing of the chain. So a step finds:
+//!
+//! - the block's proof to be of the root program it is given, and what
+//!   that proof rested on to be the programs it is given ([`Plan`]);
+//! - the chain's proof before to be of the genesis program, if this is
+//!   the first block, or else of the program this step **names as its
+//!   own**. A program cannot hold its own root, so the step takes it as
+//!   a value, states it, and requires the step before to have stated
+//!   the same. Whoever takes a chain's proof checks that the root it
+//!   verified the proof against is the one the proof states: then every
+//!   step back to the first was of that program.
+//!
+//! - Blocks come in shapes (how many runs, with signatures or
+//!   without), each a root program of its own. A step holds the root of
+//!   a tree over the shapes it takes, and finds the block's to be a
+//!   leaf.
+//!
+//! # The emission
+//!
+//! A block's inputs and its subsidy come to its outputs
+//! ([`crate::block`]); the step finds the subsidy to be what the
+//! emission pays at the block's height. Its arithmetic has no numbers
+//! to count blocks with, so where the emission stands is carried as an
+//! era and a count of the blocks left in it, the count a power of a
+//! fixed element: a block fewer is a division by it.
+//!
+//! # Not yet here
+//!
+//! The parent's work, and names.
+
+use crate::alg::{Alg, Shared, Sym, halves};
+use crate::block::{PROGRAMS, Tables};
+use crate::field::{F, as_bytes};
+use crate::hash::{DOM_PLAN_LEAF, DOM_PLAN_NODE, Digest, EMPTY, hash_domain};
+use crate::ledger::{self, Emission};
+use crate::proof::Proved;
+use crate::reading::Reader;
+
+/// What a chain's proof is of: the step's program, and where the chain
+/// is after its last block, with what that block did (for whoever has
+/// the block to compare) and where the emission stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Statement {
+    pub program: Digest,
+    pub height: u32,
+    pub root: Digest,
+    pub next: u64,
+    /// The last block's running hashes of positions spent and outputs
+    /// made, and what its inputs with its subsidy, and its outputs, came
+    /// to.
+    pub inputs: Digest,
+    pub outputs: Digest,
+    pub sum_in: u128,
+    pub sum_out: u128,
+    /// The era of the emission the last block was in (0 before the
+    /// first block, one past the last era once nothing is paid), and the
+    /// blocks left in it.
+    pub era: u32,
+    pub left: u32,
+    /// The registry's root.
+    pub names: Digest,
+    /// The id of the header before the last block's: the last header
+    /// whose work a block's proof has shown. Zeros before the first.
+    pub tip: Digest,
+}
+
+/// Elements of a [`Statement`].
+pub const STATEMENT: usize = 18;
+
+/// What counts blocks down: a block fewer is this many times less.
+const COUNT: F = F(2);
+
+fn power(mut base: F, mut e: u128) -> F {
+    let mut out = F::ONE;
+    while e > 0 {
+        if e & 1 == 1 {
+            out *= base;
+        }
+        base = base.square();
+        e >>= 1;
+    }
+    out
+}
+
+/// The polynomial through `points`, its coefficients lowest first.
+fn interpolate(points: &[(F, F)]) -> Vec<F> {
+    let mut out = vec![F::ZERO; points.len()];
+    for (i, (xi, yi)) in points.iter().enumerate() {
+        // The product of `X - x_j` over the others, over its value at x_i.
+        let mut basis = vec![F::ONE];
+        let mut at = F::ONE;
+        for (xj, _) in points.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| p) {
+            basis.push(F::ZERO);
+            for k in (1..basis.len()).rev() {
+                basis[k] = basis[k - 1] + basis[k] * *xj;
+            }
+            basis[0] *= *xj;
+            at *= *xi + *xj;
+        }
+        let scale = *yi * at.inv();
+        out.iter_mut().zip(&basis).for_each(|(o, b)| *o += scale * *b);
+    }
+    out
+}
+
+/// A polynomial at `x`, by Horner's rule.
+fn at<A: Alg>(coefficients: &[F], x: &A) -> A {
+    let mut sum = x.lift(coefficients[coefficients.len() - 1]);
+    for c in coefficients[..coefficients.len() - 1].iter().rev() {
+        sum = sum * x.clone() + x.lift(*c);
+    }
+    sum
+}
+
+/// The emission as a circuit's arithmetic follows it. It has no
+/// numbers to count with, so an era is an element, the blocks left in
+/// it a power of [`COUNT`], and what an era pays, which era is next and
+/// how long it is are polynomials in the era.
+struct Eras {
+    next: Vec<F>,
+    reset: Vec<F>,
+    pays: Vec<F>,
+}
+
+impl Eras {
+    fn of(emission: &Emission) -> Eras {
+        let n = emission.0.len();
+        let era = |i: usize| F(i as u128);
+        // Era 0 is before the first block; era `n + 1` is after the last,
+        // which is its own next and whose count never runs out.
+        let blocks = |i: usize| emission.0.get(i.wrapping_sub(1)).map(|e| e.0);
+        let pays = |i: usize| emission.0.get(i.wrapping_sub(1)).map_or(F::ZERO, |e| F(e.1 as u128));
+        let reset = |i: usize| blocks(i).map_or(F::ZERO, |b| power(COUNT, b as u128 - 1));
+        let points = |f: &dyn Fn(usize) -> F| interpolate(&(0..n + 2).map(|i| (era(i), f(i))).collect::<Vec<_>>());
+        Eras { next: points(&|i| era((i + 1).min(n + 1))), reset: points(&reset), pays: points(&pays) }
+    }
+}
+
+impl Statement {
+    /// Where a chain begins: no block, an empty state.
+    pub fn genesis() -> Statement {
+        Statement {
+            program: [0; 32],
+            height: 0,
+            root: ledger::empty_roots()[ledger::OUTPUTS_HEIGHT],
+            next: 0,
+            inputs: [0; 32],
+            outputs: [0; 32],
+            sum_in: 0,
+            sum_out: 0,
+            era: 0,
+            left: 0,
+            names: crate::name::empty_roots()[crate::name::HEIGHT],
+            tip: [0; 32],
+        }
+    }
+
+    pub fn elements(&self) -> Vec<F> {
+        let mut out = halves(&self.program).to_vec();
+        out.push(F(self.height as u128));
+        out.extend(halves(&self.root));
+        out.push(F(self.next as u128));
+        out.extend(halves(&self.inputs).into_iter().chain(halves(&self.outputs)));
+        out.extend([F(self.sum_in), F(self.sum_out), F(self.era as u128)]);
+        // An era with no end has no count.
+        out.push(if self.left == u32::MAX { F::ZERO } else { power(COUNT, self.left as u128) });
+        out.extend(halves(&self.names));
+        out.extend(halves(&self.tip));
+        out
+    }
+
+    /// The statement after `block`, by the step of program `program`,
+    /// under `emission`.
+    pub fn after(program: &Digest, block: &crate::block::Statement, emission: &Emission) -> Statement {
+        // The era of the block's height, and the blocks left in it.
+        let (mut era, mut left, mut end) = (emission.0.len() as u32 + 1, u32::MAX, 0u64);
+        for (i, (blocks, _)) in emission.0.iter().enumerate() {
+            end += *blocks as u64;
+            if block.height as u64 <= end {
+                (era, left) = (i as u32 + 1, (end - block.height as u64) as u32);
+                break;
+            }
+        }
+        Statement {
+            program: *program,
+            height: block.height,
+            root: block.root[1],
+            next: block.next[1],
+            inputs: block.inputs,
+            outputs: block.outputs,
+            sum_in: block.sum_in,
+            sum_out: block.sum_out,
+            era,
+            left,
+            names: block.names[1],
+            tip: crate::header::id_of(&block.work[0], &block.work[1], &block.work[2]),
+        }
+    }
+}
+
+/// A computation, in `cx`, that states where a chain begins.
+pub fn genesis_into(cx: &Shared) -> Vec<F> {
+    let stated = Statement::genesis().elements();
+    cx.state(&stated.iter().map(|x| cx.constant(*x)).collect::<Vec<Sym>>());
+    stated
+}
+
+/// A kind of block a chain takes: the program of its root, and what a
+/// root of that program states it rested on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shape {
+    pub root: Digest,
+    pub rested: [Digest; PROGRAMS],
+}
+
+impl Shape {
+    fn elements(&self) -> Vec<F> {
+        std::iter::once(&self.root).chain(&self.rested).flat_map(halves).collect()
+    }
+}
+
+/// The blocks a chain takes, and how it begins and pays: a tree over
+/// the shapes of block (its root is all a step holds of them), the
+/// program of the computation that states where a chain begins, and
+/// the emission.
+#[derive(Clone)]
+pub struct Plan {
+    shapes: Vec<Shape>,
+    depth: usize,
+    pub genesis: Digest,
+    pub emission: Emission,
+}
+
+impl Plan {
+    pub fn new(shapes: Vec<Shape>, genesis: Digest, emission: Emission) -> Plan {
+        assert!(!shapes.is_empty() && emission.0.len() <= 6 && emission.0.iter().all(|e| e.0 > 0));
+        let depth = shapes.len().next_power_of_two().trailing_zeros().max(1) as usize;
+        Plan { shapes, depth, genesis, emission }
+    }
+
+    fn node(&self, level: usize, index: usize) -> Digest {
+        if level == 0 {
+            return self.shapes.get(index).map_or(EMPTY, |s| hash_domain(DOM_PLAN_LEAF, &as_bytes(&s.elements())));
+        }
+        let children = [self.node(level - 1, 2 * index), self.node(level - 1, 2 * index + 1)];
+        hash_domain(DOM_PLAN_NODE, children.as_flattened())
+    }
+
+    /// The root of the tree of shapes.
+    pub fn root(&self) -> Digest {
+        self.node(self.depth, 0)
+    }
+
+    fn path(&self, index: usize) -> Vec<Digest> {
+        (0..self.depth).map(|level| self.node(level, (index >> level) ^ 1)).collect()
+    }
+}
+
+/// A proof with what it states.
+pub struct Stated<'a> {
+    pub proof: &'a Proved,
+    pub stated: &'a [F],
+}
+
+/// A step of the chain, in `cx`: it verifies `block`'s proof (of the
+/// plan's shape `shape`) and the chain's proof `before` (the genesis
+/// computation's, if `first`), finds the block to follow from where the
+/// chain was and to pay what the emission says, finds the work the
+/// block's proof showed to be of the header before it (whose other
+/// fields hash to `rest`; [`crate::header`]), and states where the
+/// chain now is. `own` is the root of this step's own program
+/// ([`crate::proof::program_of`]). What it states, by the field.
+#[allow(clippy::too_many_arguments)]
+pub fn step_into(
+    cx: &Shared,
+    tables: &Tables,
+    reader: &mut impl Reader<Sym>,
+    plan: &Plan,
+    shape: usize,
+    block: &Stated,
+    before: &Stated,
+    first: bool,
+    own: &Digest,
+    rest: &Digest,
+) -> Option<Vec<F>> {
+    let constants = |d: &Digest| halves(d).map(|x| cx.constant(x));
+    let (zero, one) = (cx.constant(F::ZERO), cx.constant(F::ONE));
+    // The block: of a shape in the plan's tree. The leaf is what the
+    // proof was verified against and what it states it rested on; the
+    // path, climbed by rows, reaches the plan's root.
+    let of = block.proof.verify_into(cx, &tables.compiled, reader)?;
+    let b = cx.stated(&[of[2].clone(), of[3].clone()], block.stated);
+    let leaf: Vec<Sym> = of[..2].iter().chain(&b[..2 * PROGRAMS]).cloned().collect();
+    let values: Vec<F> = leaf.iter().map(Sym::value).collect();
+    let index = cx.input(F(shape as u128));
+    let index_at = index.send();
+    let (opened, top) = cx.with(|c| {
+        let domains = [DOM_PLAN_LEAF, DOM_PLAN_NODE];
+        let opened = c.trace.opening_in(domains, &values, shape as u32, &plan.path(shape), index_at, true, 0, true);
+        (opened, c.trace.last())
+    });
+    for ((at, value), expect) in opened.leaf.iter().zip(&values).zip(&leaf) {
+        assert!(cx.outside(*at, *value).is(expect));
+    }
+    assert!(cx.outside(opened.high, F((shape >> plan.depth) as u128)).is(&zero));
+    for ((at, half), expect) in opened.top.iter().zip(halves(&top)).zip(constants(&plan.root())) {
+        assert!(cx.outside(*at, half).is(&expect));
+    }
+    let st = &b[2 * PROGRAMS..];
+
+    // The chain before: of the genesis program if this is the first
+    // block, of this step's own if not; and, if not, stating the same
+    // program as its own.
+    let of = before.proof.verify_into(cx, &tables.compiled, reader)?;
+    let p = cx.stated(&[of[2].clone(), of[3].clone()], before.stated);
+    let is_first = cx.input(F(first as u128));
+    assert!((is_first.clone() * is_first.clone() + is_first.clone()).is(&zero));
+    let own: Vec<Sym> = halves(own).iter().map(|x| cx.input(*x)).collect();
+    for (h, genesis) in constants(&plan.genesis).into_iter().enumerate() {
+        let program = (genesis + own[h].clone()) * is_first.clone() + own[h].clone();
+        assert!(of[h].is(&program));
+        assert!(((p[h].clone() + own[h].clone()) * (is_first.clone() + one.clone())).is(&zero));
+    }
+    // The block follows: the height before it, the state it began from
+    // and the first position it gave out are the chain's.
+    assert!(p[2].is(&st[15]));
+    assert!(p[3].is(&st[0]) && p[4].is(&st[1]));
+    assert!(p[5].is(&st[10]));
+    assert!(p[14].is(&st[17]) && p[15].is(&st[18]));
+
+    // The emission. If no block was left of the era before (its count
+    // is one), this block is the next era's first; `ended` is that, and
+    // cannot be otherwise: a count less one has an inverse or is zero.
+    let eras = Eras::of(&plan.emission);
+    let (era, count) = (&p[12], &p[13]);
+    let run_out = count.value() == F::ONE;
+    let less = count.clone() + one.clone();
+    let ended = cx.input(F(run_out as u128));
+    let inverse = cx.input(less.value().inv());
+    assert!((less.clone() * ended.clone()).is(&zero));
+    assert!((less * inverse).is(&(ended.clone() + one)));
+    let era = ((at(&eras.next, era) + era.clone()) * ended.clone() + era.clone()).kept();
+    let fewer = (count.clone() * cx.constant(COUNT.inv())).kept();
+    let count = (at(&eras.reset, &era) + fewer.clone()) * ended + fewer;
+    assert!(st[16].is(&at(&eras.pays, &era)));
+
+    let mut stated = own;
+    stated.extend([st[12].clone(), st[2].clone(), st[3].clone(), st[11].clone()]);
+    stated.extend(st[4..8].iter().cloned().chain([st[13].clone(), st[14].clone(), era, count]));
+    stated.extend([st[19].clone(), st[20].clone()]);
+
+    // The work the block's proof showed is of the header before this
+    // block: one that names the header the chain was at, and states
+    // what the chain's proof before stated. The rest of it is the
+    // prover's to give, and is bound by the id.
+    let rest = halves(rest).map(|x| cx.input(x));
+    let header = [p[16].clone(), p[17].clone(), of[2].clone(), of[3].clone(), rest[0].clone(), rest[1].clone()];
+    let work_hash = cx.hashed(crate::hash::DOM_HEADER, &header);
+    assert!(work_hash[0].is(&st[21]) && work_hash[1].is(&st[22]));
+    let named: Vec<Sym> = work_hash.iter().chain(&st[23..27]).cloned().collect();
+    stated.extend(cx.hashed(crate::hash::DOM_BLOCK, &named));
+    cx.state(&stated);
+    Some(stated.iter().map(Sym::value).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alg::statement;
+    use crate::block::{Runs, Worked, root_into};
+    use crate::header::Header;
+    use crate::ledger::{MAINNET_EMISSION, MEMO, Output, Outputs, Record, Transaction, key_hash};
+    use crate::pcs::Params;
+    use crate::proof::{program_of, prove, prove_hidden};
+    use crate::reading::{Deferred, Direct};
+    use crate::segment::{self, Run, closed};
+    use crate::xmss::SecretKey;
+
+    /// Two blocks at 50, one at 20, and nothing after.
+    const EMISSION: Emission = Emission(&[(2, 50), (1, 20)]);
+
+    fn params(m: usize) -> Params {
+        Params::plain(m, 1, 4, 4)
+    }
+
+    /// The proof of the work of a header of this work's hash, with a
+    /// nonce: the proof, what it states, and the mix.
+    fn worked(source: &impl crate::pow::ItemSource, work_hash: &Digest, nonce: u64) -> (Proved, Vec<F>, Digest) {
+        let nonce = crate::pow::nonce_from_u64(nonce);
+        let cx = Shared::new();
+        let (work, stated) = crate::work::work_into(&cx, source, work_hash, &nonce);
+        let proof = crate::proof::prove_with(cx, vec![], Some(work), params, [128, 128]);
+        assert!(proof.holds && proof.verifies());
+        (proof, stated, crate::pow::hashimoto(source, work_hash, &nonce).mix)
+    }
+
+    /// A block that pays its reward and nothing else, at `height`, on
+    /// `state`, with the work of the header before it: its root's
+    /// proof, what that states, and its statement.
+    fn reward(
+        tables: &Tables,
+        state: &mut Outputs,
+        height: u32,
+        work: &(Proved, Vec<F>, Digest),
+    ) -> (Proved, Vec<F>, crate::block::Statement) {
+        let pays = EMISSION.subsidy(height);
+        let to = key_hash(&SecretKey::generate_with_height(&[7; 32], 1).public_key());
+        let tx = Transaction {
+            inputs: vec![],
+            outputs: vec![Output::to(&to, pays, [height as u8; MEMO])],
+            ops: vec![],
+            policy: vec![],
+            covered: 0,
+        };
+        let set = crate::signed::empty_roots()[crate::signed::DEPTH];
+        let start = Record::block(state, height, pays);
+        let mut run = Run::new(&start, closed(), &set);
+        run.head(&tx);
+        run.output(&tx.outputs[0], &to, &state.path(state.next));
+        let mut record = start;
+        record.apply(state, &tx).unwrap();
+        let run = segment::prove(run, 512, params);
+        let cx = Shared::new();
+        let shown = Worked { proof: &work.0, stated: &work.1 };
+        let stated = root_into(&cx, tables, &mut Direct, &Runs::One(&run), None, Some(&shown), height).unwrap();
+        let proof = prove(cx, vec![], params);
+        assert!(proof.holds && proof.verifies());
+        let digest = |x: &[F]| -> Digest { [x[0].0.to_le_bytes(), x[1].0.to_le_bytes()].concat().try_into().unwrap() };
+        let work = [digest(&work.1[0..]), digest(&work.1[2..]), digest(&work.1[4..])];
+        (proof, stated, crate::block::Statement { work, ..crate::block::Statement::of(&record, pays, &set) })
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn a_chain_of_blocks_is_one_proof() {
+        let tables = Tables::new();
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::DEV);
+        let source = text.table(10);
+        let digest = |x: &[F]| -> Digest { [x[0].0.to_le_bytes(), x[1].0.to_le_bytes()].concat().try_into().unwrap() };
+        // A block of the one shape there is, of some header's work: for
+        // the program of its root, and what that rests on.
+        let sample = reward(&tables, &mut Outputs::default(), 1, &worked(&source, &[1; 32], 0));
+        let rested = std::array::from_fn(|i| digest(&sample.1[2 * i..]));
+
+        // The shape of a chain's proof: enough rows for a step, found by
+        // trying, and for the pads of a proof that hides what it is of.
+        // The genesis proof is made to it. A chain's proofs are the ones
+        // published: each hides the block's proofs and the proof before.
+        let mut shape = [1 << 9, 1 << 15];
+        let (genesis, began, plan, own) = loop {
+            let cx = Shared::new();
+            let began = genesis_into(&cx);
+            let genesis = prove_hidden(cx, params, shape, [0xA0; 32]);
+            assert!(genesis.holds && genesis.verifies() && genesis.params.blind);
+            let plan = Plan::new(
+                vec![Shape { root: [3; 32], rested }, Shape { root: sample.0.program, rested }],
+                genesis.program,
+                EMISSION,
+            );
+            let cx = Shared::new();
+            let mut reader = Deferred::new(&cx);
+            let (block, before) =
+                (Stated { proof: &sample.0, stated: &sample.1 }, Stated { proof: &genesis, stated: &began });
+            step_into(&cx, &tables, &mut reader, &plan, 1, &block, &before, true, &[0; 32], &[0; 32]).unwrap();
+            reader.settle(&tables.all());
+            let (hash, machine) = cx.with(|c| (c.trace.rows.len(), 2 * c.asm.finish_len()));
+            if hash <= shape[0] && machine <= shape[1] {
+                break (genesis, began, plan, program_of(cx, params, shape));
+            }
+            shape = [shape[0].max(hash.next_power_of_two()), shape[1].max(machine.next_power_of_two())];
+        };
+
+        // Four blocks, each with the work of the header before it: the
+        // header that names the one the chain was at and states what the
+        // chain's proof stated. Each step is of the one program, which
+        // it names.
+        let mut state = Outputs::default();
+        let mut blocks = Vec::new();
+        let mut headers: Vec<Header> = Vec::new();
+        let mut chain: Vec<(Proved, Vec<F>)> = Vec::new();
+        for i in 0..4 {
+            let (before, tip) = match chain.last() {
+                Some((proof, stated)) => (Stated { proof, stated }, digest(&stated[16..])),
+                None => (Stated { proof: &genesis, stated: &began }, [0; 32]),
+            };
+            let rest = [0x50 + i as u8; 32];
+            let work_hash = crate::header::work_hash(&tip, &before.proof.statement(), &rest);
+            let work = worked(&source, &work_hash, i as u64);
+            let header = Header {
+                parent: tip,
+                statement: before.proof.statement(),
+                rest,
+                nonce: crate::pow::nonce_from_u64(i as u64),
+                mix: work.2,
+            };
+            let (proof, stated, block) = reward(&tables, &mut state, i as u32 + 1, &work);
+            assert_eq!((proof.program, &stated[..2 * PROGRAMS]), (sample.0.program, &sample.1[..2 * PROGRAMS]));
+            assert_eq!(block.work, [header.work_hash(), header.nonce, header.mix]);
+            let cx = Shared::new();
+            let mut reader = Deferred::new(&cx);
+            let this = Stated { proof: &proof, stated: &stated };
+            let said = step_into(&cx, &tables, &mut reader, &plan, 1, &this, &before, i == 0, &own, &rest).unwrap();
+            reader.settle(&tables.all());
+            let step = prove_hidden(cx, params, shape, [0xA1 + i as u8; 32]);
+            assert!(step.holds && step.verifies() && step.params.blind, "block {}", i + 1);
+            assert_eq!(step.program, own, "block {}", i + 1);
+            let expect = Statement::after(&own, &block, &EMISSION);
+            assert_eq!((expect.era, expect.left), [(1, 1), (1, 0), (2, 0), (3, u32::MAX)][i]);
+            // The chain is now at the header whose work was shown.
+            assert_eq!(expect.tip, header.id());
+            assert_eq!((said.clone(), step.statement()), (expect.elements(), statement(&expect.elements())));
+            chain.push((step, said));
+            blocks.push((proof, stated));
+            headers.push(header);
+        }
+        assert_eq!(chain[3].1.len(), STATEMENT);
+        // Each header names the one before it.
+        assert!(headers.windows(2).all(|h| h[1].parent == h[0].id()));
+
+        // What does not follow does not hold: a block out of its place,
+        // a first block claimed where there was a chain, a step naming
+        // another program as its own, a header that is not the one the
+        // work was done on.
+        let holds = |block: usize, before: Option<usize>, first: bool, own: &Digest, shape: usize, rest: &Digest| {
+            let cx = Shared::new();
+            let (proof, stated) = &blocks[block];
+            let before = match before {
+                Some(i) => Stated { proof: &chain[i].0, stated: &chain[i].1 },
+                None => Stated { proof: &genesis, stated: &began },
+            };
+            let this = Stated { proof, stated };
+            step_into(&cx, &tables, &mut Direct, &plan, shape, &this, &before, first, own, rest).unwrap();
+            cx.finish().asm.finish(128).holds
+        };
+        let rest = headers[1].rest;
+        assert!(holds(1, Some(0), false, &own, 1, &rest));
+        assert!(!holds(2, Some(0), false, &own, 1, &headers[2].rest));
+        assert!(!holds(1, None, true, &own, 1, &rest));
+        assert!(!holds(1, Some(0), true, &own, 1, &rest));
+        assert!(!holds(0, None, false, &own, 1, &headers[0].rest));
+        assert!(!holds(1, Some(0), false, &[1; 32], 1, &rest));
+        assert!(!holds(1, Some(0), false, &own, 1, &headers[0].rest));
+        // A block of a shape that is not the plan's leaf it is said to be.
+        assert!(!holds(1, Some(0), false, &own, 0, &rest));
+    }
+
+    /// The most memory the process has held, in megabytes; and the mark
+    /// set back to what it holds now.
+    fn peak() -> usize {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let kb =
+            status.lines().find(|l| l.starts_with("VmHWM")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok());
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        kb.unwrap_or(0usize) / 1024
+    }
+
+    /// What a block of a reward alone costs at the chain's parameters:
+    /// each proof under it, and the chain's proof, which is what a node
+    /// is sent.
+    #[test]
+    #[ignore = "timing; run with --release --nocapture"]
+    fn reward_block_timing() {
+        use std::time::Instant;
+        let params = |m: usize| Params::proven(m, 2, crate::pcs::SECURITY);
+        let tables = Tables::new();
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::MAINNET);
+        let source = text.table(crate::pow::PowParams::MAINNET.log_dataset_items);
+        let digest = |x: &[F]| -> Digest { [x[0].0.to_le_bytes(), x[1].0.to_le_bytes()].concat().try_into().unwrap() };
+        let set = crate::signed::empty_roots()[crate::signed::DEPTH];
+        let to = key_hash(&SecretKey::generate_with_height(&[7; 32], 1).public_key());
+        // A block's proofs, each timed: the work of the header before,
+        // the run of its one transaction, and the root over both.
+        let block = |state: &mut Outputs, height: u32, work_hash: &Digest, say: bool| {
+            let nonce = crate::pow::nonce_from_u64(height as u64);
+            peak();
+            let t = Instant::now();
+            let cx = Shared::new();
+            let (work, worked) = crate::work::work_into(&cx, &source, work_hash, &nonce);
+            let work = crate::proof::prove_with(cx, vec![], Some(work), params, [128, 128]);
+            let (work_time, work_peak) = (t.elapsed(), peak());
+            let pays = MAINNET_EMISSION.subsidy(height);
+            let tx = Transaction {
+                inputs: vec![],
+                outputs: vec![Output::to(&to, pays, [height as u8; MEMO])],
+                ops: vec![],
+                policy: vec![],
+                covered: 0,
+            };
+            let start = Record::block(state, height, pays);
+            let t = Instant::now();
+            let mut run = Run::new(&start, closed(), &set);
+            run.head(&tx);
+            run.output(&tx.outputs[0], &to, &state.path(state.next));
+            let run = segment::prove(run, 512, params);
+            let (run_time, run_peak) = (t.elapsed(), peak());
+            let mut record = start;
+            record.apply(state, &tx).unwrap();
+            let t = Instant::now();
+            let cx = Shared::new();
+            let mut reader = Deferred::new(&cx);
+            let shown = Worked { proof: &work, stated: &worked };
+            let stated = root_into(&cx, &tables, &mut reader, &Runs::One(&run), None, Some(&shown), height).unwrap();
+            reader.settle(&tables.all());
+            let root = prove(cx, vec![], params);
+            let (root_time, root_peak) = (t.elapsed(), peak());
+            assert!(work.holds && root.holds);
+            if say {
+                let rows = |p: &Proved| format!("2^{} elements", p.params.m);
+                println!("  work:  {work_time:.2?}, {work_peak} MB, {} KB, {}", work.size() / 1000, rows(&work));
+                println!("  run:   {run_time:.2?}, {run_peak} MB, {} KB", run.proof.size() / 1000);
+                println!(
+                    "  root:  {root_time:.2?}, {root_peak} MB, {} KB, {} ({:?})",
+                    root.size() / 1000,
+                    rows(&root),
+                    root.tables
+                );
+            }
+            (root, stated, work_time + run_time + root_time, work_peak.max(run_peak).max(root_peak))
+        };
+        let mut state = Outputs::default();
+        let first = block(&mut state, 1, &[1; 32], false);
+        let rested = std::array::from_fn(|i| digest(&first.1[2 * i..]));
+        // The chain's shape, found by trying from the one expected.
+        let mut shape = [1 << 16, 1 << 19];
+        let (genesis, began, plan, own) = loop {
+            let cx = Shared::new();
+            let began = genesis_into(&cx);
+            let genesis = prove_hidden(cx, params, shape, [0xB0; 32]);
+            let plan = Plan::new(vec![Shape { root: first.0.program, rested }], genesis.program, MAINNET_EMISSION);
+            let step = || {
+                let cx = Shared::new();
+                let mut reader = Deferred::new(&cx);
+                let (this, before) =
+                    (Stated { proof: &first.0, stated: &first.1 }, Stated { proof: &genesis, stated: &began });
+                step_into(&cx, &tables, &mut reader, &plan, 0, &this, &before, true, &[0; 32], &[0; 32]).unwrap();
+                reader.settle(&tables.all());
+                cx
+            };
+            // The rows a step takes, by making them.
+            let made = step().finish();
+            let (hash, machine) = (made.trace.rows.len(), made.asm.finish(128).inputs.len());
+            println!(
+                "a step: {hash} hash rows, 2^{} machine rows; shape 2^{}, 2^{}",
+                machine.trailing_zeros(),
+                shape[0].trailing_zeros(),
+                shape[1].trailing_zeros()
+            );
+            if hash <= shape[0] && machine <= shape[1] {
+                let own = program_of(step(), params, shape);
+                break (genesis, began, plan, own);
+            }
+            shape = [shape[0].max(hash.next_power_of_two()), shape[1].max(machine)];
+        };
+        // Two blocks: the second's step verifies a step's proof, as
+        // every step after it does.
+        let mut state = Outputs::default();
+        let mut last: Option<(Proved, Vec<F>)> = None;
+        for i in 0..2u32 {
+            let (before, tip) = match &last {
+                Some((proof, stated)) => (Stated { proof, stated }, digest(&stated[16..])),
+                None => (Stated { proof: &genesis, stated: &began }, [0; 32]),
+            };
+            let rest = [0x60 + i as u8; 32];
+            let work_hash = crate::header::work_hash(&tip, &before.proof.statement(), &rest);
+            println!("block {}:", i + 1);
+            let (root, stated, under, under_peak) = block(&mut state, i + 1, &work_hash, true);
+            peak();
+            let t = Instant::now();
+            let cx = Shared::new();
+            let mut reader = Deferred::new(&cx);
+            let this = Stated { proof: &root, stated: &stated };
+            let said = step_into(&cx, &tables, &mut reader, &plan, 0, &this, &before, i == 0, &own, &rest).unwrap();
+            reader.settle(&tables.all());
+            let (hash, machine) = cx.with(|c| (c.trace.rows.len(), c.asm.finish_len()));
+            let step = prove_hidden(cx, params, shape, [0xB1 + i as u8; 32]);
+            let (step_time, step_peak) = (t.elapsed(), peak());
+            assert!(step.holds && step.program == own);
+            let t = Instant::now();
+            assert!(step.verifies());
+            let (verify_time, verify_peak) = (t.elapsed(), peak());
+            println!(
+                "  step:  {step_time:.2?}, {step_peak} MB, 2^{} elements; {hash} of {} hash rows, {} machine rows used of {} ({machine} operations)",
+                step.params.m, shape[0], step.used, shape[1]
+            );
+            println!(
+                "  block {}: {:.2?} in all, {} MB at most; the chain's proof {} bytes, verified in {verify_time:.2?} ({verify_peak} MB held, the circuits made with it)",
+                i + 1,
+                under + step_time,
+                under_peak.max(step_peak),
+                step.size()
+            );
+            last = Some((step, said));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn a_block_that_pays_itself_too_much_is_no_block() {
+        // The third block is the second era's: it pays 20. One that
+        // takes 50 has a root that holds (its sums agree) and a step
+        // that does not; one whose outputs are more than it says it
+        // pays has no root.
+        let tables = Tables::new();
+        let to = key_hash(&SecretKey::generate_with_height(&[7; 32], 1).public_key());
+        let state = Outputs::default();
+        let set = crate::signed::empty_roots()[crate::signed::DEPTH];
+        let root_holds = |says: u64, takes: u64| {
+            let tx = Transaction {
+                inputs: vec![],
+                outputs: vec![Output::to(&to, takes, [0; MEMO])],
+                ops: vec![],
+                policy: vec![],
+                covered: 0,
+            };
+            let start = Record::block(&state, 3, says);
+            let mut run = Run::new(&start, closed(), &set);
+            run.head(&tx);
+            run.output(&tx.outputs[0], &to, &state.path(state.next));
+            let run = segment::prove(run, 512, params);
+            let cx = Shared::new();
+            root_into(&cx, &tables, &mut Direct, &Runs::One(&run), None, None, 3).unwrap();
+            cx.finish().asm.finish(128).holds
+        };
+        assert!(root_holds(20, 20) && root_holds(50, 50));
+        assert!(!root_holds(20, 50) && !root_holds(20, 19));
+        // The schedule, as the step's arithmetic has it.
+        let eras = Eras::of(&EMISSION);
+        let pays: Vec<F> = (0..4).map(|e| at(&eras.pays, &F(e))).collect();
+        assert_eq!(pays, [F(0), F(50), F(20), F(0)]);
+        assert_eq!((0..4).map(|e| at(&eras.next, &F(e))).collect::<Vec<_>>(), [F(1), F(2), F(3), F(3)]);
+        assert_eq!(at(&eras.reset, &F(1)), COUNT);
+        assert_eq!(
+            (EMISSION.subsidy(0), EMISSION.subsidy(2), EMISSION.subsidy(3), EMISSION.subsidy(4)),
+            (0, 50, 20, 0)
+        );
+        // The count's element does not come back to one within any era:
+        // its order has a prime of 47 bits in it.
+        let large = 67_280_421_310_721u128;
+        assert_eq!(u128::MAX % large, 0);
+        assert_ne!(power(COUNT, u128::MAX / large), F::ONE);
+    }
+}
