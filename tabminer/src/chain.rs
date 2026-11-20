@@ -35,10 +35,6 @@
 //! to count blocks with, so where the emission stands is carried as an
 //! era and a count of the blocks left in it, the count a power of a
 //! fixed element: a block fewer is a division by it.
-//!
-//! # Not yet here
-//!
-//! The parent's work, and names.
 
 use crate::alg::{Alg, Shared, Sym, halves};
 use crate::block::{PROGRAMS, Tables};

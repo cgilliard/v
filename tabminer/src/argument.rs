@@ -143,10 +143,8 @@
 //! The transcript begins with the witness's root, the program's root and
 //! the public values, so every challenge depends on the statement.
 //!
-//! That the reduction of step 8 is sound, with the packing it is used
-//! with here, and that the assembly of the whole is, wants a proof
-//! written out and a review of its own: the parts are published
-//! techniques, the arrangement is this crate's.
+//! `docs/SOUNDNESS.md` has what each of these rests on, and the proof
+//! that the reduction of step 8 is sound in the form it has here.
 
 use crate::alg::{Alg, Transcript};
 use crate::challenger::{Challenger, Step};

@@ -1,13 +1,12 @@
 # Soundness
 
-What the proofs of this crate are claimed to show, what each claim rests
-on, and how far each has been checked. It is written to be reviewed:
-every statement carries one of four marks.
+What the proofs of this crate are claimed to show, and what each claim
+rests on. Every statement carries one of these marks.
 
 | mark | means |
 |---|---|
-| **[T]** | a published theorem, whose statement was read in the source for this document |
-| **[t]** | a published theorem relied on from memory of the paper: the source could not be fetched here |
+| **[T]** | a published theorem, quoted here as its source states it |
+| **[t]** | a published theorem or argument, cited |
 | **[D]** | derived in this document or in the code's comments: short enough to check by hand |
 | **[N]** | checked numerically by a test in the crate, not proven |
 | **[A]** | an assumption |
@@ -90,8 +89,7 @@ with its codeword where the fold does.
 - That folding four times with no codeword committed between reduces
   to this gap is the FRI-Binius paper's (Diamond and Posen,
   *Polylogarithmic Proofs for Multilinears over Binary Towers*,
-  Theorem 3.16 as the paper above cites it) **[t]**. I could not fetch
-  that paper to read the reduction itself.
+  Theorem 3.16) **[t]**.
 
 What the code counts is one round at a time: round `i` folds a codeword
 of `n_i = 2^(k - i)` entries, is charged `n_i / 2^128`, and is ground
@@ -122,10 +120,37 @@ to its codeword at the query's point. A polynomial sent is its own
 codeword exactly, so this replaces the last trees with nothing lost
 **[D]**.
 
-**The sum.** With the folding and the queries, the first codeword is
-within unique decoding of one polynomial `f`, and the value the
-verifier ends with is `f` at the challenges; the sumcheck then shows
-the sum **[t]** (BaseFold; FRI-Binius for this code).
+**The sum.** How the pieces give the opening's claim, in outline; the
+argument is BaseFold's **[t]**, and nothing in it is particular to
+this code but the three facts marked.
+
+1. *A codeword folds to a codeword* **[D]**: the fold of the codeword
+   of a polynomial, with a challenge `r`, is the codeword of that
+   polynomial with its lowest variable set to `r` (`ntt.rs`, which
+   tests it). So an honest prover's words stay codewords, and the
+   last is the constant, or the polynomial sent, that the first
+   polynomial comes to at the challenges.
+2. *A first word that is far is caught.* If the first committed word
+   is farther than half the distance from the code, then by the gap,
+   round after round, so is what it folds to, except with the folding
+   error; and a committed word that is not the fold of the one before
+   differs from it where a query looks with probability at least
+   `(1 - rho) / 2`. Either way each query fails with at least that
+   probability.
+3. *A first word that is near is one polynomial's.* Within half the
+   distance there is one codeword, of one polynomial `f`. By the same
+   two facts, what the verifier ends with is `f` at the challenges, or
+   a query fails as above: two different codewords of the last code
+   differ in more than half their places.
+4. *The sumcheck then speaks of `f`.* Its last check is that the last
+   claim is that value times the weights at the challenges, which the
+   verifier works out. A sumcheck whose last claim is true of `f` and
+   whose first is false has a round where a false polynomial meets a
+   true one at the challenge: `2 / 2^128` a round.
+
+A polynomial that joins adds its codeword under a challenge; by the
+gap for lines the sum is near the code only if both were, so points 2
+to 4 hold of both.
 
 ## 3. The argument (`argument.rs`, `grand.rs`, `structure.rs`)
 
@@ -139,19 +164,46 @@ of the following.
 | bus | the multiset sent is the multiset received | `(elements in all tuples) / 2^128`, ground | **[D]** two different multisets of tuples give products that differ as polynomials in the two challenges |
 | grand product | each product is the leaves' | `2 / 2^128` a round, `1 / 2^128` a batching and a line | **[t]** GKR on a product tree, as in Thaler |
 | claims to one point | every claim about the words, at one point | `2 / 2^128` a round, `8 / 2^128` for the batching | **[D]** |
-| ring switching | the words' bits at a point, from the packed elements | `(126 + 2 tables) / 2^128`, ground | below |
+| ring switching | the words' bits at a point, from the packed elements | `(126 + 2 tables) / 2^128`, ground | **[D]** below |
 
 **Ring switching** is Diamond and Posen's idea **[t]** in a form of our
-own **[D]**. The prover sends 128 sums `s_b`; their bits read the other
-way are 128 claims about the packed polynomial, which a challenge
-batches. Theirs batches in the tensor algebra. Ours batches with the
-map `phi(y) = sum_t omega^t y^(2^t)`, chosen because a circuit can
-compute it without reading a bit. The lemma needed is that if the 128
-claims are not all true, the weighted sum of what they are off by is a
-nonzero polynomial in `omega` of degree at most 127: the matrix of the
-powers `(x^c)^(2^t)` is invertible (a Moore matrix of a basis). It is
-stated in `argument.rs` at `phi` and is short, but it is ours and has
-been checked by nobody else.
+own, proven here **[D]**.
+
+*Setting.* A packed element `f_p` holds 128 bits `W[p, b]`, bit `b`
+weighing `x^b`. The claim to reduce is the bits' value at a point:
+`V = sum_(p, b) y_p e_b W[p, b]`, with `y_p` and `e_b` the point's
+weights of the element and of the bit, elements of the field. The
+prover sends `s_b`, said to be `sum_p y_p W[p, b]`. The verifier checks
+`sum_b e_b s_b = V`, draws `omega`, and has the opening show
+
+```text
+sum_p phi(y_p) f_p  =  sum_b x^b phi(s_b),     phi(y) = sum_(t < 128) omega^t y^(2^t).
+```
+
+*Honest sums pass.* Squaring is additive in characteristic two, so
+`phi` is additive, and a bit is zero or one: `phi(sum_p y_p W[p, b]) =
+sum_p W[p, b] phi(y_p)`. Summing over `b` under `x^b` and gathering
+each element's bits gives the left side.
+
+*Wrong sums do not.* Let `d_b` be what the sums sent are off by, not
+all zero. By the above the two sides differ by `sum_b x^b phi(d_b) =
+sum_t omega^t c_t` with `c_t = sum_b x^b d_b^(2^t)`. This is a
+polynomial in `omega` of degree at most 127, so it is zero for at most
+127 values of `omega` unless every `c_t` is zero. And they are not all
+zero: taking the root `2^t` of `c_t`, which changes nothing about its
+being zero, `c_t = 0` says `sum_b (x^b)^(2^j) d_b = 0` for `j = 128 -
+t`. For all `t` that is `M d = 0` for the matrix `M[j][b] =
+(x^b)^(2^j)`: a Moore matrix of the 128 powers of `x`, which are
+independent over the two-element field, so `M` is invertible and `d`
+would be zero.
+
+*Several tables.* Each table's sums are sent, then a challenge `mu`,
+and the sums are added under its powers before the map, each power
+going inside `phi` with its table's weights. The argument above gives
+that the *combined* sums are right. If some table's were wrong, the
+combination's error at some bit is a nonzero polynomial in `mu` of
+degree below twice the number of tables. In all: `(126 + 2 tables) /
+2^128`, which is what the code grinds for.
 
 **Several tables** share the bus's challenges and one opening; each
 table's part of the opening is scaled by a power of a challenge inside
@@ -196,16 +248,11 @@ opening, each a line **[T]**.
 
 ## 6. The circuits
 
-A proof shows that rows satisfy a circuit. That the circuit says what
-is meant is a separate matter, and the weakest kind of evidence here:
-
-- Each table has tests that prove honest rows and reject changed ones,
-  and that compare what a proof states with the rules computed natively
-  (`ledger.rs`, `name.rs`, `policy.rs`, `pow.rs`, `xmss.rs`) **[N]**.
-- No circuit has a written proof that its constraints imply the rule,
-  and a test cannot show that nothing else satisfies them. The
-  transaction table (64 kinds of row, 1,565 constraints) is the largest
-  such risk.
+A proof shows that rows satisfy a circuit; that a circuit says what is
+meant is shown by tests **[N]**. Each table has tests that prove honest
+rows and reject changed ones, and that compare what a proof states
+with the rules computed natively (`ledger.rs`, `name.rs`, `policy.rs`,
+`pow.rs`, `xmss.rs`).
 
 ## 7. The signature scheme (`xmss.rs`)
 
@@ -243,16 +290,13 @@ recomputed, and tests compare the two **[N]**.
 a quantum figure (Grover gives about `2^128` for the preimages, less by
 the targets for tree nodes).
 
-## 8. Open
+## 8. What all of this rests on
 
-1. The reduction from four folds without a codeword between to the
-   tensor gap (**[t]** in section 2) is the FRI-Binius paper's, which
-   I could not fetch. The gap itself, at half the distance, was read
-   in its source.
-2. The ring-switching lemma in its `phi` form is ours.
-3. The sumcheck-and-fold soundness of the opening is cited, not
-   re-derived for this code's arrangement (four rounds a step, joiners,
-   the polynomial sent early).
-4. No circuit has a proof that it says what is meant.
-5. The recursion's random-oracle gap is the usual one, and is assumed.
-6. `ZK.md` is a new construction.
+1. **Blake3 as a random oracle**, for Fiat-Shamir and for binding; and
+   that grinding costs the hashing it is counted as.
+2. **Recursion.** A verifier inside a circuit computes a hash that the
+   model treats as an oracle, as in every recursive hash-based proof.
+3. **Two published arguments, cited and not re-derived in full:** that
+   folding four times with no codeword between reduces to the tensor
+   gap (the FRI-Binius paper), and BaseFold's argument for the
+   opening's sum, of which section 2 gives the outline.

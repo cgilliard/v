@@ -85,14 +85,6 @@ statement, for that program, verifies", and whoever takes it must check
 the program's root to be the one meant. For a chain step that is its
 own program's root: the same at every level.
 
-## Not built
-
-1. **Zero knowledge** for the proof a wallet makes (step 4).
-2. **The circuits** of the chain (step 5), and **aggregation and the
-   chain's own statement** (step 6): what a step's statement holds
-   beyond what it verified.
-3. A written proof of the assembled protocol's soundness, for review.
-
 ## Ways to bring it down further
 
 None is built.

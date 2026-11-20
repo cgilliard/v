@@ -32,10 +32,8 @@ A height-4 signature is 1,047 compressions to verify, 2,312 bytes.
 
 A row a chain step: 506 words, 487 constraints, 7 products, 41,033
 terms. It takes the digest's halves off the bus and sends each chain's
-end, the seed and the leaf's index. Tested beside a stand-in for the
-other end of the bus. Not yet: the hash table's rows for the digest,
-the leaf and the path with the machine tying them to the chains; the
-entry a signature publishes; a measurement at 2^17 rows.
+end, the seed and the leaf's index. The hash table's rows for the digest, the leaf and the path, and the
+machine that ties them to the chains, are `src/signature.rs`.
 
 ## A signature's check (built: `src/signature.rs`)
 
@@ -210,7 +208,7 @@ continuity (5), the digit (1), `active` (2 and an addition), the link
 checkpoint). Products: the mux (2), the end's copies (2), the
 digest's (1), the seed's and leaf's (2).
 
-## The proof of work (built natively: `src/pow.rs`) and its circuit (planned)
+## The proof of work (`src/pow.rs`) and its circuit (`src/work.rs`)
 
 Hashimoto over Blake3 and 32-bit words; the text in 2^15 overlapping
 windows of 64 bytes. Measured: one header's check from the file reads
@@ -336,7 +334,7 @@ words; 2^16 rows (a proof of 2^24 elements) hold about 166 of them.
 Later: the reference's stack of outputs, which sets down a whole
 subtree with one path, makes an output about 20 rows.
 
-## Names: built natively (`src/name.rs`), their rows planned
+## Names (`src/name.rs`; their rows are kinds of the transaction table)
 
 Rules as the reference's, restated over Blake3: commit, reveal (1 to
 288 blocks later), update (signed by the owner's key over the new

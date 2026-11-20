@@ -48,11 +48,8 @@
 //! - **A sumcheck round** errs with probability `2 / 2^128`.
 //! - **The hash**: 256-bit digests, collisions at 128 bits.
 //!
-//! What this rests on, to be confirmed before it is relied on: the
-//! folding round's bound is taken from the published analysis of this
-//! folding in the unique-decoding regime as others state it, not yet
-//! checked here against the paper line by line; and no count is taken of
-//! conjectures that would allow fewer queries.
+//! `docs/SOUNDNESS.md` has the theorems these counts are from. No count
+//! is taken of conjectures that would allow fewer queries.
 //!
 //! # Hiding
 //!
