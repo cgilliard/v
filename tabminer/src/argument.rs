@@ -180,14 +180,15 @@ pub struct TableProof {
     /// constraints', and the multiplications' (zero without any).
     pub tau_nonce: u64,
     pub product_nonce: u64,
-    /// Each zerocheck round's polynomial, lowest coefficient first.
-    pub rounds: Vec<[F; 3]>,
+    /// Each zerocheck round's polynomial: its constant and leading
+    /// coefficients. The middle one is what the claim leaves it to be.
+    pub rounds: Vec<[F; 2]>,
     /// The operands at the zerocheck's point.
     pub abc: [F; 3],
     /// The multiplications' zerocheck, as the constraints': its rounds,
     /// and the three operands at its point. Empty and zero for a circuit
     /// with no multiplications.
-    pub product_rounds: Vec<[F; 3]>,
+    pub product_rounds: Vec<[F; 2]>,
     pub xyz: [F; 3],
     /// The grand products of what the table sent on the bus and of what
     /// it received. Empty for a circuit with no bus.
@@ -238,7 +239,7 @@ impl TableProof {
     fn read(r: &mut Reader) -> Option<TableProof> {
         let threes = |r: &mut Reader| {
             let xs = r.fs()?;
-            (xs.len() % 3 == 0).then(|| xs.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect::<Vec<[F; 3]>>())
+            (xs.len() % 2 == 0).then(|| xs.chunks_exact(2).map(|c| [c[0], c[1]]).collect::<Vec<[F; 2]>>())
         };
         let three = |r: &mut Reader| <[F; 3]>::try_from(r.fs()?).ok();
         let pairs = |r: &mut Reader| {
@@ -411,7 +412,7 @@ pub(crate) struct Rounds {
     /// What the round polynomial must sum to, under the round's `eq`.
     pub(crate) claim: F,
     pub(crate) rs: Vec<F>,
-    pub(crate) polys: Vec<[F; 3]>,
+    pub(crate) polys: Vec<[F; 2]>,
 }
 
 impl Rounds {
@@ -420,8 +421,8 @@ impl Rounds {
     pub(crate) fn prove(&mut self, tr: &mut Challenger, pads: &mut Option<Pads>, tau: F, h0: F, h2: F) -> F {
         let h_one = (self.claim + (F::ONE + tau) * h0) * tau.inv();
         let [h0, h1, h2] = [h0, h_one + h0 + h2, h2];
-        let sent = send(tr, pads, &[h0, h1, h2]);
-        self.polys.push([sent[0], sent[1], sent[2]]);
+        let sent = send(tr, pads, &[h0, h2]);
+        self.polys.push([sent[0], sent[1]]);
         let r = tr.challenge();
         self.claim = h0 + r * (h1 + r * h2);
         self.rs.push(r);
@@ -458,7 +459,7 @@ fn zerocheck(
     tau: &[F],
     tr: &mut Challenger,
     pads: &mut Option<Pads>,
-) -> (Vec<[F; 3]>, Vec<F>, [F; 3]) {
+) -> (Vec<[F; 2]>, Vec<F>, [F; 3]) {
     let kc = 1usize << lk;
     let rows = w.rows;
     let n = tau.len();
@@ -2647,7 +2648,7 @@ mod tests {
         };
         assert!(verify(&circuit, &params, &domain, 128, &good).is_some());
         assert!(!changed(&|p| p.product_rounds[3][0] += F::ONE));
-        assert!(!changed(&|p| p.product_rounds[8][2] += F::ONE));
+        assert!(!changed(&|p| p.product_rounds[8][1] += F::ONE));
         assert!(!changed(&|p| p.xyz[1] += F::ONE));
         for i in 0..4 {
             assert!(!changed(&|p| p.u[i] += F::ONE));
@@ -3000,7 +3001,7 @@ mod tests {
         assert!(!changed(&|p| p.s_program[5] += F::ONE));
         assert!(!changed(&|p| p.s_program.clear()));
         assert!(!changed(&|p| p.pcs.joined_finals[0] += F::ONE));
-        assert!(!changed(&|p| p.pcs.joined_openings[0].leaves[2][1] += F::ONE));
+        assert!(!changed(&|p| p.pcs.joined_openings[0].leaves[2][0] += F::ONE));
         for i in 0..9 {
             assert!(!changed(&|p| p.u[i] += F::ONE), "sum {i}");
         }

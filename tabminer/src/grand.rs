@@ -39,8 +39,9 @@ use crate::pcs::eq_table;
 /// One level's part of a proof.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Level {
-    /// The sumcheck's rounds, lowest coefficient first.
-    pub rounds: Vec<[F; 3]>,
+    /// The sumcheck's rounds: each polynomial's constant and leading
+    /// coefficients.
+    pub rounds: Vec<[F; 2]>,
     /// For each table, the level below at the point, by child.
     pub ends: Vec<[F; 2]>,
 }
@@ -68,11 +69,11 @@ impl Proof {
         let mut levels = Vec::with_capacity(n);
         for _ in 0..n {
             let (rounds, ends) = (r.fs()?, r.fs()?);
-            if rounds.len() % 3 != 0 || ends.len() % 2 != 0 {
+            if rounds.len() % 2 != 0 || ends.len() % 2 != 0 {
                 return None;
             }
             levels.push(Level {
-                rounds: rounds.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+                rounds: rounds.chunks_exact(2).map(|c| [c[0], c[1]]).collect(),
                 ends: ends.chunks_exact(2).map(|c| [c[0], c[1]]).collect(),
             });
         }
@@ -249,7 +250,7 @@ mod tests {
         assert!(!changed(&|p| p.products[0] += F::ONE));
         assert!(!changed(&|p| p.products.swap(0, 1)));
         assert!(!changed(&|p| p.levels[0].ends[1][0] += F::ONE));
-        assert!(!changed(&|p| p.levels[3].rounds[1][2] += F::ONE));
+        assert!(!changed(&|p| p.levels[3].rounds[1][1] += F::ONE));
         assert!(!changed(&|p| p.levels[5].ends[0][1] += F::ONE));
         assert!(!changed(&|p| p.levels[5].rounds[4][0] += F::ONE));
         assert!(!changed(&|p| p.levels.truncate(5)));

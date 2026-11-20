@@ -574,6 +574,10 @@ mod tests {
     fn reward_block_timing() {
         use std::time::Instant;
         let params = |m: usize| Params::proven(m, 2, crate::pcs::SECURITY);
+        // The chain's proof is the one published: it grinds its queries
+        // more, for fewer of them.
+        let grind: usize = std::env::var("GRIND").ok().and_then(|g| g.parse().ok()).unwrap_or(24);
+        let published = move |m: usize| Params::proven_ground(m, 2, crate::pcs::SECURITY, grind);
         let tables = Tables::new();
         let text = crate::pow::SeedText::new(crate::pow::PowParams::MAINNET);
         let source = text.table(crate::pow::PowParams::MAINNET.log_dataset_items);
@@ -637,7 +641,7 @@ mod tests {
         let (genesis, began, plan, own) = loop {
             let cx = Shared::new();
             let began = genesis_into(&cx);
-            let genesis = prove_hidden(cx, params, shape, [0xB0; 32]);
+            let genesis = prove_hidden(cx, published, shape, [0xB0; 32]);
             let plan = Plan::new(vec![Shape { root: first.0.program, rested }], genesis.program, MAINNET_EMISSION);
             let step = || {
                 let cx = Shared::new();
@@ -658,7 +662,7 @@ mod tests {
                 shape[1].trailing_zeros()
             );
             if hash <= shape[0] && machine <= shape[1] {
-                let own = program_of(step(), params, shape);
+                let own = program_of(step(), published, shape);
                 break (genesis, began, plan, own);
             }
             shape = [shape[0].max(hash.next_power_of_two()), shape[1].max(machine)];
@@ -684,7 +688,7 @@ mod tests {
             let said = step_into(&cx, &tables, &mut reader, &plan, 0, &this, &before, i == 0, &own, &rest).unwrap();
             reader.settle(&tables.all());
             let (hash, machine) = cx.with(|c| (c.trace.rows.len(), c.asm.finish_len()));
-            let step = prove_hidden(cx, params, shape, [0xB1 + i as u8; 32]);
+            let step = prove_hidden(cx, published, shape, [0xB1 + i as u8; 32]);
             let (step_time, step_peak) = (t.elapsed(), peak());
             assert!(step.holds && step.program == own);
             let t = Instant::now();

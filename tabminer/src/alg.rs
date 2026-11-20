@@ -664,8 +664,12 @@ impl Opens<Sym> for HashedOpens {
             at.push(at[at.len() - 1].iter().map(|i| i >> s).collect());
         }
         let of = |tree: &Tree<Sym>, joined: bool| {
-            let (height, _) = shapes[tree.codeword];
-            paths(tree, &at[tree.codeword], height, crate::pcs::leaf_len(params, tree.codeword, joined))
+            // A joiner's leaves are the entries of the codeword it
+            // joined: a query's is its leaf in the codeword before.
+            let (height, s) = shapes[tree.codeword];
+            let (height, indices) =
+                if joined { (height + s, &at[tree.codeword - 1]) } else { (height, &at[tree.codeword]) };
+            paths(tree, indices, height, crate::pcs::leaf_len(params, tree.codeword, joined))
         };
         let own: Vec<_> = trees.iter().map(|t| of(t, false)).collect::<Option<_>>()?;
         let others: Vec<_> = joined.iter().map(|t| of(t, true)).collect::<Option<_>>()?;
@@ -690,9 +694,12 @@ impl Opens<Sym> for HashedOpens {
                     // those above the tree.
                     query.point = high * x(F(1 << height)) + raw.clone();
                 }
-                for (j, tree) in joined.iter().enumerate().filter(|(_, tree)| tree.codeword == t) {
-                    let (i, path) = leaf_at(&others[j]);
-                    let (leaf, ..) = self.opening(tree, &tree.batch.leaves[i], &path, &raw, 0, false)?;
+                for (j, tree) in joined.iter().enumerate().filter(|(_, tree)| tree.codeword == t + 1) {
+                    // The entry of the next codeword this leaf folds
+                    // to: the same index, in a tree of entries.
+                    let (distinct, paths) = &others[j];
+                    let i = distinct.binary_search(&at[t][q]).expect("opened");
+                    let (leaf, ..) = self.opening(tree, &tree.batch.leaves[i], &paths[i], &raw, 0, false)?;
                     query.joined.push(leaf);
                 }
                 if shift > 0 {
@@ -711,9 +718,11 @@ impl Opens<Sym> for HashedOpens {
 }
 
 /// The rounds of a sumcheck under `eq(tau, .)`, from the claim `claim`:
-/// the point and the last claim, if every round's polynomial (three
-/// coefficients, lowest first) sums to the claim before it.
-pub fn rounds<A: Alg, T: Transcript<A>>(tr: &mut T, polys: &[[F; 3]], tau: &[A], claim: A) -> Option<(Vec<A>, A)> {
+/// the point and the last claim. A round's polynomial `h` is sent as its
+/// constant and leading coefficients; the middle one is what makes
+/// `(1 + tau) h(0) + tau h(1)` the claim before it. `None` if a `tau`
+/// is zero: nothing is divided by then.
+pub fn rounds<A: Alg, T: Transcript<A>>(tr: &mut T, polys: &[[F; 2]], tau: &[A], claim: A) -> Option<(Vec<A>, A)> {
     if polys.len() != tau.len() {
         return None;
     }
@@ -721,12 +730,10 @@ pub fn rounds<A: Alg, T: Transcript<A>>(tr: &mut T, polys: &[[F; 3]], tau: &[A],
     let mut point = Vec::with_capacity(tau.len());
     for (poly, tau_v) in polys.iter().zip(tau) {
         let h = tr.elements(poly);
-        let [h0, h1, h2] = [h[0].clone(), h[1].clone(), h[2].clone()];
-        // (1 + tau) h(0) + tau h(1): h(0) and tau times what h(1) adds.
-        let sum = tau_v.clone() * (h1.clone() + h2.clone()) + h0.clone();
-        if !sum.is(&claim) {
-            return None;
-        }
+        let [h0, h2] = [h[0].clone(), h[1].clone()];
+        // h(1) is the claim less (1 + tau) h(0), over tau; the middle
+        // coefficient is that less the other two.
+        let h1 = (claim + h0.clone()) * tau_v.inv()? + h2.clone();
         let r = tr.challenge();
         claim = (h2 * r.clone() + h1) * r.clone() + h0;
         point.push(r);

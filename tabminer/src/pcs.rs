@@ -148,36 +148,50 @@ pub struct Params {
     /// Whether the commitment hides the polynomial ([`commit_blind`]),
     /// and the argument above it everything it says of it.
     pub blind: bool,
+    /// Once the polynomial has this many variables left or fewer where a
+    /// codeword would be committed, it is sent as it is and no more
+    /// codewords are: zero for one that is folded to a constant.
+    pub last: usize,
 }
 
 impl Params {
     /// Grinding before the queries at every proven level: 2^20 hashes,
-    /// some milliseconds, for 29 queries fewer at rate 1/4.
+    /// some milliseconds, for 29 queries fewer at rate 1/4. A proof
+    /// that is published may grind more ([`Params::ground`]).
     pub const QUERY_GRINDING: usize = 20;
 
     /// Parameters for `security` bits, proven: every round errs with
     /// probability below `2^-(security + 1)`.
     pub fn proven(m: usize, log_inv_rate: usize, security: usize) -> Params {
+        Params::proven_ground(m, log_inv_rate, security, Self::QUERY_GRINDING)
+    }
+
+    /// [`Params::proven`], with `grinding` bits ground before the
+    /// queries: each bit is twice the hashing, once a proof, and about
+    /// a query and a half fewer at rate 1/4. For a proof whose size
+    /// matters more than a second of proving.
+    pub fn proven_ground(m: usize, log_inv_rate: usize, security: usize, grinding: usize) -> Params {
         assert!((1..=QUERY_MICROBITS.len()).contains(&log_inv_rate));
         // A sumcheck round is 127 bits, and is not ground.
         assert!(security + 1 < FIELD_BITS);
-        let from_queries = (security + 1).saturating_sub(Self::QUERY_GRINDING) as u64 * 1_000_000;
+        let from_queries = (security + 1).saturating_sub(grinding) as u64 * 1_000_000;
         let queries = from_queries.div_ceil(QUERY_MICROBITS[log_inv_rate - 1]) as usize;
         Params {
             m,
             log_inv_rate,
             queries,
             arity: 4,
-            query_grinding: Self::QUERY_GRINDING,
+            query_grinding: grinding,
             round_bits: security + 1,
             blind: false,
+            last: 8,
         }
     }
 
     /// Parameters with no grinding and `queries` queries: for tests, and
     /// for measuring what the parts cost.
     pub fn plain(m: usize, log_inv_rate: usize, queries: usize, arity: usize) -> Params {
-        Params { m, log_inv_rate, queries, arity, query_grinding: 0, round_bits: 0, blind: false }
+        Params { m, log_inv_rate, queries, arity, query_grinding: 0, round_bits: 0, blind: false, last: 0 }
     }
 
     /// The same, for proofs that hide what they are of. The queries are
@@ -199,6 +213,20 @@ impl Params {
             steps.push(self.m % self.arity);
         }
         steps
+    }
+
+    /// The round after which the polynomial is sent as it is
+    /// ([`Params::last`]), and how many codewords are committed before:
+    /// the first, and one where each step before that round ends.
+    pub fn sent(&self) -> (usize, usize) {
+        let (mut round, mut trees) = (0, 0);
+        for step in self.steps() {
+            if round > 0 && self.m - round <= self.last {
+                break;
+            }
+            (round, trees) = (round + step, trees + 1);
+        }
+        (round, trees)
     }
 
     /// Bits ground before the challenge of folding round `round`, which
@@ -288,6 +316,10 @@ pub struct Proof {
     /// Each round's nonce, ground before its challenge; zero where the
     /// round needs none.
     pub fold_nonces: Vec<u64>,
+    /// The polynomial folded so far, with what joined it, where no more
+    /// codewords are committed ([`Params::last`]): its values on what
+    /// is left of the cube. Empty if the folding goes on to a constant.
+    pub last: Vec<F>,
     /// The polynomial at the challenges: what its codeword folds to.
     pub final_value: F,
     /// Each joiner at its challenges.
@@ -457,7 +489,10 @@ pub fn commit_at(params: &Params, domain: &Domain, f: &[F], round: usize) -> Com
     let t = oracle_at(&steps, round).filter(|t| *t > 0).expect("a polynomial joins where a codeword is committed");
     assert_eq!(f.len(), 1 << (params.m - round));
     let codeword = domain.encode_up(f, round);
-    let tree = MerkleTree::new(&codeword, 1 << steps[t]);
+    // Its leaves are single entries: a query needs one of them, not
+    // the sixteen a codeword that is folded on is opened by.
+    let _ = steps[t];
+    let tree = MerkleTree::new(&codeword, 1);
     Committed { codeword, tree, blind: None }
 }
 
@@ -496,6 +531,8 @@ pub fn open_weighted(
     // The committed codewords after the first, and the one being folded
     // when it is none of them.
     let mut oracles: Vec<Committed> = Vec::new();
+    let (stop, trees) = params.sent();
+    let mut last: Vec<F> = Vec::new();
     let mut current: Vec<F> = Vec::new();
     let mut committed = true;
     let mut boundary = steps[0];
@@ -560,7 +597,10 @@ pub fn open_weighted(
         for joiner in joiners.iter().filter(|j| j.round == i + 1) {
             // The first is this one's size from here. Adding the
             // codewords is a round like a fold: ground like one.
-            assert!(i + 1 == boundary && i + 1 < m, "a polynomial joins where a codeword is committed");
+            assert!(
+                (i + 1 == boundary || i + 1 == stop) && i + 1 < m,
+                "a polynomial joins where a codeword is committed"
+            );
             join_nonces.push(tr.grind(params.fold_grinding(i + 1)));
             let theta = tr.challenge();
             let add = &joiner.com.codeword;
@@ -570,6 +610,15 @@ pub fn open_weighted(
                 }
             });
             joined.push((joiner.f.to_vec(), joiner.weights.clone(), theta));
+        }
+        if i + 1 == stop && i + 1 < m {
+            // No more codewords: the polynomial, with what joined it.
+            last = f.clone();
+            for (g, _, theta) in joined.iter().chain(&blinder).chain(&padded) {
+                last.iter_mut().zip(g).for_each(|(x, y)| *x += *theta * *y);
+            }
+            tr.absorb_fs(&last);
+            boundary = m + 1;
         }
         if i + 1 == boundary && i + 1 < m {
             let leaf = 1 << steps[oracles.len() + 1];
@@ -617,19 +666,24 @@ pub fn open_weighted(
     let mut joined_openings = Vec::with_capacity(joiners.len());
     let mut round = 0;
     for (t, s) in steps.iter().enumerate() {
+        // A query's entry in this codeword is its leaf in the one before.
+        for joiner in joiners.iter().filter(|j| j.round == round) {
+            joined_openings.push(Batch::of(joiner.com, &indices, 1));
+        }
+        if t == trees {
+            break;
+        }
         if t > 0 {
             indices.iter_mut().for_each(|i| *i >>= s);
         }
         openings.push(Batch::of(if t == 0 { com } else { &oracles[t - 1] }, &indices, 1 << s));
-        for joiner in joiners.iter().filter(|j| j.round == round) {
-            joined_openings.push(Batch::of(joiner.com, &indices, 1 << s));
-        }
         round += s;
     }
     Proof {
         roots: oracles.iter().map(|o| o.tree.root()).collect(),
         rounds,
         fold_nonces,
+        last,
         final_value,
         joined_finals,
         join_nonces,
@@ -746,9 +800,12 @@ pub fn shapes(params: &Params) -> Vec<(usize, usize)> {
 
 /// Elements in a leaf of an opening's codeword `codeword`: the first's
 /// has two more in a commitment that hides ([`commit_blind`]). A
-/// joiner's has none.
+/// joiner's leaf is one entry, in a tree as much higher.
 pub fn leaf_len(params: &Params, codeword: usize, joined: bool) -> usize {
-    (1 << params.steps()[codeword]) + if params.blind && codeword == 0 && !joined { 2 } else { 0 }
+    if joined {
+        return 1;
+    }
+    (1 << params.steps()[codeword]) + if params.blind && codeword == 0 { 2 } else { 0 }
 }
 
 impl Opens<F> for Batched {
@@ -767,8 +824,11 @@ impl Opens<F> for Batched {
             at.push(at[at.len() - 1].iter().map(|i| i >> s).collect());
         }
         let mut leaves = |tree: &Tree<F>, joined: bool| -> Option<Vec<Vec<F>>> {
-            let (height, _) = shapes[tree.codeword];
-            let indices = &at[tree.codeword];
+            // A joiner's tree has a leaf for each entry of the codeword
+            // it joined: a query's is its leaf in the codeword before.
+            let (height, s) = shapes[tree.codeword];
+            let (height, indices) =
+                if joined { (height + s, &at[tree.codeword - 1]) } else { (height, &at[tree.codeword]) };
             let leaf = leaf_len(params, tree.codeword, joined);
             let (distinct, hashed) = tree.batch.check(tree.root, indices, leaf, height)?;
             self.compressions += hashed;
@@ -848,8 +908,19 @@ impl<A: Alg> Layers<A> {
     }
 }
 
-/// What a query's leaves fold to, if each codeword's leaf holds what the
-/// one before folded to (and, where polynomials joined, theirs).
+/// Where a query's folding ends: after the committed codewords, at the
+/// polynomial that was sent if one was, or at the constant.
+struct Ends<'a, A> {
+    trees: usize,
+    last: &'a [A],
+    end: &'a A,
+}
+
+/// Whether a query's leaves fold rightly: each codeword's leaf holds
+/// what the one before folded to (and, where polynomials joined,
+/// theirs), and the last folds to the polynomial sent, at the query's
+/// point, or to the constant.
+#[allow(clippy::too_many_arguments)]
 fn fold_query<A: Alg>(
     domain: &Domain,
     steps: &[usize],
@@ -857,8 +928,9 @@ fn fold_query<A: Alg>(
     thetas: &[A],
     places: &[usize],
     blind: Option<&[A; 2]>,
+    ends: &Ends<A>,
     query: &Query<A>,
-) -> Option<A> {
+) -> Option<()> {
     let lift = |c: F| query.point.lift(c);
     // `W_i` at the query's point in the whole domain, for every layer:
     // `W_(i+1)(y) = W_i(y) (W_i(y) + W_i(x^i))`. The point of a leaf of
@@ -871,26 +943,29 @@ fn fold_query<A: Alg>(
         wi = (kept.clone() + lift(domain.norm(i))) * kept.clone();
         w.push(kept);
     }
+    // What joined the codeword `t`, at the query's entry of it, added to
+    // what was folded so far.
+    let joins = |t: usize, mut c: A| -> A {
+        for j in (0..places.len()).filter(|j| places[*j] == t) {
+            c = thetas[j].clone() * query.joined[j][0].clone() + c;
+        }
+        if let (Some(thetas), 1) = (blind, t) {
+            // The blinding polynomial's entry and the pads': the
+            // first leaf's last two.
+            for (theta, entry) in thetas.iter().zip(&query.leaves[0][1 << steps[0]..]) {
+                c = theta.clone() * entry.clone() + c;
+            }
+        }
+        c
+    };
     let mut carried: Option<A> = None;
     let mut layer = 0;
-    for (t, s) in steps.iter().enumerate() {
+    for (t, s) in steps.iter().enumerate().take(ends.trees) {
         let bits = &query.bits[t];
-        if let Some(mut c) = carried.take() {
-            // The polynomials that join here: their codewords were added
-            // to what was folded so far.
-            for j in (0..places.len()).filter(|j| places[*j] == t) {
-                c = thetas[j].clone() * select(&query.joined[j], bits) + c;
-            }
-            if let (Some(thetas), 1) = (blind, t) {
-                // The blinding polynomial's entry and the pads': the
-                // first leaf's last two.
-                for (theta, entry) in thetas.iter().zip(&query.leaves[0][1 << steps[0]..]) {
-                    c = theta.clone() * entry.clone() + c;
-                }
-            }
-            if !c.is(&select(&query.leaves[t], bits)) {
-                return None;
-            }
+        if let Some(c) = carried.take()
+            && !joins(t, c).is(&select(&query.leaves[t], bits))
+        {
+            return None;
         }
         let mut vals = query.leaves[t][..1 << s].to_vec();
         for j in 0..*s {
@@ -910,7 +985,19 @@ fn fold_query<A: Alg>(
         carried = Some(vals.swap_remove(0) * layers.whole[t].clone());
         layer += s;
     }
-    carried
+    let carried = carried?;
+    if ends.last.is_empty() {
+        return carried.is(ends.end).then_some(());
+    }
+    // The codeword of the polynomial sent, at the point folded to: its
+    // values are coefficients, of the products of the layers' twiddles
+    // there. A twiddle past the leaves is the query's point's alone.
+    let mut values = ends.last.to_vec();
+    for (w, scale) in w.iter().zip(&layers.scale).skip(layer) {
+        let twiddle = (w.clone() * scale.clone()).kept();
+        values = values.chunks_exact(2).map(|p| p[1].clone() * twiddle.clone() + p[0].clone()).collect();
+    }
+    joins(ends.trees, carried).is(&values[0]).then_some(())
 }
 
 /// [`verify`] for [`open_weighted`], all but the last check. The caller
@@ -937,11 +1024,13 @@ pub fn verify_weighted<A: Alg, T: Transcript<A>, O: Opens<A>>(
 ) -> Option<Opening<A>> {
     let m = params.m;
     let steps = params.steps();
+    let (stop, trees) = params.sent();
     if domain.k != params.k()
         || proof.rounds.len() != m
         || proof.fold_nonces.len() != m
-        || proof.roots.len() != steps.len() - 1
-        || proof.openings.len() != steps.len()
+        || proof.roots.len() != trees - 1
+        || proof.openings.len() != trees
+        || proof.last.len() != if stop < m { 1 << (m - stop) } else { 0 }
         || [proof.joined_finals.len(), proof.join_nonces.len(), proof.joined_openings.len()] != [joiners.len(); 3]
         || (params.blind && steps.len() < 2)
         || (!params.blind && (proof.blind_sum, proof.blind_nonces, proof.pad_final) != (F::ZERO, [0; 2], F::ZERO))
@@ -957,6 +1046,7 @@ pub fn verify_weighted<A: Alg, T: Transcript<A>, O: Opens<A>>(
     }
     let mut claim = target;
     let mut blind_thetas: Option<[A; 2]> = None;
+    let mut last: Vec<A> = Vec::new();
     let mut thetas = Vec::with_capacity(joiners.len());
     let mut rs = Vec::with_capacity(m);
     let mut roots = vec![root];
@@ -994,6 +1084,10 @@ pub fn verify_weighted<A: Alg, T: Transcript<A>, O: Opens<A>>(
             claim = theta.clone() * joiner.target.clone() + claim;
             thetas.push(theta);
         }
+        if i + 1 == stop && i + 1 < m {
+            last = tr.elements(&proof.last);
+            boundary = m + 1;
+        }
         if i + 1 == boundary && i + 1 < m {
             let next = &proof.roots[roots.len() - 1];
             roots.push((next, tr.digest(next)));
@@ -1026,11 +1120,21 @@ pub fn verify_weighted<A: Alg, T: Transcript<A>, O: Opens<A>>(
         end = theta.clone() * f.clone() + end;
     }
     let end = end.kept();
-    let layers = Layers::new(domain, &steps, &rs)?;
-    for query in &queries {
-        if !fold_query(domain, &steps, &layers, &thetas, &places, blind_thetas.as_ref(), query)?.is(&end) {
+    // The polynomial sent, at the challenges after it: what all of it
+    // folds to.
+    if !last.is_empty() {
+        let mut values = last.clone();
+        for r in &rs[stop..] {
+            values = values.chunks_exact(2).map(|p| (p[0].clone() + p[1].clone()) * r.clone() + p[0].clone()).collect();
+        }
+        if !values[0].is(&end) {
             return None;
         }
+    }
+    let layers = Layers::new(domain, &steps, &rs)?;
+    let ends = Ends { trees: trees.len(), last: &last, end: &end };
+    for query in &queries {
+        fold_query(domain, &steps, &layers, &thetas, &places, blind_thetas.as_ref(), &ends, query)?;
     }
     let indices = indices.into_iter().map(|(i, _)| i).collect();
     Some(Opening { r: rs, claim, thetas, indices, final_value, joined_finals, pad_final })
@@ -1043,6 +1147,7 @@ impl Proof {
             roots: Vec::new(),
             rounds: Vec::new(),
             fold_nonces: Vec::new(),
+            last: Vec::new(),
             final_value: F::ZERO,
             joined_finals: Vec::new(),
             join_nonces: Vec::new(),
@@ -1070,6 +1175,7 @@ impl Proof {
             w.f(*c2);
             w.u64(*nonce);
         }
+        w.fs(&self.last);
         w.f(self.final_value);
         w.fs(&self.joined_finals);
         w.len(self.join_nonces.len());
@@ -1099,6 +1205,7 @@ impl Proof {
             rounds.push((r.f()?, r.f()?));
             fold_nonces.push(r.u64()?);
         }
+        let last = r.fs()?;
         let (final_value, joined_finals) = (r.f()?, r.fs()?);
         let n = r.len(8)?;
         let join_nonces = (0..n).map(|_| r.u64()).collect::<Option<_>>()?;
@@ -1113,6 +1220,7 @@ impl Proof {
             roots,
             rounds,
             fold_nonces,
+            last,
             final_value,
             joined_finals,
             join_nonces,
@@ -1184,8 +1292,16 @@ mod tests {
         // A sum of the polynomial under weights and of the pads' under
         // theirs, opened with a polynomial that blinds.
         let mut rng = Rng(31);
-        for (m, rate) in [(10, 1), (13, 2)] {
-            let params = Params::plain(m, rate, 8, 4).hiding();
+        // Folded to a constant; sent with five variables left, after two
+        // codewords; and sent where the blinding polynomial joins, after
+        // the one.
+        for (m, rate, last) in [(10, 1, 0), (13, 2, 0), (13, 2, 5), (10, 1, 8)] {
+            let params = Params { last, ..Params::plain(m, rate, 8, 4).hiding() };
+            assert_eq!(
+                params.sent(),
+                [(10, 3), (13, 4), (8, 2), (4, 1)]
+                    [[(10, 0), (13, 0), (13, 5), (10, 8)].iter().position(|x| *x == (m, last)).unwrap()]
+            );
             let domain = Domain::new(params.k(), true);
             let (f, weights) = (rng.fs(1 << m), rng.fs(1 << m));
             let (g, pads, pad_weights) = (rng.fs(1 << (m - 4)), rng.fs(1 << (m - 4)), rng.fs(1 << (m - 4)));
@@ -1222,13 +1338,19 @@ mod tests {
             assert!(run(sum, &|p| p.openings[0].leaves[0][16] += F::ONE).is_none());
             assert!(run(sum, &|p| p.openings[0].leaves[0][17] += F::ONE).is_none());
             assert!(run(sum, &|p| p.openings[0].leaves[0][3] += F::ONE).is_none());
+            if last > 0 {
+                assert!(run(sum, &|p| p.last[1] += F::ONE).is_none());
+                assert!(run(sum, &|p| _ = p.last.pop()).is_none());
+            }
         }
     }
 
     #[test]
     fn a_proof_verifies() {
-        for (m, rate, arity) in [(10, 2, 4), (12, 5, 4), (9, 1, 3), (7, 3, 1), (11, 2, 6)] {
-            let params = Params::plain(m, rate, 12, arity);
+        for (m, rate, arity, last) in
+            [(10, 2, 4, 0), (12, 5, 4, 0), (9, 1, 3, 0), (7, 3, 1, 0), (11, 2, 6, 0), (12, 2, 4, 5), (9, 1, 3, 9)]
+        {
+            let params = Params { last, ..Params::plain(m, rate, 12, arity) };
             let (domain, f, z, v) = setup(&params, 8 + m as u64);
             let com = commit(&params, &domain, &f);
             let proof = open(&params, &domain, &com, &f, &z, v);

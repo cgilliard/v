@@ -600,16 +600,16 @@ impl Trace {
         let steps = params.steps();
         let mut indices = indices.to_vec();
         let mut layer = 0;
-        for (t, s) in steps.iter().enumerate() {
+        for (t, s) in steps.iter().enumerate().take(proof.pcs.openings.len()) {
+            if let (1, Some(program)) = (t, program) {
+                self.batch(program, &proof.pcs.joined_openings[0], &indices, params.k() - layer);
+            }
             if t > 0 {
                 indices.iter_mut().for_each(|i| *i >>= s);
             }
             let root = if t == 0 { &proof.root } else { &proof.pcs.roots[t - 1] };
             let height = params.k() - layer - s;
             self.batch(root, &proof.pcs.openings[t], &indices, height);
-            if let (1, Some(program)) = (t, program) {
-                self.batch(program, &proof.pcs.joined_openings[0], &indices, height);
-            }
             layer += s;
         }
     }
