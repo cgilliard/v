@@ -945,6 +945,53 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn the_corners_and_the_cover_hide_together() {
+        // The corners hide the first rounds whatever the cover is, and
+        // the cover hides the leaves whatever the corners are; but the
+        // rounds read the cover too, and the leaves the corners. What
+        // is seen of both, as one map from the whole last word, is onto:
+        // the corners' sum, eight coefficients, and sixteen elements a
+        // leaf, all uniform together.
+        let (log_cols, groups, step) = (2usize, 16usize, 4usize);
+        let layout = Layout { m: vec![11], offset: vec![0], total: 11 };
+        let places = Places { log_cols, groups };
+        let domain = Domain::new(12, true);
+        let mut rng = Rng(73);
+        // Weights on everything, as the ring switching's are, and the
+        // challenge's on the corners.
+        let (chi, rs) = (rng.f(), rng.fs(4));
+        let mut weights = rng.fs(1 << 11);
+        WEIGHED.iter().for_each(|i| weights[places.corner(&layout, *i)] += chi);
+        let leaves = [9usize, 40, 41, 100, 130, 200, 255];
+        assert!(places.good(step, &leaves));
+        let seen = |at: usize| -> Vec<F> {
+            let mut message = vec![F::ZERO; 1 << 11];
+            message[at] = F::ONE;
+            let corner = (0..32).position(|i| places.corner(&layout, i) == at);
+            let mut out = vec![if corner.is_some_and(|i| WEIGHED.contains(&i)) { F::ONE } else { F::ZERO }];
+            let (mut f, mut w) = (message.clone(), weights.clone());
+            for r in &rs {
+                let pairs = || f.chunks_exact(2).zip(w.chunks_exact(2));
+                out.push(pairs().fold(F::ZERO, |s, (f, w)| s + f[0] * w[0]));
+                out.push(pairs().fold(F::ZERO, |s, (f, w)| s + (f[0] + f[1]) * (w[0] + w[1])));
+                let fold = |t: &[F]| -> Vec<F> { t.chunks_exact(2).map(|p| p[0] + *r * (p[0] + p[1])).collect() };
+                (f, w) = (fold(&f), fold(&w));
+            }
+            let codeword = domain.encode(&message);
+            out.extend(leaves.iter().flat_map(|l| codeword[l << step..(l + 1) << step].iter().copied()));
+            out
+        };
+        let columns: Vec<Vec<F>> = (0..groups)
+            .flat_map(|g| (0..32).map(move |bit| (g, bit)))
+            .map(|(g, bit)| seen(places.at(&layout, g, bit)))
+            .collect();
+        let values = 9 + (leaves.len() << step);
+        let rows: Vec<Vec<F>> = (0..values).map(|v| columns.iter().map(|c| c[v]).collect()).collect();
+        assert_eq!(rank(rows), values);
+    }
+
+    #[test]
     fn a_form_over_pads_is_kept_by_sums_and_known_products() {
         // The verifier's arithmetic over what it does not know, against
         // the same with the pads known.

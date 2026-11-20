@@ -221,6 +221,43 @@ holds an entry of `g`'s codeword, and those of later trees are of the
 blinded sum, so each has 128 bits that the view does not fix, and its
 hash says nothing in the random oracle model.
 
+### 5. That these hold together
+
+Each of the three coverings above was argued by itself, and they are
+not independent of one another: the first four rounds read the leaves'
+cover as well as the corners (the ring switching weighs every element
+of a table), and a leaf's elements depend on the corners as well as on
+the cover (the corners are coefficients like any others). So what must
+be shown is that the corners' sum, the eight coefficients of the first
+rounds and every element of every opened leaf are uniform *together*,
+as one map from the whole of the first table's last word.
+
+Write the map as two blocks of rows, the rounds' `(M_c | M_v)` and the
+leaves' `(L_c | L_v)`, over the corners' group `c` and the cover `v`.
+The leaves' rule gives `L_v` full row rank. A dependence between the
+rows is an `a` and a `b`, not both zero, with `a M_v = b L_v` and
+`a M_c = b L_c`. Since `L_v` has full row rank, `b` is a linear
+function of `a`, say `b = a B`, and `a` is not zero. So a dependence is
+a nonzero `a` with `a (M_c - B L_c) = 0`. Now `M_c` is the rounds'
+matrix on the corners' group for the weights there, which are whatever
+the ring switching put plus `chi` on the four corners: `M_c = N + chi
+M`, with `M` the matrix for the corners' weights alone, of full row
+rank nine (section 4). Nothing else in the condition depends on `chi`.
+So `(N - B L_c) + chi M` has a nine-by-nine minor that is a polynomial
+in `chi` with a nonzero leading coefficient, and has full row rank for
+all but nine values of `chi`: then there is no such `a`. A test builds
+the whole map for one case and computes its rank
+(`the_corners_and_the_cover_hide_together`).
+
+The pads' polynomial is apart from this: it is no part of a table, and
+what is seen of it (an entry a query, and its last value) is hidden by
+its own first elements. Those are one more than the queries at least.
+The entries are a polynomial's values at as many points as there are
+queries, onto for coefficients of that many low degrees; the last
+value is the first elements under `eq` at the challenges, which lies
+in the span of those evaluations only if a nonzero multilinear
+polynomial vanishes at the challenges.
+
 ## The simulator
 
 Given the statement and the challenges (it programs the oracle):
@@ -279,3 +316,40 @@ witnesses' messages.
 - The first table must have a word to spare and more than 128 rows, and
   the polynomial be large enough for the pads (about 2^17 elements).
   The chain's proof is far past both; small proofs cannot hide.
+
+## A second pass
+
+After the construction was built I went through it again as an
+attacker of my own argument, looking at every value a verifier sees and
+asking what it is a function of. What that found:
+
+- **The pads were entangled with the tables** (found before this
+  document's first full version, and the reason the pads have a
+  polynomial of their own): described under "Where a prover can put
+  randomness".
+- **The opening's coverings were argued one at a time.** That they
+  hold together needed its own argument: part 5, added in this pass,
+  with a test.
+- **Nothing else.** Checked, one by one: every element of the
+  argument's part of a proof is sent through the one function that
+  adds a pad, but the programs' part of the sum, which is public; no
+  pad or triple is used twice; the products' clear values each have a
+  pad of their own; every nonce is a function of the transcript; the
+  queries' nonce is chosen by a rule on the queries' places alone; the
+  last value sent is the blinded one; the polynomial sent early is the
+  blinded one; an opened leaf is sixteen covered elements and two
+  entries, each accounted for; and the number of elements in a proof
+  depends on the tables' sizes only.
+
+What the argument still takes on trust, stated once:
+
+1. Blake3 as a random oracle, for the challenges and for the hashes of
+   unopened leaves.
+2. The challenges are honest ones (they are hashes).
+3. The seed is random and used for one proof.
+4. Three statements of the form "this map is onto unless a challenge
+   is one of a few bad values" are proven only up to a rank that a test
+   computes for one case: the corners' nine values, the leaves' rule,
+   and the two together. Each has an argument above; none has been
+   checked by anyone else.
+5. Nothing is claimed about what timing or memory use reveal.
