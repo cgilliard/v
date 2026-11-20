@@ -716,6 +716,280 @@ mod tests {
         }
     }
 
+    /// A block of 256 signatures, from its signatures to the chain's
+    /// proof, at the chain's parameters: 128 payments of two inputs and
+    /// two outputs, spending what the block before made. What each proof
+    /// takes, what can be made before the block is known, and the most
+    /// memory held.
+    #[test]
+    #[ignore = "timing; run with --release --nocapture"]
+    fn full_small_block_timing() {
+        use crate::block::{Beside, beside_into, root_with};
+        use crate::ledger::Input;
+        use crate::signature::{Signed, node_into, segment_into};
+        use crate::signed;
+        use std::time::{Duration, Instant};
+        let params = |m: usize| Params::proven(m, 2, crate::pcs::SECURITY);
+        let published = |m: usize| Params::proven_ground(m, 2, crate::pcs::SECURITY, 24);
+        let tables = Tables::new();
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::MAINNET);
+        let source = text.table(crate::pow::PowParams::MAINNET.log_dataset_items);
+        let digest = |x: &[F]| -> Digest { [x[0].0.to_le_bytes(), x[1].0.to_le_bytes()].concat().try_into().unwrap() };
+        let (payments, per_proof) = (128usize, 64usize);
+        let mut most = 0usize;
+        let mut timed = |name: &str, t: Instant, what: String| -> Duration {
+            let (took, held) = (t.elapsed(), peak());
+            most = most.max(held);
+            println!("  {name}: {took:.2?}, {held} MB{what}");
+            took
+        };
+        let shape = |p: &Proved| format!(", {} KB, 2^{} elements", p.size() / 1000, p.params.m);
+        let worked = |work_hash: &Digest, n: u64| {
+            let cx = Shared::new();
+            let (work, stated) = crate::work::work_into(&cx, &source, work_hash, &crate::pow::nonce_from_u64(n));
+            (crate::proof::prove_with(cx, vec![], Some(work), params, [128, 128]), stated)
+        };
+
+        // The block before: one transaction that makes the 256 outputs,
+        // each a key's. Its proofs are not what is measured.
+        let mut keys: Vec<SecretKey> = (0..2 * payments)
+            .map(|i| SecretKey::generate_with_height(&[i as u8, (i >> 8) as u8 + 1].repeat(16).try_into().unwrap(), 2))
+            .collect();
+        let hashes: Vec<Digest> = keys.iter().map(|k| key_hash(&k.public_key())).collect();
+        let pays = MAINNET_EMISSION.subsidy(1);
+        let amount = |i: usize| if i == 0 { pays - 100 * (2 * payments as u64 - 1) } else { 100 };
+        let made = Transaction {
+            inputs: vec![],
+            outputs: (0..2 * payments).map(|i| Output::to(&hashes[i], amount(i), [i as u8; MEMO])).collect(),
+            ops: vec![],
+            policy: vec![],
+            covered: 0,
+        };
+        let nothing = signed::empty_roots()[signed::DEPTH];
+        let mut state = Outputs::default();
+        let start = Record::block(&state, 1, pays);
+        let mut run = Run::new(&start, closed(), &nothing);
+        run.head(&made);
+        let mut owned = Vec::new();
+        for (i, output) in made.outputs.iter().enumerate() {
+            run.output(output, &hashes[i], &state.path(state.next));
+            let position = state.insert(output, 1);
+            owned.push(Input {
+                key: keys[i].public_key(),
+                amount: amount(i),
+                memo: [i as u8; MEMO],
+                created: 1,
+                position,
+            });
+        }
+        let run = segment::prove(run, 512, params);
+        let first_work = worked(&[1; 32], 0);
+        let cx = Shared::new();
+        let mut reader = Deferred::new(&cx);
+        let shown = Worked { proof: &first_work.0, stated: &first_work.1 };
+        let first_stated = root_into(&cx, &tables, &mut reader, &Runs::One(&run), None, Some(&shown), 1).unwrap();
+        reader.settle(&tables.all());
+        let first_root = prove(cx, vec![], params);
+        assert!(first_root.holds);
+
+        // The block measured. Its signatures, in four proofs; the three
+        // that join them: all of it before any block is known.
+        println!("made ahead:");
+        peak();
+        let subsidy = MAINNET_EMISSION.subsidy(2);
+        let txs: Vec<Transaction> = (0..payments)
+            .map(|t| {
+                let total = owned[2 * t].amount + owned[2 * t + 1].amount + if t == 0 { subsidy } else { 0 };
+                Transaction {
+                    inputs: vec![owned[2 * t].clone(), owned[2 * t + 1].clone()],
+                    outputs: vec![Output::to(&hashes[0], total - 50, [9; MEMO]), Output::to(&hashes[1], 50, [8; MEMO])],
+                    ops: vec![],
+                    policy: vec![],
+                    covered: 0,
+                }
+            })
+            .collect();
+        let mut signatures = Vec::new();
+        for (t, tx) in txs.iter().enumerate() {
+            for k in [2 * t, 2 * t + 1] {
+                let sig = keys[k].sign(&tx.id()).unwrap();
+                signatures.push((keys[k].public_key(), tx.id(), sig));
+            }
+        }
+        let mut ahead = Duration::ZERO;
+        let mut segments: Vec<(Proved, Digest)> = Vec::new();
+        for some in signatures.chunks(per_proof) {
+            let t = Instant::now();
+            let cx = Shared::new();
+            let mut chains = Vec::new();
+            let root = segment_into(&cx, &mut chains, some, per_proof).unwrap();
+            let proof = prove(cx, chains, params);
+            assert!(proof.holds);
+            ahead += timed(&format!("{} signatures", some.len()), t, shape(&proof));
+            segments.push((proof, root));
+        }
+        let mut node = |name: &str, a: &Signed, b: &Signed| {
+            let t = Instant::now();
+            let cx = Shared::new();
+            let mut reader = Deferred::new(&cx);
+            let stated = node_into(&cx, &tables.compiled, &mut reader, [a, b]).unwrap();
+            reader.settle(&tables.all());
+            let proof = prove(cx, vec![], params);
+            assert!(proof.holds);
+            ahead += timed(name, t, shape(&proof));
+            (proof, stated)
+        };
+        let leaves: Vec<Signed> = segments.iter().map(|(p, root)| Signed::Segment(p, *root)).collect();
+        let left = node("two proofs of signatures joined", &leaves[0], &leaves[1]);
+        let right = node("two proofs of signatures joined", &leaves[2], &leaves[3]);
+        let top = node("the two joins joined", &Signed::Node(&left.0, &left.1), &Signed::Node(&right.0, &right.1));
+        let all = Signed::Node(&top.0, &top.1);
+        let (entries_root, level) = all.root();
+        let set = signed::lift(&entries_root, level, signed::DEPTH);
+        // Every entry's place in the set: a proof's slots, one proof
+        // after another.
+        let mut slots = vec![crate::hash::EMPTY; segments.len() * signed::SLOTS];
+        for (i, (pk, msg, sig)) in signatures.iter().enumerate() {
+            slots[i / per_proof * signed::SLOTS + i % per_proof] = crate::signature::entry(pk, msg, sig.index);
+        }
+        let tree = signed::Tree::new(&slots);
+        assert_eq!(tree.root(), entries_root);
+
+        // The chain so far: its beginning, and the block before.
+        let (genesis, began, plan, own, sized) = {
+            // The two shapes of block: one whose root verifies the work
+            // alone, and one whose root verifies signatures and work as
+            // one proof. The second's programs are known once it is
+            // made; for the plan it is made below, of this block.
+            let _ = &first_stated;
+            (None::<Proved>, None::<Vec<F>>, None::<Plan>, None::<Digest>, [1usize << 16, 1 << 19])
+        };
+        let _ = (genesis, began, plan, own);
+
+        println!("after the block before is known:");
+        let mut after = Duration::ZERO;
+        // The chain's proof before this block states what the header
+        // before must: so the block before is stepped first (not timed),
+        // with a plan that names this block's shape, which needs this
+        // block's root's programs. Those do not depend on what the block
+        // holds: a root made of this block against any header gives them.
+        let rest = [0x71; 32];
+        let build = |work: &(Proved, Vec<F>), say: Option<&mut dyn FnMut(&str, Instant, String) -> Duration>| {
+            let mut times = Vec::new();
+            let t = Instant::now();
+            let start = Record::block(&state, 2, subsidy);
+            let mut local = state.clone();
+            let mut run = Run::new(&start, closed(), &set);
+            let mut record = start;
+            let mut applied = state.clone();
+            for (n, tx) in txs.iter().enumerate() {
+                run.head(tx);
+                for (k, input) in tx.inputs.iter().enumerate() {
+                    let i = 2 * n + k;
+                    let place = i / per_proof * signed::SLOTS + i % per_proof;
+                    let mut siblings = tree.path(place).siblings;
+                    siblings.extend_from_slice(&signed::empty_roots()[level..signed::DEPTH]);
+                    run.input(input, &local.path(input.position), signatures[i].2.index, &(place as u64, siblings));
+                    local.set(input.position, crate::hash::EMPTY);
+                }
+                for output in &tx.outputs {
+                    let to = if output.amount == 50 { &hashes[1] } else { &hashes[0] };
+                    run.output(output, to, &local.path(local.next));
+                    local.insert(output, 2);
+                }
+                record.apply(&mut applied, tx).unwrap();
+            }
+            let run = segment::prove(run, 512, params);
+            times.push((
+                "the payments' run",
+                t,
+                format!(", {} KB, 2^{} elements", run.proof.size() / 1000, run.params.m),
+            ));
+            let t2 = Instant::now();
+            let cx = Shared::new();
+            let mut reader = Deferred::new(&cx);
+            let shown = Worked { proof: &work.0, stated: &work.1 };
+            let both = beside_into(&cx, &tables, &mut reader, &all, &shown).unwrap();
+            reader.settle(&tables.all());
+            let beside = prove(cx, vec![], params);
+            assert!(beside.holds);
+            times.push(("signatures and work as one", t2, shape(&beside)));
+            let t3 = Instant::now();
+            let cx = Shared::new();
+            let mut reader = Deferred::new(&cx);
+            let stated =
+                root_with(&cx, &tables, &mut reader, &Runs::One(&run), &Beside::Joined(&beside, &both), 2).unwrap();
+            reader.settle(&tables.all());
+            let root = prove(cx, vec![], params);
+            assert!(root.holds);
+            times.push(("the root", t3, shape(&root)));
+            let _ = (say, times);
+            (root, stated)
+        };
+        // (The closure above is run twice: once for the shape, once
+        // against the real header, timed by hand below.)
+        let sample = build(&first_work, None);
+        let rested = |stated: &[F]| -> [Digest; PROGRAMS] { std::array::from_fn(|i| digest(&stated[2 * i..])) };
+        let shapes = vec![
+            Shape { root: first_root.program, rested: rested(&first_stated) },
+            Shape { root: sample.0.program, rested: rested(&sample.1) },
+        ];
+        let cx = Shared::new();
+        let began = genesis_into(&cx);
+        let genesis = prove_hidden(cx, published, sized, [0xC0; 32]);
+        let plan = Plan::new(shapes, genesis.program, MAINNET_EMISSION);
+        let step = |index: usize, this: &Stated, before: &Stated, first: bool, own: &Digest, rest: &Digest| {
+            let cx = Shared::new();
+            let mut reader = Deferred::new(&cx);
+            let said = step_into(&cx, &tables, &mut reader, &plan, index, this, before, first, own, rest).unwrap();
+            reader.settle(&tables.all());
+            (cx, said)
+        };
+        let origin = Stated { proof: &genesis, stated: &began };
+        let first_block = Stated { proof: &first_root, stated: &first_stated };
+        let own = program_of(step(0, &first_block, &origin, true, &[0; 32], &[0; 32]).0, published, sized);
+        // The block before's real root: against the header the chain
+        // begins from.
+        let genesis_header = crate::header::work_hash(&[0; 32], &genesis.statement(), &[0x70; 32]);
+        let work_one = worked(&genesis_header, 1);
+        let cx = Shared::new();
+        let mut reader = Deferred::new(&cx);
+        let shown = Worked { proof: &work_one.0, stated: &work_one.1 };
+        let one_stated = root_into(&cx, &tables, &mut reader, &Runs::One(&run), None, Some(&shown), 1).unwrap();
+        reader.settle(&tables.all());
+        let one_root = prove(cx, vec![], params);
+        let (cx, one_said) =
+            step(0, &Stated { proof: &one_root, stated: &one_stated }, &origin, true, &own, &[0x70; 32]);
+        let one_step = prove_hidden(cx, published, sized, [0xC1; 32]);
+        assert!(one_step.holds && one_step.program == own);
+        peak();
+
+        // Now the block measured, against the header before it.
+        let before = Stated { proof: &one_step, stated: &one_said };
+        let work_hash = crate::header::work_hash(&digest(&one_said[16..]), &one_step.statement(), &rest);
+        let t = Instant::now();
+        let work = worked(&work_hash, 2);
+        after += timed("the work of the header before", t, shape(&work.0));
+        let t = Instant::now();
+        let (root, stated) = build(&work, None);
+        after += timed("the run, signatures and work as one, and the root", t, shape(&root));
+        let t = Instant::now();
+        let (cx, _) = step(1, &Stated { proof: &root, stated: &stated }, &before, false, &own, &rest);
+        let (hash, used) = cx.with(|c| (c.trace.rows.len(), c.asm.finish_len()));
+        let last = prove_hidden(cx, published, sized, [0xC2; 32]);
+        assert!(last.holds && last.program == own && last.verifies());
+        after += timed("the chain's step", t, format!("{}; {hash} hash rows, {used} operations", shape(&last)));
+        println!(
+            "a block of {} signatures in {payments} payments: {:.1?} made ahead, {:.1?} after; {:.1?} in all; \
+             {most} MB at most; the chain's proof {} bytes",
+            signatures.len(),
+            ahead,
+            after,
+            ahead + after,
+            last.size()
+        );
+    }
+
     /// What verifying a chain's proof takes of a process that does
     /// nothing else: the proof is read from the file `DUMP` names,
     /// which the timing above wrote.
