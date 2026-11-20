@@ -874,9 +874,7 @@ mod tests {
         // block's root's programs. Those do not depend on what the block
         // holds: a root made of this block against any header gives them.
         let rest = [0x71; 32];
-        let build = |work: &(Proved, Vec<F>), say: Option<&mut dyn FnMut(&str, Instant, String) -> Duration>| {
-            let mut times = Vec::new();
-            let t = Instant::now();
+        let build = |work: &(Proved, Vec<F>)| {
             let start = Record::block(&state, 2, subsidy);
             let mut local = state.clone();
             let mut run = Run::new(&start, closed(), &set);
@@ -900,12 +898,6 @@ mod tests {
                 record.apply(&mut applied, tx).unwrap();
             }
             let run = segment::prove(run, 512, params);
-            times.push((
-                "the payments' run",
-                t,
-                format!(", {} KB, 2^{} elements", run.proof.size() / 1000, run.params.m),
-            ));
-            let t2 = Instant::now();
             let cx = Shared::new();
             let mut reader = Deferred::new(&cx);
             let shown = Worked { proof: &work.0, stated: &work.1 };
@@ -913,8 +905,6 @@ mod tests {
             reader.settle(&tables.all());
             let beside = prove(cx, vec![], params);
             assert!(beside.holds);
-            times.push(("signatures and work as one", t2, shape(&beside)));
-            let t3 = Instant::now();
             let cx = Shared::new();
             let mut reader = Deferred::new(&cx);
             let stated =
@@ -922,13 +912,11 @@ mod tests {
             reader.settle(&tables.all());
             let root = prove(cx, vec![], params);
             assert!(root.holds);
-            times.push(("the root", t3, shape(&root)));
-            let _ = (say, times);
             (root, stated)
         };
         // (The closure above is run twice: once for the shape, once
         // against the real header, timed by hand below.)
-        let sample = build(&first_work, None);
+        let sample = build(&first_work);
         let rested = |stated: &[F]| -> [Digest; PROGRAMS] { std::array::from_fn(|i| digest(&stated[2 * i..])) };
         let shapes = vec![
             Shape { root: first_root.program, rested: rested(&first_stated) },
@@ -971,7 +959,7 @@ mod tests {
         let work = worked(&work_hash, 2);
         after += timed("the work of the header before", t, shape(&work.0));
         let t = Instant::now();
-        let (root, stated) = build(&work, None);
+        let (root, stated) = build(&work);
         after += timed("the run, signatures and work as one, and the root", t, shape(&root));
         let t = Instant::now();
         let (cx, _) = step(1, &Stated { proof: &root, stated: &stated }, &before, false, &own, &rest);
