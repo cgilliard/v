@@ -705,8 +705,49 @@ mod tests {
                 under_peak.max(step_peak),
                 step.size()
             );
+            // The proof as a node is sent it, for a process that only
+            // verifies ([`a_chain_s_proof_is_verified`]).
+            if let Ok(path) = std::env::var("DUMP") {
+                let words = step.public.iter().flat_map(|w| w.to_le_bytes());
+                let bytes: Vec<u8> = step.program.into_iter().chain(words).chain(step.proof.to_bytes()).collect();
+                std::fs::write(path, bytes).unwrap();
+            }
             last = Some((step, said));
         }
+    }
+
+    /// What verifying a chain's proof takes of a process that does
+    /// nothing else: the proof is read from the file `DUMP` names,
+    /// which the timing above wrote.
+    #[test]
+    #[ignore = "timing; run with --release --nocapture, after the block's timing with DUMP set"]
+    fn a_chain_s_proof_is_verified() {
+        let bytes = std::fs::read(std::env::var("DUMP").expect("a file to read")).unwrap();
+        let grind: usize = std::env::var("GRIND").ok().and_then(|g| g.parse().ok()).unwrap_or(24);
+        let program: Digest = bytes[..32].try_into().unwrap();
+        let public: Vec<u32> = bytes[32..64].chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        let proof = crate::argument::Proof::from_bytes(&bytes[64..]).expect("a proof");
+        let before = peak();
+        let t = std::time::Instant::now();
+        let (hash, machine) = (crate::recursion::circuit(), crate::machine::circuit());
+        let made = t.elapsed();
+        let tables = [
+            crate::argument::Table { circuit: &hash, rows: 1 << 16, public: &[] },
+            crate::argument::Table { circuit: &machine, rows: 1 << 19, public: &public },
+        ];
+        let params = Params::proven_ground(24, 2, crate::pcs::SECURITY, grind).hiding();
+        let domain = crate::ntt::Domain::new(params.k(), false);
+        let t = std::time::Instant::now();
+        let work = crate::argument::verify_tables(&params, &domain, &tables, Some(&program), &proof);
+        let took = t.elapsed();
+        assert!(work.is_some());
+        println!(
+            "a chain's proof of {} bytes: verified in {took:.2?} ({} compressions), the two circuits made in {made:.2?}; \
+             the process held {} MB at most ({before} MB before it began)",
+            bytes.len() - 64,
+            work.unwrap().compressions,
+            peak()
+        );
     }
 
     #[test]
