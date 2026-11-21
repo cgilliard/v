@@ -88,10 +88,35 @@ pub fn check_into(cx: &Shared, chains: &mut Chains, pk: &PublicKey, msg: &Digest
     let index = cx.outside(at.key[1], F(leaf as u128));
     let end_values: Vec<F> = ends.iter().flat_map(pair).collect();
     let sent: Vec<Sym> = at.ends.iter().flatten().zip(&end_values).map(|(at, x)| cx.outside(*at, *x)).collect();
+    // The key's height, which the prover gives: a bit for each level
+    // below it, falling once and for good (the first is one, a height
+    // being one at the least, and there is none at the tallest tree's
+    // height), so that the level the bits fall at is the height. What a
+    // signature is checked by is the same whatever its key's height: a
+    // proof of signatures is of one program, of whichever keys.
+    let (zero, one) = (cx.constant(F::ZERO), cx.constant(F::ONE));
+    let below: Vec<Sym> = (0..=crate::xmss::MAX_HEIGHT)
+        .map(|l| match l {
+            0 => one.clone(),
+            crate::xmss::MAX_HEIGHT => zero.clone(),
+            _ => cx.input(F((l < height) as u128)),
+        })
+        .collect();
+    for l in 1..crate::xmss::MAX_HEIGHT {
+        assert!((below[l].clone() * below[l].clone() + below[l].clone()).is(&zero));
+        assert!((below[l].clone() * (below[l - 1].clone() + one.clone())).is(&zero));
+    }
+    // Whether the height is `l`, for each it may be; and the height, as
+    // the number's element.
+    let is_height: Vec<Sym> =
+        (1..=crate::xmss::MAX_HEIGHT).map(|l| (below[l - 1].clone() + below[l].clone()).kept()).collect();
+    let height_said = (is_height.iter().enumerate())
+        .fold(zero.clone(), |sum, (l, is)| sum + is.clone() * cx.constant(F(l as u128 + 1)))
+        .kept();
     // A head is the chains' seed, and their leaf under the height and
     // the part.
     let is_head = |found: &[Sym], part: u32| {
-        let above = cx.constant(F((pk.height as u128) << 64 | (part as u128) << 96));
+        let above = height_said.clone() * cx.constant(F(1 << 64)) + cx.constant(F((part as u128) << 96));
         found[0].is(&seed) && found[1].is(&(index.clone() + above))
     };
     assert!(is_head(&taken, 0));
@@ -113,28 +138,51 @@ pub fn check_into(cx: &Shared, chains: &mut Chains, pk: &PublicKey, msg: &Digest
     let mut elements = head(pk, leaf, 2).to_vec();
     elements.extend(&end_values[4 * PK_PART..]);
     elements.extend(parts.iter().map(Sym::value));
-    let index_at = index.send();
-    let (opened, top) = cx.with(|c| {
-        let domains = [DOM_XMSS_LEAF, DOM_XMSS_TREE];
-        let opened = c.trace.opening_in(domains, &elements, leaf as u32, &sig.auth_path, index_at, true, 0, true);
-        (opened, c.trace.last())
-    });
-    let found = read(&opened.leaf, &elements);
+    let (found, leaf_node) = hashed(DOM_XMSS_LEAF, &elements);
     assert!(is_head(&found, 2));
     for (x, expect) in found[2..].iter().zip(sent[4 * PK_PART..].iter().chain(&parts)) {
         assert!(x.is(expect));
     }
-    // The leaf's index is the path's alone: nothing of it is above the
-    // tree.
-    assert!(cx.outside(opened.high, F::ZERO).is(&cx.constant(F::ZERO)));
-    let root = read(&opened.top, &pair(&top));
+    // The path, a hash a level for as many levels as the tallest tree
+    // has: the leaf's index a bit a level (none at or above the
+    // height), each bit saying which side the node so far is on. The
+    // root is the node at the height; the levels above it hash
+    // nothing that counts.
+    let mut node = leaf_node;
+    let (mut said_index, mut root) = (zero.clone(), [zero.clone(), zero.clone()]);
+    for l in 0..crate::xmss::MAX_HEIGHT {
+        let bit = cx.input(F(((leaf >> l) & 1) as u128 * (l < height) as u128));
+        assert!((bit.clone() * bit.clone() + bit.clone()).is(&zero));
+        assert!((bit.clone() * (below[l].clone() + one.clone())).is(&zero));
+        said_index = said_index + bit.clone() * cx.constant(F(1 << l));
+        let sibling = pair(sig.auth_path.get(l).unwrap_or(&[0; 32])).map(|x| cx.input(x));
+        // The node on the left if the bit is none, the sibling if it is
+        // one; and the other on the right.
+        let sides: Vec<Sym> = (0..4)
+            .map(|k| {
+                let (own, other) = (node[k % 2].clone(), sibling[k % 2].clone());
+                let turned = (own.clone() + other.clone()) * bit.clone();
+                (turned + if k < 2 { own } else { other }).kept()
+            })
+            .collect();
+        let values: Vec<F> = sides.iter().map(Sym::value).collect();
+        let (found, above) = hashed(DOM_XMSS_TREE, &values);
+        for (x, expect) in found.iter().zip(&sides) {
+            assert!(x.is(expect));
+        }
+        node = above;
+        for (half, sum) in root.iter_mut().enumerate() {
+            *sum = (sum.clone() + is_height[l].clone() * node[half].clone()).kept();
+        }
+    }
+    assert!(said_index.is(&index));
 
     // The entry: of the root reached.
     let said = [
         root[0].clone(),
         root[1].clone(),
         seed,
-        cx.constant(F(pk.height as u128)),
+        height_said,
         message[0].clone(),
         message[1].clone(),
         index,
@@ -420,6 +468,30 @@ mod tests {
         let p = prove(cx, vec![chains], |m| Params::plain(m, 1, 4, 4));
         assert!(p.holds && p.verifies());
         assert_eq!(digest_of(&p.public), stated);
+    }
+
+    /// Keys of trees of any height are checked by one program: a proof
+    /// of signatures is the same whichever keys signed. The entry says
+    /// the key's height, and a leaf's index is one its tree has.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn keys_of_any_height_are_checked_by_one_program() {
+        let proved = |height: usize, leaf: u64| {
+            let mut sk = SecretKey::generate_with_height(&[height as u8; 32], height);
+            sk.set_next_index(leaf);
+            let (pk, msg) = (sk.public_key(), [height as u8 ^ 0x5A; 32]);
+            let sig = sk.sign(&msg).unwrap();
+            let (cx, mut chains) = (Shared::new(), Chains::default());
+            let found = check_into(&cx, &mut chains, &pk, &msg, &sig).expect("a signature of the key's height");
+            assert_eq!([found[0].value(), found[1].value()], halves(&entry(&pk, &msg, leaf)));
+            cx.state(&found);
+            let p = prove(cx, vec![chains], |m| Params::plain(m, 1, 4, 4));
+            assert!(p.holds && p.verifies(), "height {height}");
+            p
+        };
+        let (short, plain, tall) = (proved(1, 1), proved(crate::xmss::PLAIN_HEIGHT, 11), proved(9, 300));
+        assert_eq!((short.program, short.tables.clone()), (plain.program, plain.tables.clone()));
+        assert_eq!((tall.program, tall.tables.clone()), (plain.program, plain.tables.clone()));
     }
 
     #[test]

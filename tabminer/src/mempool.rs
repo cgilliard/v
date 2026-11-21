@@ -225,7 +225,7 @@ pub const EXPIRY_SECS: u64 = 14 * 86400;
 const MAX_EXPIRED: usize = 100_000;
 /// About the size of a block's proof, the rest of a block being space
 /// for transactions.
-pub const PROOF_BYTES: usize = 205_000;
+pub const PROOF_BYTES: usize = 440_000;
 /// The share of a block's space for transactions the reference miner
 /// gives to the longest-waiting ones, by default.
 pub const RESERVE_PERCENT: usize = 10;

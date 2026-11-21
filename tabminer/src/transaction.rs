@@ -596,6 +596,40 @@ impl Transaction {
         }
     }
 
+    /// Every signature the transaction rests on, each with its key and
+    /// what it signs: its inputs' of the body; its policy inputs'
+    /// signers' of the body or of what a channel's keys sign; and those
+    /// of its updates of names. What a block's proof finds in its signed
+    /// set ([`crate::signature::entry`]).
+    pub fn signings(&self) -> Vec<(PublicKey, Digest, Sig)> {
+        let body = self.body_hash();
+        let mut out: Vec<(PublicKey, Digest, Sig)> =
+            self.inputs.iter().map(|i| (i.pubkey, body, i.signature.clone())).collect();
+        for p in &self.policy_inputs {
+            for (cond, witness) in p.leaf.conds.iter().zip(&p.witness) {
+                let (crate::policy::Cond::Thresh { mode, .. }, crate::policy::CondWitness::Signatures(signers)) =
+                    (cond, witness)
+                else {
+                    continue;
+                };
+                let message = match mode {
+                    crate::policy::Mode::Body => body,
+                    crate::policy::Mode::Rebindable { channel } => {
+                        let covered = p.covered_outputs(&self.outputs).unwrap_or_default();
+                        crate::policy::rebind_message(channel, p.state, &covered)
+                    }
+                };
+                out.extend(signers.iter().map(|s| (s.pubkey, message, s.signature.clone())));
+            }
+        }
+        for op in &self.ops {
+            if let NameOp::Update { record, pubkey, signature } = op {
+                out.push((*pubkey, crate::name::update_message(record), signature.clone()));
+            }
+        }
+        out
+    }
+
     /// Hash of the body, excluding signatures.
     pub fn body_hash(&self) -> Digest {
         owned_body!(self.inputs.iter().map(|i| (i.pubkey, i.amount)), self, body_hash)

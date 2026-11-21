@@ -21,6 +21,7 @@ use crate::hash::Digest;
 use crate::ledger::state_node as compress;
 
 /// Part of a tree of `H` levels: its root is the node of level `H`.
+#[derive(Clone)]
 pub struct Partial<const H: usize> {
     /// The nodes known, by level and index there.
     nodes: HashMap<(u8, u64), Digest>,
