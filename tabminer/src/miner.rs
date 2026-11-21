@@ -709,9 +709,9 @@ mod tests {
         assert!(!snap.is_unspent(5).unwrap());
     }
 
-    /// A block of more transactions than one run holds is of two runs,
-    /// joined: each transaction whole in one, the second run going on
-    /// from the state, and the outputs, the first left.
+    /// A block of more than one run holds is of two runs, joined: a
+    /// transaction may lie across them, the second run going on from the
+    /// state, the outputs and the transaction in hand the first left.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
     fn a_block_of_more_than_a_run_holds_is_joined() {
@@ -727,16 +727,16 @@ mod tests {
             let Mined::Block { block, .. } = made else { panic!("{made:?}") };
             assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
         }
-        // Two payments of 300 outputs each: one run holds one of them.
-        let (count, each, fee) = (300u64, 1_000_000u64, 100_000_000u64);
+        // A payment of 500 outputs, more than one run holds, and one of
+        // 100: the first lies across the two runs.
+        let (counts, each, fee) = ([500u64, 100], 1_000_000u64, 100_000_000u64);
         let mut pool = Mempool::new(1 << 22);
         {
             let state = chain.whole().unwrap();
             let snap = state.snapshot().unwrap();
             for position in 0..2u64 {
                 let held = params.subsidy(position as u32 + 1);
-                // (Other amounts in each: two payments, not one twice.)
-                let each = each + position;
+                let count = counts[position as usize];
                 let mut outputs: Vec<Output> = (1..count).map(|i| Output::to_key_hash(&[i as u8; 32], each)).collect();
                 outputs.push(Output::new(&pk, held - (count - 1) * each - fee));
                 let mut tx = UnsignedTransaction::new(vec![(pk, held)], outputs).sign_with(&mut key).unwrap();
@@ -751,9 +751,10 @@ mod tests {
         let Mined::Block { block, .. } = made else { panic!("{made:?}") };
         let view = BlockRef::from_bytes(&block).unwrap();
         assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
-        assert_eq!((view.body().inputs().len(), view.body().outputs().len()), (2, 1 + 2 * count as usize));
+        let count = counts[0] + counts[1];
+        assert_eq!((view.body().inputs().len(), view.body().outputs().len()), (2, 1 + count as usize));
         let state = chain.whole().unwrap();
         let snap = state.snapshot().unwrap();
-        assert_eq!(snap.outputs().next, 2 + 1 + 2 * count);
+        assert_eq!(snap.outputs().next, 2 + 1 + count);
     }
 }

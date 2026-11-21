@@ -23,7 +23,8 @@ pub const TARGET: [u64; 4] = [0, 0, 0, 1099511627776];
 pub const HASHES_PER_BLOCK: u64 = 65535;
 /// The genesis header's mix: its work's ([`crate::chain::params`] checks it).
 pub const MIX: [u8; 32] = [121, 28, 226, 68, 226, 33, 253, 64, 172, 49, 11, 159, 154, 14, 34, 151, 195, 85, 212, 194, 125, 200, 238, 210, 212, 12, 125, 84, 210, 91, 111, 239];
-/// The program of the chain's proof's step.
-pub const PROGRAM: [u8; 32] = [0; 32];
+/// The program of the chain's proof's step: that of the main network's
+/// setup ([`crate::prover::Parts::mainnet`], which is checked against it).
+pub const PROGRAM: [u8; 32] = [38, 160, 31, 8, 115, 92, 116, 244, 32, 6, 89, 49, 155, 167, 208, 100, 200, 48, 50, 50, 243, 96, 45, 236, 157, 203, 229, 56, 209, 238, 159, 160];
 /// The genesis block id, as `tabminer show` prints it.
 pub const ID: &str = "ed9fa1801a7928ff5f211491029912813d25df75ac2f9ef679cf13b37fd89bcb";

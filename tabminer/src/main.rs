@@ -607,13 +607,37 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // What the proofs are made and checked with: a block of each shape
     // is proven once, for the plan of the shapes and the step's program,
     // which every block's statement names.
-    let began = Instant::now();
-    main.log("Making what the proofs are made and checked with");
-    let proving = Setup::new(proofs, tabminer::ledger::Emission(params.emission), &seed.at(0));
-    main.log(&format!("That was made in {:.1}s", began.elapsed().as_secs_f64()));
-    params.program = proving.own;
-    let mut verifier = proving.verifier();
-    if SETUP.set(proving).is_err() {
+    // Its numbers are kept in the data directory from one run to the
+    // next: a node that only checks blocks needs no more than those,
+    // and one that makes them has the rest back in a moment.
+    let emission = tabminer::ledger::Emission(params.emission);
+    let kept = c.data_dir.join(format!("proofs-{}.setup", c.network.name()));
+    // (The main network's are built in.)
+    let read = match c.network {
+        Network::Mainnet => Some(tabminer::prover::Parts::mainnet()),
+        _ => std::fs::read(&kept).ok().and_then(|bytes| tabminer::prover::Parts::from_bytes(&bytes)),
+    };
+    let again = read.as_ref().filter(|_| c.mine).and_then(|parts| Setup::from_parts(proofs, emission, parts));
+    let (parts, proving) = match (read, again) {
+        (Some(parts), Some(proving)) => (parts, Some(proving)),
+        (Some(parts), None) if !c.mine => (parts, None),
+        _ => {
+            let began = Instant::now();
+            main.log("Making what the proofs are made and checked with: once, for some minutes");
+            let proving = Setup::new_said(proofs, emission, &seed.at(0), &|line| main.log(line));
+            main.log(&format!("That was made in {:.1}s", began.elapsed().as_secs_f64()));
+            let parts = proving.parts();
+            if let Err(e) = std::fs::write(&kept, parts.to_bytes()) {
+                main.log(&format!("Error: it is not kept for the next run: {}: {e}", kept.display()));
+            }
+            (parts, Some(proving))
+        }
+    };
+    params.program = parts.own;
+    let mut verifier = ChainVerifier::of(&proofs, &parts);
+    if let Some(proving) = proving
+        && SETUP.set(proving).is_err()
+    {
         return Err("the setup was made twice".into());
     }
     // A data directory is of blocks that were checked, or of blocks

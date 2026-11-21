@@ -26,9 +26,12 @@
 //! - **A reward's block**: one run of [`REWARD_ROWS`] rows (the reward,
 //!   and sweeps), no signatures, and the work of the header before.
 //! - **A block of transactions**: one run of one of the level's sizes,
-//!   and the signatures in a tree of one, two or four proofs of a fixed
+//!   or two, four and so on of the largest, joined two and two; and the
+//!   signatures in a tree of one, two, four and so on proofs of a fixed
 //!   number of signatures each (a proof not full is filled by saying a
 //!   signature again: its entry is in the set once more, to no harm).
+//!   On the main network: up to 32 runs of 2^16 rows, and up to 128
+//!   proofs of 64 signatures.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -93,12 +96,13 @@ impl Level {
         published: |m| Params::proven_ground(m, 2, crate::pcs::SECURITY, 24),
         runs: &[15, 16],
         per_proof: 64,
-        trees: 2,
+        trees: 7,
         joins: 5,
     };
 
-    /// For tests and the dev networks: proofs of the shapes the main
-    /// network's have, small, sound to a few bits and made in a moment.
+    /// For tests and the dev networks: proofs of the kinds of shape the
+    /// main network's have, fewer of them, sound to a few bits and made
+    /// sooner.
     pub const SMALL: Level = Level {
         inner: |m| Params::plain(m, 1, 4, 4),
         published: |m| Params::plain(m, 1, 4, 4),
@@ -134,7 +138,7 @@ struct SignedSizes {
 
 /// The sizes a block's last proofs are made at, of one shape, and the
 /// program its root then has.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Sized {
     beside: [usize; 2],
     root: [usize; 2],
@@ -307,6 +311,115 @@ pub struct Setup {
     joins: Vec<[usize; 2]>,
 }
 
+/// What a setup comes to, less its circuits and its proofs: the numbers
+/// that are the same for every node of a network, found once
+/// ([`Setup::new`], which takes minutes) and kept, in a file or in the
+/// program itself. A node that only checks blocks needs no more of a
+/// setup than these ([`ChainVerifier::of`]); one that makes them has
+/// the rest back in the time one small proof takes
+/// ([`Setup::from_parts`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Parts {
+    /// The shapes of block a chain takes, the program of the proof of
+    /// where a chain begins, and the step's own.
+    pub shapes: Vec<Shape>,
+    pub genesis: Digest,
+    pub own: Digest,
+    /// Rows the chain's proof's tables are filled to at the least, the
+    /// rows they then have, and the variables of the proof's polynomial.
+    pub rows: [usize; 2],
+    pub tables: [usize; 2],
+    pub m: usize,
+    /// The sizes of every other proof: the work's; the proofs of
+    /// signatures' and their nodes'; each shape's, the reward's first;
+    /// and the joins of runs'.
+    work: [usize; 2],
+    segment: [usize; 2],
+    nodes: Vec<[usize; 2]>,
+    blocks: Vec<Sized>,
+    joins: Vec<[usize; 2]>,
+}
+
+/// What a file of [`Parts`] begins with: other circuits, or another
+/// way of writing them down, is another number.
+const PARTS_VERSION: u32 = 1;
+
+/// The main network's setup's numbers, as the test that makes that
+/// setup writes them (`write_the_main_network_s_setup`).
+const MAINNET_PARTS: &[u8] = include_bytes!("../../resources/setup-mainnet.bin");
+
+impl Parts {
+    /// The main network's: a node of it makes no setup.
+    pub fn mainnet() -> Parts {
+        Parts::from_bytes(MAINNET_PARTS).expect("the setup built in is whole")
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = crate::codec::Writer::default();
+        let pair = |w: &mut crate::codec::Writer, rows: &[usize; 2]| rows.iter().for_each(|r| w.u64(*r as u64));
+        w.u32(PARTS_VERSION);
+        w.u32(self.shapes.len() as u32);
+        for shape in &self.shapes {
+            w.digest(&shape.root);
+            shape.rested.iter().for_each(|d| w.digest(d));
+        }
+        w.digest(&self.genesis);
+        w.digest(&self.own);
+        for rows in [&self.rows, &self.tables, &self.work, &self.segment] {
+            pair(&mut w, rows);
+        }
+        w.u64(self.m as u64);
+        for list in [&self.nodes, &self.joins] {
+            w.u32(list.len() as u32);
+            list.iter().for_each(|rows| pair(&mut w, rows));
+        }
+        w.u32(self.blocks.len() as u32);
+        for sized in &self.blocks {
+            pair(&mut w, &sized.beside);
+            pair(&mut w, &sized.root);
+            w.digest(&sized.program);
+        }
+        w.finish()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Parts> {
+        let mut r = crate::codec::Reader(bytes);
+        let pair = |r: &mut crate::codec::Reader<'_>| -> Option<[usize; 2]> {
+            let rows = [r.u64()?, r.u64()?];
+            rows.iter().all(|n| (*n == 0 || n.is_power_of_two()) && *n <= 1 << 30).then(|| rows.map(|n| n as usize))
+        };
+        let count = |r: &mut crate::codec::Reader<'_>| r.u32().filter(|n| *n <= 1 << 12).map(|n| n as usize);
+        if r.u32()? != PARTS_VERSION {
+            return None;
+        }
+        let mut shapes = Vec::new();
+        for _ in 0..count(&mut r)? {
+            let root = r.digest()?;
+            let mut rested = [EMPTY; PROGRAMS];
+            for d in rested.iter_mut() {
+                *d = r.digest()?;
+            }
+            shapes.push(Shape { root, rested });
+        }
+        let (genesis, own) = (r.digest()?, r.digest()?);
+        let (rows, tables, work, segment) = (pair(&mut r)?, pair(&mut r)?, pair(&mut r)?, pair(&mut r)?);
+        let m = r.u64().filter(|m| *m <= 40)? as usize;
+        let mut lists = [Vec::new(), Vec::new()];
+        for list in lists.iter_mut() {
+            for _ in 0..count(&mut r)? {
+                list.push(pair(&mut r)?);
+            }
+        }
+        let [nodes, joins] = lists;
+        let mut blocks = Vec::new();
+        for _ in 0..count(&mut r)? {
+            blocks.push(Sized { beside: pair(&mut r)?, root: pair(&mut r)?, program: r.digest()? });
+        }
+        (r.end() && !shapes.is_empty() && shapes.len() == blocks.len())
+            .then_some(Parts { shapes, genesis, own, rows, tables, m, work, segment, nodes, blocks, joins })
+    }
+}
+
 /// A chain's proof and what it states: the proof of where a chain
 /// begins, or the one a block carried.
 pub struct Before {
@@ -324,45 +437,84 @@ pub struct Contents<'a> {
     pub reward: &'a Output,
 }
 
-/// Which transactions go in which run of `cap` rows at the most: by the
-/// rows they take, which follow from what they are and from the
-/// positions their outputs get, the first of them `first` (the
-/// reward's). The operations on names and the sweeps are the last
-/// run's. `None` if a transaction is more than a run holds.
+/// A thing a run does, of a block's transactions: the reward's
+/// transaction; a transaction's beginning; and its inputs, policy
+/// inputs, outputs and the operations on names it carries, each by the
+/// transaction's place and its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Item {
+    Reward,
+    Head(usize),
+    Input(usize, usize),
+    Policy(usize, usize),
+    Output(usize, usize),
+    Carried(usize, usize),
+}
+
+/// What goes in which run of `cap` rows at the most: by the rows each
+/// thing takes, which follow from what it is and, for an output, from
+/// the position it gets, the first of them `first` (the reward's). A
+/// transaction may lie across runs, cut between its inputs and its
+/// outputs; one that spends a policy's output is whole in one, the
+/// outputs its conditions are on being one run's. The operations on
+/// names and the sweeps are the last run's. `None` if a transaction
+/// that must be whole, or those, are more than a run holds.
 fn grouped(
     first: u64,
     rules: &[crate::ledger::Transaction],
     ops: usize,
     sweeps: usize,
     cap: usize,
-) -> Option<Vec<std::ops::Range<usize>>> {
+) -> Option<Vec<Vec<Item>>> {
     let made = |position: u64| 6 + 2 * position.trailing_ones() as usize;
-    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
-    let (mut from, mut rows, mut position) = (0, 2 + made(first), first + 1);
+    let input = 7 + signed::DEPTH + 2 * OUTPUTS_HEIGHT;
+    let mut groups: Vec<Vec<Item>> = vec![vec![Item::Reward]];
+    let (mut rows, mut position) = (2 + made(first), first + 1);
+    // The run in hand takes `items`, of `takes` rows, or the next does.
+    let put = |groups: &mut Vec<Vec<Item>>, rows: &mut usize, items: &[Item], takes: usize| {
+        if *rows + takes + SETTLE_ROWS > cap {
+            groups.push(Vec::new());
+            *rows = 1;
+        }
+        groups.last_mut().expect("a run").extend_from_slice(items);
+        *rows += takes;
+        *rows + SETTLE_ROWS <= cap
+    };
     for (i, rule) in rules.iter().enumerate() {
-        let outputs = rule.outputs.len();
-        let exact: usize = (0..outputs as u64).map(|k| made(position + k) + 1).sum();
-        let takes = segment::rows_bound(rule) - outputs * (7 + 2 * OUTPUTS_HEIGHT) + exact;
-        if 1 + takes + SETTLE_ROWS > cap {
-            return None;
+        let inputs = (0..rule.inputs.len()).map(|k| Item::Input(i, k));
+        let policy = (0..rule.policy.len()).map(|k| Item::Policy(i, k));
+        let outputs: Vec<(Item, usize)> = (0..rule.outputs.len())
+            .map(|k| (Item::Output(i, k), made(position + k as u64) + (k < rule.covered as usize) as usize))
+            .collect();
+        let carried = (0..rule.ops.len()).map(|k| Item::Carried(i, k));
+        position += rule.outputs.len() as u64;
+        if rule.policy.is_empty() {
+            let each = std::iter::once((Item::Head(i), 1))
+                .chain(inputs.map(|item| (item, input)))
+                .chain(outputs)
+                .chain(carried.map(|item| (item, 2)));
+            for (item, takes) in each {
+                if !put(&mut groups, &mut rows, &[item], takes) {
+                    return None;
+                }
+            }
+        } else {
+            let exact: usize = outputs.iter().map(|o| o.1).sum();
+            let takes = segment::rows_bound(rule) - rule.outputs.len() * (7 + 2 * OUTPUTS_HEIGHT) + exact;
+            let all: Vec<Item> = std::iter::once(Item::Head(i))
+                .chain(inputs)
+                .chain(policy)
+                .chain(outputs.iter().map(|o| o.0))
+                .chain(carried)
+                .collect();
+            if !put(&mut groups, &mut rows, &all, takes) {
+                return None;
+            }
         }
-        if rows + takes + SETTLE_ROWS > cap {
-            groups.push(from..i);
-            (from, rows) = (i, 1);
-        }
-        (rows, position) = (rows + takes, position + outputs as u64);
     }
     let tail = ops * (14 + signed::DEPTH + 2 * OUTPUTS_HEIGHT + 2 * crate::registry::HEIGHT)
         + sweeps * (2 + 2 * OUTPUTS_HEIGHT);
-    if 1 + tail + SETTLE_ROWS > cap {
-        return None;
-    }
-    if rows + tail + SETTLE_ROWS > cap {
-        groups.push(from..rules.len());
-        from = rules.len();
-    }
-    groups.push(from..rules.len());
-    Some(groups)
+    put(&mut groups, &mut rows, &[], tail).then_some(groups)
 }
 
 /// The proofs of signatures joined into one over `2^tree` of them:
@@ -431,6 +583,14 @@ impl Setup {
     /// shapes are found by proving a block of each, whose header's
     /// work is part of it.
     pub fn new(level: Level, emission: Emission, source: &impl ItemSource) -> Setup {
+        Setup::new_said(level, emission, source, &|_| {})
+    }
+
+    /// [`Setup::new`], saying how far it has come to `said` as it goes:
+    /// it is minutes of proving, or hours.
+    pub fn new_said(level: Level, emission: Emission, source: &impl ItemSource, said: &dyn Fn(&str)) -> Setup {
+        let began_at = std::time::Instant::now();
+        let say = |what: std::fmt::Arguments<'_>| said(&format!("{:>6.0}s {what}", began_at.elapsed().as_secs_f64()));
         let tables = Tables::new();
         let rested = |stated: &[F]| -> [Digest; PROGRAMS] { std::array::from_fn(|i| digest(&stated[2 * i..])) };
         let work = {
@@ -439,6 +599,7 @@ impl Setup {
             (prove_with(cx, vec![], Some(work), level.inner, [128, 128]), stated)
         };
         let shown = Worked { proof: &work.0, stated: &work.1 };
+        say(format_args!("the work is proven"));
         let (record, pay) = (Record::block(&crate::ledger::Outputs::default(), 1, 1), Output::to_key_hash(&[7; 32], 1));
         let sample = |set: &Digest, rows: usize| {
             let contents = Contents { txs: &[], sweeps: &[], reward: &pay };
@@ -451,7 +612,7 @@ impl Setup {
         // size. For the sizes of their proofs and the programs of their
         // roots.
         let mut key = crate::xmss::SecretKey::generate_with_height(&[0x5a; 32], 1);
-        let said: Signing = (key.public_key(), [0; 32], key.sign(&[0; 32]).expect("a first signature"));
+        let signing: Signing = (key.public_key(), [0; 32], key.sign(&[0; 32]).expect("a first signature"));
         let mut sizes = SignedSizes::default();
         type Joined = (Proved, Vec<F>);
         let mut samples: Vec<(Runs<'_>, Option<std::rc::Rc<Joined>>)> = Vec::new();
@@ -462,21 +623,47 @@ impl Setup {
         samples.push((Runs::One(keep_run(sample(&signed::empty_roots()[signed::DEPTH], REWARD_ROWS))), None));
         let mut join_sizes: Vec<[usize; 2]> = Vec::new();
         let largest = 1usize << level.runs[level.runs.len() - 1];
+        // The trees of signatures: a proof of them joined with itself is
+        // the tree over two of it, and so on up, a proof a level.
+        let mut top: Option<(Proved, Vec<F>, Digest)> = None;
         for tree in 0..=level.trees {
-            let proven = sign(&level, &tables, &mut sizes, std::slice::from_ref(&said), tree).expect("signatures");
+            top = Some(match top.take() {
+                None => {
+                    let one = sign(&level, &tables, &mut sizes, std::slice::from_ref(&signing), 0).expect("signatures");
+                    (one.top, one.stated, one.root)
+                }
+                Some(under) => {
+                    let (a, b) = (as_signed(&under), as_signed(&under));
+                    let cx = Shared::new();
+                    let mut reader = Deferred::new(&cx);
+                    let stated = node_into(&cx, &tables.compiled, &mut reader, [&a, &b]).expect("a node");
+                    reader.settle(&tables.all());
+                    let proof = prove_at(cx, vec![], level.inner, sizes.nodes.get(tree - 1).copied().unwrap_or([128, 128]));
+                    assert!(proof.holds, "the sample signatures join");
+                    if sizes.nodes.len() == tree - 1 {
+                        sizes.nodes.push(rows_of(&proof));
+                    }
+                    let root = Signed::Node(&proof, &stated).root().0;
+                    (proof, stated, root)
+                }
+            });
+            let over = top.as_ref().expect("made above");
+            let set = signed::lift(&over.2, signed::LOG_SLOTS + tree, signed::DEPTH);
             let cx = Shared::new();
             let mut reader = Deferred::new(&cx);
-            let both = beside_into(&cx, &tables, &mut reader, &proven.as_signed(), &shown).expect("a join");
+            let both = beside_into(&cx, &tables, &mut reader, &as_signed(over), &shown).expect("a join");
             reader.settle(&tables.all());
             let beside = std::rc::Rc::new((prove_at(cx, vec![], level.inner, [128, 128]), both));
             assert!(beside.0.holds, "the sample signatures and work hold");
+            say(format_args!("signatures in a tree of {} proofs", 1usize << tree));
             for log in level.runs {
-                samples.push((Runs::One(keep_run(sample(&proven.set(), 1 << log))), Some(beside.clone())));
+                samples.push((Runs::One(keep_run(sample(&set, 1 << log))), Some(beside.clone())));
             }
+            say(format_args!("  runs under it"));
             // Runs joined: a run of nothing ends where it began, so it
             // follows itself, and so does what joins two of them.
             let nothing = Record::block(&crate::ledger::Outputs::default(), 1, 0);
-            let idle = segment::prove(Run::new(&nothing, closed(), &proven.set()), largest, level.inner);
+            let idle = segment::prove(Run::new(&nothing, closed(), &set), largest, level.inner);
             let mut under = Runs::One(keep_run(idle));
             for depth in 0..level.joins {
                 let cx = Shared::new();
@@ -491,6 +678,7 @@ impl Setup {
                 let kept = keep_join((proof, stated));
                 under = Runs::Joined(&kept.0, &kept.1);
                 samples.push((Runs::Joined(&kept.0, &kept.1), Some(beside.clone())));
+                say(format_args!("  {} runs joined under it", 2usize << depth));
             }
         }
         // The roots, all of one size, so that a chain's step verifies a
@@ -508,12 +696,17 @@ impl Setup {
             assert!(root.holds, "the sample block's root holds");
             (root, stated.expect("a root"))
         };
-        let mut roots: Vec<(Proved, Vec<F>)> = samples.iter().map(|s| root_of(s, [128, 128])).collect();
+        let mut roots: Vec<(Proved, Vec<F>)> = Vec::new();
+        for (i, s) in samples.iter().enumerate() {
+            roots.push(root_of(s, [128, 128]));
+            say(format_args!("root {} of {}: {:?} rows", i + 1, samples.len(), rows_of(&roots[i].0)));
+        }
         let most = roots.iter().map(|r| rows_of(&r.0)).fold([0; 2], |a, b| [a[0].max(b[0]), a[1].max(b[1])]);
-        for (root, sample) in roots.iter_mut().zip(&samples) {
+        for (i, (root, sample)) in roots.iter_mut().zip(&samples).enumerate() {
             if rows_of(&root.0) != most {
                 *root = root_of(sample, most);
                 assert_eq!(rows_of(&root.0), most);
+                say(format_args!("root {} again, at {most:?} rows", i + 1));
             }
         }
         let shapes: Vec<Shape> = roots.iter().map(|(root, stated)| Shape { root: root.program, rested: rested(stated) }).collect();
@@ -530,7 +723,12 @@ impl Setup {
         // The shape of a chain's proof: rows enough for a step, found by
         // trying, and for the pads of a proof that hides what it is of.
         // The proof of where a chain begins is made to it.
-        let mut rows = [1 << 9, 1 << 15];
+        // (A proof that hides is of a hash table of a group of 128 rows
+        // for every query, and more: the leaves the queries open are
+        // hidden by a group each ([`crate::hidden::Places::good`]), and
+        // with fewer no nonce's queries would do.)
+        let hiding = ((level.published)(20).queries + 2) << 7;
+        let mut rows = [hiding.next_power_of_two().max(1 << 9), 1 << 15];
         loop {
             let cx = Shared::new();
             let began = genesis_into(&cx);
@@ -543,7 +741,14 @@ impl Setup {
                 (Stated { proof: &first, stated: &first_stated }, Stated { proof: &genesis, stated: &began });
             step_into(&cx, &tables, &mut reader, &plan, 0, &block, &before, true, &[0; 32], &[0; 32]).expect("a step");
             reader.settle(&tables.all());
-            let (hash, machine) = cx.with(|c| (c.trace.rows.len(), 2 * c.asm.finish_len()));
+            // (The machine's rows are its operations, the values they
+            // name, and a hiding proof's pads: an eighth more and 2^14
+            // is room for those.)
+            let (hash, machine) = cx.with(|c| {
+                let ops = c.asm.finish_len();
+                (c.trace.rows.len(), ops + ops / 8 + (1 << 14))
+            });
+            say(format_args!("the chain's step at {rows:?} rows takes {:?}", [hash, machine]));
             if hash <= rows[0] && machine <= rows[1] {
                 let own = program_of(cx, level.published, rows);
                 let work = rows_of(&work.0);
@@ -552,6 +757,55 @@ impl Setup {
             }
             rows = [rows[0].max(hash.next_power_of_two()), rows[1].max(machine.next_power_of_two())];
         }
+    }
+
+    /// What the setup comes to, to keep ([`Parts`]).
+    pub fn parts(&self) -> Parts {
+        Parts {
+            shapes: self.plan.shapes().to_vec(),
+            genesis: self.genesis.program,
+            own: self.own,
+            rows: self.rows,
+            tables: rows_of(&self.genesis),
+            m: self.genesis.params.m,
+            work: self.work,
+            segment: self.signed.segment.unwrap_or([128, 128]),
+            nodes: self.signed.nodes.clone(),
+            blocks: std::iter::once(self.reward).chain(self.blocks.iter().copied()).collect(),
+            joins: self.joins.clone(),
+        }
+    }
+
+    /// The setup `parts` are of, at `level`, of a network that pays by
+    /// `emission`: its circuits made, and the proof of where a chain
+    /// begins made again. `None` if the parts are not this build's: that
+    /// proof is of another program, or of other sizes, than they say.
+    pub fn from_parts(level: Level, emission: Emission, parts: &Parts) -> Option<Setup> {
+        let shapes = 1 + (level.trees + 1) * (level.runs.len() + level.joins);
+        if parts.shapes.len() != shapes || parts.nodes.len() < level.trees || parts.joins.len() < level.joins {
+            return None;
+        }
+        let cx = Shared::new();
+        let began = genesis_into(&cx);
+        let genesis = prove_hidden(cx, level.published, parts.rows, seed());
+        let same = genesis.holds
+            && genesis.program == parts.genesis
+            && genesis.params.m == parts.m
+            && rows_of(&genesis) == parts.tables;
+        same.then(|| Setup {
+            level,
+            tables: Tables::new(),
+            plan: Plan::new(parts.shapes.clone(), parts.genesis, emission),
+            own: parts.own,
+            rows: parts.rows,
+            genesis,
+            began,
+            work: parts.work,
+            reward: parts.blocks[0],
+            signed: SignedSizes { segment: Some(parts.segment), nodes: parts.nodes.clone() },
+            blocks: parts.blocks[1..].to_vec(),
+            joins: parts.joins.clone(),
+        })
     }
 
     /// The proofs of `signings` (as many as [`Level::signatures`] at the
@@ -571,10 +825,10 @@ impl Setup {
     /// with the signed set of root `set`: the reward's transaction, the
     /// others, the operations on names they carry, and the sweeps. One
     /// run, if `cap` is none; else as many as it takes for none to have
-    /// more than `cap` rows, a transaction whole in one, and as many
-    /// again of nothing as make their number a power of two. `None` if
-    /// a signature is not in the set, the witness lacks a path, or a
-    /// transaction is more than a run holds.
+    /// more than `cap` rows ([`grouped`]), and as many again of nothing
+    /// as make their number a power of two. `None` if a signature is
+    /// not in the set, the witness lacks a path, or what must be in one
+    /// run is more than a run holds.
     fn runs_of(
         start: &Record,
         set: &Digest,
@@ -589,10 +843,7 @@ impl Setup {
         let rules: Vec<crate::ledger::Transaction> = contents.txs.iter().map(|tx| tx.rule(of)).collect();
         let ops: Vec<&NameOp> = contents.txs.iter().flat_map(|tx| &tx.ops).collect();
 
-        let groups = match cap {
-            Some(cap) => grouped(first, &rules, ops.len(), contents.sweeps.len(), cap)?,
-            None => vec![0..rules.len()],
-        };
+        let groups = grouped(first, &rules, ops.len(), contents.sweeps.len(), cap.unwrap_or(usize::MAX / 2))?;
 
         let reveals = ops.iter().filter_map(|op| match op {
             NameOp::Reveal { commit, .. } => Some(*commit),
@@ -618,47 +869,57 @@ impl Setup {
             // everything the run spends is gone.
             if next != 0 {
                 let mut after = witness.outputs.clone();
-                let own = contents.txs[group.clone()].iter().flat_map(|tx| tx.spent_positions());
+                let own = group.iter().filter_map(|item| match item {
+                    Item::Input(i, k) => Some(contents.txs[*i].inputs[*k].position),
+                    Item::Policy(i, k) => Some(contents.txs[*i].policy_inputs[*k].position),
+                    _ => None,
+                });
                 let tail = last.iter().copied().filter(|_| g + 1 == groups.len());
                 own.chain(tail).for_each(|p| after.set(p, &EMPTY));
                 run.frontier(&after.frontier(next));
             }
-            if g == 0 {
-                // The reward's transaction: no input, one output.
-                let pay = crate::ledger::Transaction { outputs: vec![contents.reward.listed()], ..Default::default() };
-                run.head(&pay);
-                run.output(&pay.outputs[0], &contents.reward.key_hash);
-                leaves.push(pay.outputs[0].leaf(height));
-            }
-            for (tx, rule) in contents.txs[group.clone()].iter().zip(&rules[group.clone()]) {
-                let id = rule.id();
-                run.head(rule);
-                for (input, spent) in tx.inputs.iter().zip(&rule.inputs) {
-                    let at = place(&input.pubkey, &id, input.signature.index)?;
-                    run.input(spent, &witness.outputs.path(input.position), input.signature.index, &at);
-                    witness.outputs.set(input.position, &EMPTY);
-                }
-                for spent in &rule.policy {
-                    use crate::conditions::{Cond, Shown, rebind_message};
-                    let mut places = Vec::new();
-                    for (cond, shown) in spent.conds.iter().zip(&spent.shown) {
-                        let Shown::Signers(signers) = shown else { continue };
-                        let message = match cond {
-                            Cond::Rebind { channel, .. } => rebind_message(channel, &rule.cover()?.1, spent.state),
-                            _ => id,
+            for item in group {
+                match *item {
+                    // The reward's transaction: no input, one output.
+                    Item::Reward => {
+                        let pay = crate::ledger::Transaction {
+                            outputs: vec![contents.reward.listed()],
+                            ..Default::default()
                         };
-                        for (key, leaf) in signers.iter().flatten() {
-                            places.push(place(key, &message, *leaf)?);
-                        }
+                        run.head(&pay);
+                        run.output(&pay.outputs[0], &contents.reward.key_hash);
+                        leaves.push(pay.outputs[0].leaf(height));
                     }
-                    run.policy_input(spent, &witness.outputs.path(spent.position), &places);
-                    witness.outputs.set(spent.position, &EMPTY);
+                    Item::Head(i) => run.head(&rules[i]),
+                    Item::Input(i, k) => {
+                        let (input, spent) = (&contents.txs[i].inputs[k], &rules[i].inputs[k]);
+                        let at = place(&input.pubkey, &rules[i].id(), input.signature.index)?;
+                        run.input(spent, &witness.outputs.path(input.position), input.signature.index, &at);
+                        witness.outputs.set(input.position, &EMPTY);
+                    }
+                    Item::Policy(i, k) => {
+                        use crate::conditions::{Cond, Shown, rebind_message};
+                        let (rule, spent) = (&rules[i], &rules[i].policy[k]);
+                        let mut places = Vec::new();
+                        for (cond, shown) in spent.conds.iter().zip(&spent.shown) {
+                            let Shown::Signers(signers) = shown else { continue };
+                            let message = match cond {
+                                Cond::Rebind { channel, .. } => rebind_message(channel, &rule.cover()?.1, spent.state),
+                                _ => rule.id(),
+                            };
+                            for (key, leaf) in signers.iter().flatten() {
+                                places.push(place(key, &message, *leaf)?);
+                            }
+                        }
+                        run.policy_input(spent, &witness.outputs.path(spent.position), &places);
+                        witness.outputs.set(spent.position, &EMPTY);
+                    }
+                    Item::Output(i, k) => {
+                        run.output(&rules[i].outputs[k], &contents.txs[i].outputs[k].key_hash);
+                        leaves.push(rules[i].outputs[k].leaf(height));
+                    }
+                    Item::Carried(i, k) => run.carried(&contents.txs[i].ops[k].digest()),
                 }
-                for (output, listed) in tx.outputs.iter().zip(&rule.outputs) {
-                    run.output(listed, &output.key_hash);
-                    leaves.push(listed.leaf(height));
-                }
-                tx.ops.iter().for_each(|op| run.carried(&op.digest()));
             }
         }
         // The operations, done after the transactions; then the sweeps.
@@ -934,6 +1195,13 @@ impl ChainVerifier {
 }
 
 impl ChainVerifier {
+    /// The verifier of the chain's proofs of the setup `parts` are of,
+    /// made at `level`: with no proof made, in the time it takes to
+    /// make two circuits.
+    pub fn of(level: &Level, parts: &Parts) -> ChainVerifier {
+        ChainVerifier::new((level.published)(parts.m).hiding(), parts.own, parts.tables)
+    }
+
     /// Debugging only: the same verifier, taking every proof unread.
     pub fn unchecked(self) -> ChainVerifier {
         ChainVerifier { unchecked: true, ..self }
@@ -1173,5 +1441,151 @@ pub(crate) mod tests {
         let state = chain.state();
         let snap = state.snapshot().unwrap();
         assert_eq!((snap.outputs().next, snap.is_unspent(0).unwrap(), snap.is_unspent(2).unwrap()), (4, false, true));
+    }
+
+    /// A setup's numbers are kept and read back; a setup made of them
+    /// again is the same setup, and the verifier made of them alone
+    /// takes the blocks it makes.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn a_setup_is_kept_and_made_again() {
+        let (setup, params) = network();
+        let parts = setup.parts();
+        assert!(Parts::from_bytes(&parts.to_bytes()).as_ref() == Some(&parts));
+        let bytes = parts.to_bytes();
+        assert!(Parts::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        assert!(Parts::from_bytes(&[&bytes[..], &[0]].concat()).is_none());
+        let again = Setup::from_parts(Level::SMALL, Emission(params.emission), &parts).unwrap();
+        assert!(again.parts() == parts && again.own == setup.own);
+        // Parts of another build's circuits: the proof of where a chain
+        // begins is not of the program they say.
+        let other = Parts { genesis: [1; 32], ..parts.clone() };
+        assert!(Setup::from_parts(Level::SMALL, Emission(params.emission), &other).is_none());
+        // A block made by the setup made again is taken by a chain that
+        // has the verifier of the parts alone.
+        let chain = Chain::open(MemBackend::new(), 8, params, seed(), ChainVerifier::of(&Level::SMALL, &parts)).unwrap();
+        chain.set_dataset(table());
+        let reward = crate::output::Output::to_key_hash(&[1; 32], params.subsidy(1));
+        let proof = prove_next(&again, &chain, &reward);
+        let body = Body { outputs: vec![reward.block_output()], proof, ..Body::default() };
+        let block = Block { header: header_for(&chain, &body), body }.to_bytes();
+        assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
+    }
+
+    /// Makes the main network's setup and writes its numbers down: what
+    /// the program then has built in. Minutes of proving.
+    #[test]
+    #[ignore = "makes the main network's setup; run with --release --nocapture"]
+    fn write_the_main_network_s_setup() {
+        let began = std::time::Instant::now();
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::MAINNET);
+        let said = |line: &str| println!("{line}");
+        let setup = Setup::new_said(Level::MAINNET, Emission(ChainParams::MAINNET.emission), &text.at(0), &said);
+        let parts = setup.parts();
+        println!(
+            "the main network's setup: {} shapes, the chain's proof of 2^{} elements in tables of {:?} rows, made in {:.0?}",
+            parts.shapes.len(),
+            parts.m,
+            parts.tables,
+            began.elapsed()
+        );
+        println!("the step's program: {:?}", parts.own);
+        std::fs::write("../resources/setup-mainnet.bin", parts.to_bytes()).unwrap();
+        assert!(Parts::from_bytes(&parts.to_bytes()).as_ref() == Some(&parts));
+    }
+
+    /// The main network's proofs, timed: the setup read back from its
+    /// file, and two blocks of a reward made and taken, on the main
+    /// network's table (its items made as they are asked for) with
+    /// every header meeting its target.
+    #[test]
+    #[ignore = "timing; run with --release --nocapture, after the main network's setup is written"]
+    fn main_network_block_timing() {
+        use std::time::Instant;
+        let bytes = std::fs::read("../resources/setup-mainnet.bin").unwrap();
+        let parts = Parts::from_bytes(&bytes).unwrap();
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::MAINNET);
+        let params = ChainParams {
+            pow: crate::pow::PowParams::MAINNET,
+            emission: ChainParams::MAINNET.emission,
+            program: parts.own,
+            ..easy()
+        };
+        let params = ChainParams { genesis_mix: params.genesis_work(&text), ..params };
+        let began = Instant::now();
+        let setup = Setup::from_parts(Level::MAINNET, Emission(params.emission), &parts).unwrap();
+        println!("the setup, from its file: {:.1?}", began.elapsed());
+        let chain = Chain::open(MemBackend::new(), 8, params, text, ChainVerifier::of(&Level::MAINNET, &parts)).unwrap();
+        let source = text.at(0);
+        for height in 1..=2u32 {
+            let reward = crate::output::Output::to_key_hash(&[height as u8; 32], params.subsidy(height));
+            let (parent, state) = (chain.tip().unwrap(), chain.state());
+            let snap = state.snapshot().unwrap();
+            let (roots, next) = ((snap.outputs().hash(), snap.names().hash()), snap.outputs().next);
+            let began = Instant::now();
+            let before = match parent.height {
+                0 => setup.beginning(),
+                _ => {
+                    let bytes = chain.body(&parent.hash()).unwrap().unwrap();
+                    let body = BodyRef::from_bytes(&bytes).unwrap();
+                    let stated = chain.statement(parent.height, &parent.prev_hash, &body, &roots, next);
+                    setup.carried(body.proof(), &stated).unwrap()
+                }
+            };
+            let start = Record {
+                root: [roots.0; 2],
+                inputs: [EMPTY; 2],
+                outputs: [EMPTY; 2],
+                next: [next; 2],
+                sum_in: params.subsidy(height) as u128,
+                sum_out: 0,
+                height,
+                names: [roots.1; 2],
+                ops: [EMPTY; 2],
+                done: [EMPTY; 2],
+            };
+            let witness = Witness::collect(&snap, &[], &[]).unwrap();
+            let contents = Contents { txs: &[], sweeps: &[], reward: &reward };
+            let proof = setup.block(&source, &parent, &before, &start, witness, &contents, None).unwrap();
+            println!("block {height}: proved in {:.1?}, a proof of {} bytes", began.elapsed(), proof.len());
+            let body = Body { outputs: vec![reward.block_output()], proof, ..Body::default() };
+            let bytes = body.to_bytes();
+            let (state_root, stated) = chain.header_after(&BodyRef::from_bytes(&bytes).unwrap()).unwrap();
+            let mut header = Header {
+                prev_hash: parent.hash(),
+                height,
+                timestamp: parent.timestamp + 600,
+                body_commitment: body.commitment(),
+                state_root,
+                statement: stated.digest(),
+                aux: [0; 32],
+                mix: EMPTY,
+                nonce: [0; 32],
+            };
+            let target = chain.expected_target(&parent).unwrap();
+            loop {
+                header.mix = hashimoto(&source, &header.pow_hash(), &header.nonce).mix;
+                if header.quick_pow_check(&target) {
+                    break;
+                }
+                header.nonce[0] = header.nonce[0].wrapping_add(1);
+            }
+            let block = Block { header, body }.to_bytes();
+            let began = Instant::now();
+            assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
+            println!("block {height}: taken in {:.1?}", began.elapsed());
+        }
+    }
+
+    /// The setup built in is the main network's: its step's program is
+    /// the one the network's parameters name, and it lists the shapes of
+    /// the main network's level.
+    #[test]
+    fn the_setup_built_in_is_the_main_network_s() {
+        let (parts, level) = (Parts::mainnet(), Level::MAINNET);
+        assert_eq!(parts.own, crate::genesis::PROGRAM);
+        assert_eq!(parts.own, ChainParams::MAINNET.program);
+        assert_eq!(parts.shapes.len(), 1 + (level.trees + 1) * (level.runs.len() + level.joins));
+        assert_eq!((parts.nodes.len(), parts.joins.len()), (level.trees, level.joins));
     }
 }

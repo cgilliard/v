@@ -271,6 +271,11 @@ impl Plan {
         hash_domain(DOM_PLAN_NODE, children.as_flattened())
     }
 
+    /// The shapes of block the plan lists, in their order.
+    pub fn shapes(&self) -> &[Shape] {
+        &self.shapes
+    }
+
     /// The root of the tree of shapes.
     pub fn root(&self) -> Digest {
         self.node(self.depth, 0)
