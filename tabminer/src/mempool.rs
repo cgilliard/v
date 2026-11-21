@@ -190,6 +190,23 @@ impl Weights {
         inputs as u64 * self.input + outputs as u64 * self.output
     }
 
+    /// The weight of a transaction as its maker has it
+    /// ([`Weights::weigh`], of the same one).
+    pub fn of_tx(&self, tx: &crate::transaction::Transaction) -> u64 {
+        let policy: u64 = tx.policy_inputs.iter().map(|p| p.signatures().max(1) as u64).sum();
+        let ops: u64 = tx.ops.iter().map(|op| self.of_op(op.kind())).sum();
+        (tx.inputs.len() as u64 + policy) * self.input + tx.outputs.len() as u64 * self.output + ops
+    }
+
+    /// The weight of an operation on a name.
+    pub fn of_op(&self, kind: OpKind) -> u64 {
+        match kind {
+            OpKind::Commit => self.commit,
+            OpKind::Reveal => self.reveal,
+            _ => self.update,
+        }
+    }
+
     /// The weight of `tx`.
     pub fn weigh(&self, tx: &TransactionRef<'_>) -> u64 {
         let n = tx.counts();

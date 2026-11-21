@@ -79,6 +79,10 @@ pub struct Level {
     pub per_proof: usize,
     /// The most proofs of signatures a block's tree is over, as a log.
     pub trees: usize,
+    /// The most runs of the largest size a block's proof joins, as a
+    /// log: a block of more transactions than one run holds is of two
+    /// runs, or four, and so on.
+    pub joins: usize,
 }
 
 impl Level {
@@ -90,6 +94,7 @@ impl Level {
         runs: &[15, 16],
         per_proof: 64,
         trees: 2,
+        joins: 5,
     };
 
     /// For tests and the dev networks: proofs of the shapes the main
@@ -100,6 +105,7 @@ impl Level {
         runs: &[12],
         per_proof: 2,
         trees: 1,
+        joins: 1,
     };
 
     /// The most signatures a block's proof rests on.
@@ -297,6 +303,8 @@ pub struct Setup {
     reward: Sized,
     signed: SignedSizes,
     blocks: Vec<Sized>,
+    /// The sizes of the proofs that join runs, a level after another.
+    joins: Vec<[usize; 2]>,
 }
 
 /// A chain's proof and what it states: the proof of where a chain
@@ -314,6 +322,47 @@ pub struct Contents<'a> {
     pub txs: &'a [Transaction],
     pub sweeps: &'a [u64],
     pub reward: &'a Output,
+}
+
+/// Which transactions go in which run of `cap` rows at the most: by the
+/// rows they take, which follow from what they are and from the
+/// positions their outputs get, the first of them `first` (the
+/// reward's). The operations on names and the sweeps are the last
+/// run's. `None` if a transaction is more than a run holds.
+fn grouped(
+    first: u64,
+    rules: &[crate::ledger::Transaction],
+    ops: usize,
+    sweeps: usize,
+    cap: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let made = |position: u64| 6 + 2 * position.trailing_ones() as usize;
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    let (mut from, mut rows, mut position) = (0, 2 + made(first), first + 1);
+    for (i, rule) in rules.iter().enumerate() {
+        let outputs = rule.outputs.len();
+        let exact: usize = (0..outputs as u64).map(|k| made(position + k) + 1).sum();
+        let takes = segment::rows_bound(rule) - outputs * (7 + 2 * OUTPUTS_HEIGHT) + exact;
+        if 1 + takes + SETTLE_ROWS > cap {
+            return None;
+        }
+        if rows + takes + SETTLE_ROWS > cap {
+            groups.push(from..i);
+            (from, rows) = (i, 1);
+        }
+        (rows, position) = (rows + takes, position + outputs as u64);
+    }
+    let tail = ops * (14 + signed::DEPTH + 2 * OUTPUTS_HEIGHT + 2 * crate::registry::HEIGHT)
+        + sweeps * (2 + 2 * OUTPUTS_HEIGHT);
+    if 1 + tail + SETTLE_ROWS > cap {
+        return None;
+    }
+    if rows + tail + SETTLE_ROWS > cap {
+        groups.push(from..rules.len());
+        from = rules.len();
+    }
+    groups.push(from..rules.len());
+    Some(groups)
 }
 
 /// The proofs of signatures joined into one over `2^tree` of them:
@@ -392,8 +441,9 @@ impl Setup {
         let shown = Worked { proof: &work.0, stated: &work.1 };
         let (record, pay) = (Record::block(&crate::ledger::Outputs::default(), 1, 1), Output::to_key_hash(&[7; 32], 1));
         let sample = |set: &Digest, rows: usize| {
-            let run = Self::run_of(&record, set, &mut Witness::default(), &Contents { txs: &[], sweeps: &[], reward: &pay }, None);
-            segment::prove(run.expect("a run"), rows, level.inner)
+            let contents = Contents { txs: &[], sweeps: &[], reward: &pay };
+            let runs = Self::runs_of(&record, set, &mut Witness::default(), &contents, None, None);
+            segment::prove(runs.expect("a run").remove(0), rows, level.inner)
         };
 
         // A block of each shape, of some header's work: a reward's, and
@@ -403,7 +453,15 @@ impl Setup {
         let mut key = crate::xmss::SecretKey::generate_with_height(&[0x5a; 32], 1);
         let said: Signing = (key.public_key(), [0; 32], key.sign(&[0; 32]).expect("a first signature"));
         let mut sizes = SignedSizes::default();
-        let mut samples = vec![(sample(&signed::empty_roots()[signed::DEPTH], REWARD_ROWS), None)];
+        type Joined = (Proved, Vec<F>);
+        let mut samples: Vec<(Runs<'_>, Option<std::rc::Rc<Joined>>)> = Vec::new();
+        // (The samples' proofs are kept for as long as the setup is
+        // made: what refers to them does so for no longer.)
+        let keep_run = |p: segment::Proved| -> &'static segment::Proved { Box::leak(Box::new(p)) };
+        let keep_join = |p: Joined| -> &'static Joined { Box::leak(Box::new(p)) };
+        samples.push((Runs::One(keep_run(sample(&signed::empty_roots()[signed::DEPTH], REWARD_ROWS))), None));
+        let mut join_sizes: Vec<[usize; 2]> = Vec::new();
+        let largest = 1usize << level.runs[level.runs.len() - 1];
         for tree in 0..=level.trees {
             let proven = sign(&level, &tables, &mut sizes, std::slice::from_ref(&said), tree).expect("signatures");
             let cx = Shared::new();
@@ -413,18 +471,37 @@ impl Setup {
             let beside = std::rc::Rc::new((prove_at(cx, vec![], level.inner, [128, 128]), both));
             assert!(beside.0.holds, "the sample signatures and work hold");
             for log in level.runs {
-                samples.push((sample(&proven.set(), 1 << log), Some(beside.clone())));
+                samples.push((Runs::One(keep_run(sample(&proven.set(), 1 << log))), Some(beside.clone())));
+            }
+            // Runs joined: a run of nothing ends where it began, so it
+            // follows itself, and so does what joins two of them.
+            let nothing = Record::block(&crate::ledger::Outputs::default(), 1, 0);
+            let idle = segment::prove(Run::new(&nothing, closed(), &proven.set()), largest, level.inner);
+            let mut under = Runs::One(keep_run(idle));
+            for depth in 0..level.joins {
+                let cx = Shared::new();
+                let mut reader = Deferred::new(&cx);
+                let stated = crate::block_proof::join_into(&cx, &tables, &mut reader, [&under, &under]).expect("a join");
+                reader.settle(&tables.all());
+                let proof = prove_at(cx, vec![], level.inner, join_sizes.get(depth).copied().unwrap_or([128, 128]));
+                assert!(proof.holds, "the sample runs join");
+                if join_sizes.len() == depth {
+                    join_sizes.push(rows_of(&proof));
+                }
+                let kept = keep_join((proof, stated));
+                under = Runs::Joined(&kept.0, &kept.1);
+                samples.push((Runs::Joined(&kept.0, &kept.1), Some(beside.clone())));
             }
         }
         // The roots, all of one size, so that a chain's step verifies a
         // block's root the same way whatever its shape: the largest any
         // of them comes to.
-        let root_of = |(run, beside): &(segment::Proved, Option<std::rc::Rc<(Proved, Vec<F>)>>), rows: [usize; 2]| {
+        let root_of = |(runs, beside): &(Runs<'_>, Option<std::rc::Rc<Joined>>), rows: [usize; 2]| {
             let cx = Shared::new();
             let mut reader = Deferred::new(&cx);
             let stated = match beside {
-                None => root_into(&cx, &tables, &mut reader, &Runs::One(run), None, Some(&shown), 1),
-                Some(b) => root_with(&cx, &tables, &mut reader, &Runs::One(run), &Beside::Joined(&b.0, &b.1), 1),
+                None => root_into(&cx, &tables, &mut reader, runs, None, Some(&shown), 1),
+                Some(b) => root_with(&cx, &tables, &mut reader, runs, &Beside::Joined(&b.0, &b.1), 1),
             };
             reader.settle(&tables.all());
             let root = prove_at(cx, vec![], level.inner, rows);
@@ -470,7 +547,8 @@ impl Setup {
             if hash <= rows[0] && machine <= rows[1] {
                 let own = program_of(cx, level.published, rows);
                 let work = rows_of(&work.0);
-                return Setup { level, tables, plan, own, rows, genesis, began, work, reward, signed: sizes, blocks: blocks.clone() };
+                let (blocks, joins) = (blocks.clone(), join_sizes.clone());
+                return Setup { level, tables, plan, own, rows, genesis, began, work, reward, signed: sizes, blocks, joins };
             }
             rows = [rows[0].max(hash.next_power_of_two()), rows[1].max(machine.next_power_of_two())];
         }
@@ -489,77 +567,107 @@ impl Setup {
         sign(&self.level, &self.tables, &mut self.signed.clone(), signings, tree)
     }
 
-    /// The run of a block of `contents`, from the state `start` is of,
+    /// The runs of a block of `contents`, from the state `start` is of,
     /// with the signed set of root `set`: the reward's transaction, the
-    /// others, the operations on names they carry, and the sweeps.
-    /// `None` if a signature is not in the set, or the witness lacks a
-    /// path.
-    fn run_of(
+    /// others, the operations on names they carry, and the sweeps. One
+    /// run, if `cap` is none; else as many as it takes for none to have
+    /// more than `cap` rows, a transaction whole in one, and as many
+    /// again of nothing as make their number a power of two. `None` if
+    /// a signature is not in the set, the witness lacks a path, or a
+    /// transaction is more than a run holds.
+    fn runs_of(
         start: &Record,
         set: &Digest,
         witness: &mut Witness,
         contents: &Contents<'_>,
         proven: Option<&SignedProof>,
-    ) -> Option<Run> {
-        let next = start.next[0];
+        cap: Option<usize>,
+    ) -> Option<Vec<Run>> {
+        let (first, height) = (start.next[0], start.height);
         let place = |key: &PublicKey, message: &Digest, leaf: u64| proven?.place(key, message, leaf);
         let of = |position: u64| witness.spent.get(&position).map_or(([0; 20], 0), |r| (r.memo, r.height));
         let rules: Vec<crate::ledger::Transaction> = contents.txs.iter().map(|tx| tx.rule(of)).collect();
-        // The nodes to the left of the next position's path, once
-        // everything the block spends is gone.
-        let reveals = contents.txs.iter().flat_map(|tx| &tx.ops).filter_map(|op| match op {
+        let ops: Vec<&NameOp> = contents.txs.iter().flat_map(|tx| &tx.ops).collect();
+
+        let groups = match cap {
+            Some(cap) => grouped(first, &rules, ops.len(), contents.sweeps.len(), cap)?,
+            None => vec![0..rules.len()],
+        };
+
+        let reveals = ops.iter().filter_map(|op| match op {
             NameOp::Reveal { commit, .. } => Some(*commit),
             _ => None,
         });
-        let gone: Vec<u64> = (contents.txs.iter().flat_map(|tx| tx.spent_positions()))
-            .chain(reveals)
-            .chain(contents.sweeps.iter().copied())
-            .collect();
+        let last: Vec<u64> = reveals.chain(contents.sweeps.iter().copied()).collect();
+        let mut runs: Vec<Run> = Vec::new();
         let mut run = Run::new(start, closed(), set);
-        if next != 0 {
-            let mut after = witness.outputs.clone();
-            gone.iter().for_each(|p| after.set(*p, &EMPTY));
-            let path = after.path(next);
-            let frontier: Vec<Digest> = (0..OUTPUTS_HEIGHT).filter(|l| next >> l & 1 == 1).map(|l| path[l]).collect();
-            run.frontier(&frontier);
-        }
-        // The reward's transaction: no input, one output.
-        let pay = crate::ledger::Transaction { outputs: vec![contents.reward.listed()], ..Default::default() };
-        run.head(&pay);
-        run.output(&pay.outputs[0], &contents.reward.key_hash);
-        for (tx, rule) in contents.txs.iter().zip(&rules) {
-            let id = rule.id();
-            run.head(rule);
-            for (input, spent) in tx.inputs.iter().zip(&rule.inputs) {
-                let at = place(&input.pubkey, &id, input.signature.index)?;
-                run.input(spent, &witness.outputs.path(input.position), input.signature.index, &at);
-                witness.outputs.set(input.position, &EMPTY);
-            }
-            for spent in &rule.policy {
-                use crate::conditions::{Cond, Shown, rebind_message};
-                let mut places = Vec::new();
-                for (cond, shown) in spent.conds.iter().zip(&spent.shown) {
-                    let Shown::Signers(signers) = shown else { continue };
-                    let message = match cond {
-                        Cond::Rebind { channel, .. } => rebind_message(channel, &rule.cover()?.1, spent.state),
-                        _ => id,
-                    };
-                    for (key, leaf) in signers.iter().flatten() {
-                        places.push(place(key, &message, *leaf)?);
-                    }
+        // The next position, and the leaves the run in hand has made,
+        // which are in the tree once the run ends.
+        let (mut next, mut leaves): (u64, Vec<Digest>) = (first, Vec::new());
+        for (g, group) in groups.iter().enumerate() {
+            if g > 0 {
+                run.settle();
+                for leaf in leaves.drain(..) {
+                    witness.outputs.append(next, &leaf, crate::ledger::empty_roots());
+                    next += 1;
                 }
-                run.policy_input(spent, &witness.outputs.path(spent.position), &places);
-                witness.outputs.set(spent.position, &EMPTY);
+                let after = Run::after(&run);
+                runs.push(std::mem::replace(&mut run, after));
             }
-            for (output, listed) in tx.outputs.iter().zip(&rule.outputs) {
-                run.output(listed, &output.key_hash);
+            // The nodes to the left of the next position's path, once
+            // everything the run spends is gone.
+            if next != 0 {
+                let mut after = witness.outputs.clone();
+                let own = contents.txs[group.clone()].iter().flat_map(|tx| tx.spent_positions());
+                let tail = last.iter().copied().filter(|_| g + 1 == groups.len());
+                own.chain(tail).for_each(|p| after.set(p, &EMPTY));
+                run.frontier(&after.frontier(next));
             }
-            tx.ops.iter().for_each(|op| run.carried(&op.digest()));
+            if g == 0 {
+                // The reward's transaction: no input, one output.
+                let pay = crate::ledger::Transaction { outputs: vec![contents.reward.listed()], ..Default::default() };
+                run.head(&pay);
+                run.output(&pay.outputs[0], &contents.reward.key_hash);
+                leaves.push(pay.outputs[0].leaf(height));
+            }
+            for (tx, rule) in contents.txs[group.clone()].iter().zip(&rules[group.clone()]) {
+                let id = rule.id();
+                run.head(rule);
+                for (input, spent) in tx.inputs.iter().zip(&rule.inputs) {
+                    let at = place(&input.pubkey, &id, input.signature.index)?;
+                    run.input(spent, &witness.outputs.path(input.position), input.signature.index, &at);
+                    witness.outputs.set(input.position, &EMPTY);
+                }
+                for spent in &rule.policy {
+                    use crate::conditions::{Cond, Shown, rebind_message};
+                    let mut places = Vec::new();
+                    for (cond, shown) in spent.conds.iter().zip(&spent.shown) {
+                        let Shown::Signers(signers) = shown else { continue };
+                        let message = match cond {
+                            Cond::Rebind { channel, .. } => rebind_message(channel, &rule.cover()?.1, spent.state),
+                            _ => id,
+                        };
+                        for (key, leaf) in signers.iter().flatten() {
+                            places.push(place(key, &message, *leaf)?);
+                        }
+                    }
+                    run.policy_input(spent, &witness.outputs.path(spent.position), &places);
+                    witness.outputs.set(spent.position, &EMPTY);
+                }
+                for (output, listed) in tx.outputs.iter().zip(&rule.outputs) {
+                    run.output(listed, &output.key_hash);
+                    leaves.push(listed.leaf(height));
+                }
+                tx.ops.iter().for_each(|op| run.carried(&op.digest()));
+            }
         }
         // The operations, done after the transactions; then the sweeps.
-        for op in contents.txs.iter().flat_map(|tx| &tx.ops) {
+        for op in ops {
             match op {
-                NameOp::Commit { commit, memo } => run.commit(commit, memo),
+                NameOp::Commit { commit, memo } => {
+                    run.commit(commit, memo);
+                    leaves.push(crate::registry::commit_output(commit, *memo).leaf(height));
+                }
                 NameOp::Reveal { record, salt, commit } => {
                     let spent = witness.spent.get(commit)?;
                     let key = record.key();
@@ -584,26 +692,32 @@ impl Setup {
             run.sweep(&spent.commitment, &spent.memo, spent.height, *position, &witness.outputs.path(*position));
             witness.outputs.set(*position, &EMPTY);
         }
-        Some(run)
+        // Runs of nothing, to a power of two of them.
+        runs.push(run);
+        while cap.is_some() && !runs.len().is_power_of_two() {
+            let last = runs.last_mut().expect("a run");
+            last.settle();
+            let after = Run::after(last);
+            runs.push(after);
+        }
+        Some(runs)
     }
 
-    /// Whether a block of `txs`, with its reward and `sweeps` sweeps, is
-    /// one whose rows a run holds, whatever the state: for whoever
-    /// chooses a block's transactions.
-    pub fn fits(&self, txs: &[Transaction], sweeps: usize) -> bool {
-        // A commitment made, a reveal and an update, at the most; and a
-        // sweep.
-        let done = |op: &NameOp| match op {
-            NameOp::Commit { .. } => 4 + 2 * OUTPUTS_HEIGHT,
-            NameOp::Reveal { .. } => 12 + 2 * OUTPUTS_HEIGHT + 2 * crate::registry::HEIGHT,
-            NameOp::Update { .. } => 14 + signed::DEPTH + 2 * crate::registry::HEIGHT,
+    /// Whether a block of `txs`, with its reward and `sweeps` sweeps, on
+    /// a state whose next position is `next`, is one a chain takes by
+    /// this setup's proofs: its rows are a run's, or a few runs' joined,
+    /// and its signatures no more than a block's proofs hold. For
+    /// whoever chooses a block's transactions.
+    pub fn fits(&self, next: u64, txs: &[Transaction], sweeps: usize) -> bool {
+        let rules: Vec<crate::ledger::Transaction> = txs.iter().map(|tx| tx.rule(|_| ([0; 20], 0))).collect();
+        let ops = txs.iter().map(|tx| tx.ops.len()).sum();
+        let cap = match txs.is_empty() {
+            true => REWARD_ROWS,
+            false => 1 << self.level.runs[self.level.runs.len() - 1],
         };
-        let of = |tx: &Transaction| {
-            segment::rows_bound(&tx.rule(|_| ([0; 20], 0))) + tx.ops.iter().map(done).sum::<usize>()
-        };
-        let rows = 16 + txs.iter().map(of).sum::<usize>() + sweeps * (2 + 2 * OUTPUTS_HEIGHT) + SETTLE_ROWS;
-        let most = if txs.is_empty() { REWARD_ROWS } else { 1 << self.level.runs[self.level.runs.len() - 1] };
-        rows <= most && txs.iter().map(|tx| tx.signings().len()).sum::<usize>() <= self.level.signatures()
+        let runs = grouped(next, &rules, ops, sweeps, cap).map_or(usize::MAX, |groups| groups.len());
+        let most = if txs.is_empty() { 1 } else { 1 << self.level.joins };
+        runs <= most && txs.iter().map(|tx| tx.signings().len()).sum::<usize>() <= self.level.signatures()
     }
 
     /// The proof of where a chain begins, as the chain's proof before
@@ -671,8 +785,11 @@ impl Setup {
         proven: Option<&SignedProof>,
     ) -> Option<Vec<u8>> {
         let set = proven.map_or(signed::empty_roots()[signed::DEPTH], SignedProof::set);
-        let run = Self::run_of(start, &set, &mut witness, contents, proven)?;
+        let kept = witness.clone();
+        let run = Self::runs_of(start, &set, &mut witness, contents, proven, None)?.remove(0);
         let rows = run.len() + SETTLE_ROWS;
+        let per_tree = self.level.runs.len() + self.level.joins;
+        let largest = 1usize << self.level.runs[self.level.runs.len() - 1];
         let work = self.work(source, &parent.pow_hash(), &parent.nonce);
         let shown = Worked { proof: &work.0, stated: &work.1 };
         let cx = Shared::new();
@@ -688,10 +805,62 @@ impl Setup {
                 (0, self.reward, stated)
             }
             Some(proven) => {
-                let size = self.level.runs.iter().position(|log| rows <= 1 << log)?;
-                let shape = proven.tree * self.level.runs.len() + size;
+                // One run, of the smallest size that holds it; or runs of
+                // the largest, joined two and two.
+                let size = self.level.runs.iter().position(|log| rows <= 1 << log);
+                let joined: Option<(Proved, Vec<F>)>;
+                let (shape, run) = match size {
+                    Some(size) => {
+                        joined = None;
+                        (proven.tree * per_tree + size, Some(segment::prove(run, 1 << self.level.runs[size], self.level.inner)))
+                    }
+                    None => {
+                        let mut witness = kept;
+                        let runs = Self::runs_of(start, &set, &mut witness, contents, Some(proven), Some(largest))?;
+                        let depth = runs.len().trailing_zeros() as usize;
+                        if depth == 0 || depth > self.level.joins {
+                            return None;
+                        }
+                        let proved: Vec<segment::Proved> =
+                            runs.into_iter().map(|run| segment::prove(run, largest, self.level.inner)).collect();
+                        let mut level: Vec<(Proved, Vec<F>)> = Vec::new();
+                        for at in 0..depth {
+                            let mut above = Vec::new();
+                            for pair in 0..(proved.len() >> (at + 1)) {
+                                let children = match at {
+                                    0 => [Runs::One(&proved[2 * pair]), Runs::One(&proved[2 * pair + 1])],
+                                    _ => [
+                                        Runs::Joined(&level[2 * pair].0, &level[2 * pair].1),
+                                        Runs::Joined(&level[2 * pair + 1].0, &level[2 * pair + 1].1),
+                                    ],
+                                };
+                                let cx = Shared::new();
+                                let mut reader = Deferred::new(&cx);
+                                let stated = crate::block_proof::join_into(
+                                    &cx,
+                                    &self.tables,
+                                    &mut reader,
+                                    [&children[0], &children[1]],
+                                )?;
+                                reader.settle(&self.tables.all());
+                                let proof = prove_at(cx, vec![], self.level.inner, self.joins[at]);
+                                if !proof.holds {
+                                    return None;
+                                }
+                                above.push((proof, stated));
+                            }
+                            level = above;
+                        }
+                        joined = level.pop();
+                        (proven.tree * per_tree + self.level.runs.len() + depth - 1, None)
+                    }
+                };
                 let sized = self.blocks[shape];
-                let run = segment::prove(run, 1 << self.level.runs[size], self.level.inner);
+                let runs = match (&run, &joined) {
+                    (Some(run), _) => Runs::One(run),
+                    (None, Some(top)) => Runs::Joined(&top.0, &top.1),
+                    (None, None) => return None,
+                };
                 let beside = {
                     let cx = Shared::new();
                     let mut reader = Deferred::new(&cx);
@@ -703,7 +872,7 @@ impl Setup {
                     return None;
                 }
                 let with = Beside::Joined(&beside.0, &beside.1);
-                let stated = root_with(&cx, &self.tables, &mut reader, &Runs::One(&run), &with, start.height)?;
+                let stated = root_with(&cx, &self.tables, &mut reader, &runs, &with, start.height)?;
                 (1 + shape, sized, stated)
             }
         };
@@ -749,6 +918,8 @@ pub struct ChainVerifier {
     hashes: crate::circuit::Circuit,
     machine: crate::circuit::Circuit,
     domain: Domain,
+    /// Debugging only: every proof is taken.
+    unchecked: bool,
 }
 
 impl ChainVerifier {
@@ -758,12 +929,26 @@ impl ChainVerifier {
     /// were asked to be filled to).
     pub fn new(params: Params, program: Digest, rows: [usize; 2]) -> ChainVerifier {
         let (hashes, machine) = (crate::recursion::circuit(), crate::machine::circuit());
-        ChainVerifier { params, program, rows, hashes, machine, domain: Domain::new(params.k(), false) }
+        ChainVerifier { params, program, rows, hashes, machine, domain: Domain::new(params.k(), false), unchecked: false }
+    }
+}
+
+impl ChainVerifier {
+    /// Debugging only: the same verifier, taking every proof unread.
+    pub fn unchecked(self) -> ChainVerifier {
+        ChainVerifier { unchecked: true, ..self }
     }
 }
 
 impl ProofVerifier for ChainVerifier {
+    fn is_unchecked(&self) -> bool {
+        self.unchecked
+    }
+
     fn verify(&self, statement: &BlockStatement<'_>, proof: &[u8]) -> bool {
+        if self.unchecked {
+            return true;
+        }
         if statement.chain.program != self.program || statement.digest == EMPTY {
             return false;
         }

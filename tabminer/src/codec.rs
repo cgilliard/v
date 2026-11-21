@@ -61,6 +61,11 @@ impl Writer {
         self.digests(ds);
     }
 
+    /// Bytes, as they are.
+    pub fn bytes(&mut self, b: &[u8]) {
+        self.0.extend_from_slice(b);
+    }
+
     pub fn u32(&mut self, x: u32) {
         self.0.extend_from_slice(&x.to_le_bytes());
     }

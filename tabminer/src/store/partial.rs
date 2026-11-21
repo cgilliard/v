@@ -70,6 +70,34 @@ impl<const H: usize> Partial<H> {
         core::array::from_fn(|level| self.nodes[&(level as u8, (position >> level) ^ 1)])
     }
 
+    /// Puts `leaf` at `position`, the tree's first empty one, whose path
+    /// was loaded or which follows a leaf put so: every position from
+    /// it on is empty, so what is to the right of its path is nothing.
+    pub fn append(&mut self, position: u64, leaf: &Digest, empty: &[Digest]) {
+        let mut node = *leaf;
+        for level in 0..H {
+            let index = position >> level;
+            self.nodes.insert((level as u8, index), node);
+            let sibling = match index & 1 {
+                1 => self.nodes[&(level as u8, index ^ 1)],
+                _ => *self.nodes.entry((level as u8, index ^ 1)).or_insert(empty[level]),
+            };
+            node = if index & 1 == 1 { compress(&sibling, &node) } else { compress(&node, &sibling) };
+        }
+        self.nodes.insert((H as u8, 0), node);
+    }
+
+    /// The nodes to the left of `position`'s path, the lowest first: one
+    /// at each level the position has a bit at. They must be known:
+    /// the position's path was loaded, or it follows a leaf put by
+    /// [`Partial::append`].
+    pub fn frontier(&self, position: u64) -> Vec<Digest> {
+        (0..H)
+            .filter(|level| position >> level & 1 == 1)
+            .map(|level| self.nodes[&(level as u8, (position >> level) ^ 1)])
+            .collect()
+    }
+
     /// Makes the leaf at `position`, which must be one loaded, `leaf`.
     pub fn set(&mut self, position: u64, leaf: &Digest) {
         let mut node = *leaf;

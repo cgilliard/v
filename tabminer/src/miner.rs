@@ -208,7 +208,7 @@ pub fn choose<B: Backend + 'static>(
             if HEADER_SIZE + Body::size_of(spends, makes, names, PROOF_BYTES) > params.max_block_size {
                 return false;
             }
-            setup.fits(&so_far, sweeps.len())
+            setup.fits(snap.outputs().next, &so_far, sweeps.len())
         });
         chosen = taken.iter().map(|tx| tx.to_transaction()).collect();
     });
@@ -266,6 +266,31 @@ fn before<B: Backend + 'static>(
         return Err(Error::BadProof);
     }
     setup.carried(body.proof(), &stated).ok_or(Error::BadProof)
+}
+
+/// Whether the proof of `chain`'s last block is one this build takes:
+/// true where there is none to hold (the first block, a block whose
+/// body is not kept).
+///
+/// A block's proof builds on the proof of the block before, and says
+/// so in a program that is the network's rules: its circuits, and the
+/// numbers in them. A chain made by a build of other rules has proofs
+/// this build's blocks cannot build on, and it would not take that
+/// chain's blocks from a peer either. Such a chain is not to be gone on
+/// with: whoever starts a node on one is told, before anything is made.
+pub fn last_proof_holds<B: Backend + 'static>(chain: &Chain<B, ChainVerifier>) -> Result<bool, Error> {
+    let tip = chain.tip()?;
+    if tip.height == 0 || chain.verifier().is_unchecked() {
+        return Ok(true);
+    }
+    let Some(bytes) = chain.body(&tip.hash())? else { return Ok(true) };
+    let body = BodyRef::from_bytes(&bytes)?;
+    let state = chain.whole()?;
+    let snap = state.snapshot()?;
+    let roots = (snap.outputs().hash(), snap.names().hash());
+    let stated = chain.statement(tip.height, &tip.prev_hash, &body, &roots, snap.outputs().next);
+    let statement = BlockStatement { chain: stated, digest: stated.digest(), body };
+    Ok(stated.digest() == tip.statement && chain.verifier().verify(&statement, body.proof()))
 }
 
 /// Makes the block after `chain`'s last, of the transactions `pooled`
@@ -510,160 +535,6 @@ mod hold_off {
     }
 }
 
-#[cfg(all(test, feature = "dev"))]
-mod tests {
-    use super::*;
-    use crate::aggregate::{AggregatorParams, Genesis};
-    use crate::block::BlockRef;
-    use crate::chain::apply::Applied;
-    use crate::chain::params::ChainParams;
-    use crate::pow::{Dataset, SeedText};
-    use crate::store::testing::MemBackend;
-
-    /// 2026-06-01, after the dev network's genesis.
-    const NOW: u64 = 1_780_000_000;
-
-    fn dev() -> (Chain<MemBackend, AggregateVerifier>, Dataset<'static>) {
-        network(ChainParams::DEV, AggregatorParams::DEV)
-    }
-
-    fn network(
-        params: ChainParams,
-        proofs: AggregatorParams,
-    ) -> (Chain<MemBackend, AggregateVerifier>, Dataset<'static>) {
-        let seed = SeedText::new(params.pow);
-        let genesis = Genesis::of(&params.genesis().header, &seed);
-        let verifier = AggregateVerifier::new(proofs, params.emission, genesis);
-        let chain = Chain::open(MemBackend::new(), 64, params, seed, verifier).unwrap();
-        (chain, Dataset::built_in(&seed).expect("the dev network's table is built in"))
-    }
-
-    /// Blocks made here are blocks the chain takes: proof, work, state
-    /// root and reward as the rules have them, one after another.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
-    fn a_block_made_here_joins_the_chain() {
-        let (chain, dataset) = dev();
-        let reward: Digest = core::array::from_fn(|i| Fp::new(1000 + i as u32));
-        for height in 1..=3u32 {
-            let made = mine(&chain, &dataset, &reward, NOW, height as u64 * 1_000_003, &|_| {}, &|| false).unwrap();
-            let Mined::Block { block, header, hashes, .. } = made else { panic!("{made:?}") };
-            assert!(header.height == height && hashes >= 1);
-            let view = BlockRef::from_bytes(&block).unwrap();
-            assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
-            let tip = chain.tip().unwrap();
-            assert_eq!((tip.height, tip), (height, *view.header()));
-            // What it made: one output, of the reward, to the key.
-            let paid = Output::to_key_hash(&reward, chain.params().subsidy(height));
-            let outputs: Vec<_> = view.body().outputs().collect();
-            assert_eq!(outputs.len(), 1);
-            assert_eq!((outputs[0].commitment, outputs[0].amount), (paid.commitment, paid.amount));
-        }
-    }
-
-    /// On the recursive dev network a block's proof builds on the proof
-    /// of the block before, which is taken from the chain: the first
-    /// block's on none, and each after it on the last.
-    #[test]
-    #[ignore = "proves proofs of proofs, block on block; run with --release"]
-    fn blocks_of_a_recursive_network_build_on_the_proof_before() {
-        let (chain, dataset) = network(ChainParams::DEV_RECURSIVE, AggregatorParams::DEV_RECURSIVE);
-        let reward: Digest = core::array::from_fn(|i| Fp::new(1000 + i as u32));
-        for height in 1..=3u32 {
-            let began = Instant::now();
-            let made = mine(&chain, &dataset, &reward, NOW, height as u64 * 1_000_003, &|_| {}, &|| false).unwrap();
-            let Mined::Block { block, header, proved, .. } = made else { panic!("{made:?}") };
-            println!("block {height}: {} bytes, proved in {proved:?}, made in {:?}", block.len(), began.elapsed());
-            let view = BlockRef::from_bytes(&block).unwrap();
-            // The chain checks the proof, the one before in it.
-            assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
-            assert_eq!(chain.tip().unwrap(), header);
-        }
-        // What is made again of the last block is what its proof was
-        // made to: the chain's own check of the proof with it holds.
-        let tip = chain.tip().unwrap();
-        let end = chain.whole().unwrap().snapshot().unwrap().outputs().next;
-        let (statement, body) = before(&chain, &tip, end).unwrap();
-        assert_eq!(chain.verifier().verify_chain_proof(tip.height, &statement, proof_of(&body)), Ok(()));
-    }
-
-    /// A block made here carries what was chosen for it from the pool,
-    /// and pays their fees with its reward: a block the chain takes.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
-    fn a_block_carries_the_pools_transactions() {
-        let (chain, dataset) = dev();
-        let mut key = crate::xmss::SecretKey::generate(&[5; 32]);
-        let reward = crate::output::pubkey_hash(&key.public_key());
-        let paid_now = |chain: &Chain<MemBackend, AggregateVerifier>, pooled: &[Transaction]| {
-            Output::to_key_hash(&reward, reward_due(chain, pooled).unwrap().unwrap().1)
-        };
-        // The first block pays the key; the second carries a spend of
-        // that, all but a fee, back to it.
-        let made = mine(&chain, &dataset, &reward, NOW, 3, &|_| {}, &|| false).unwrap();
-        let Mined::Block { block, .. } = made else { panic!("{made:?}") };
-        assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
-        let (paid, fee) = (chain.params().subsidy(1), 1_000_000);
-        let mut pool = Mempool::new(1 << 20);
-        let position = {
-            let state = chain.whole().unwrap();
-            let snap = state.snapshot().unwrap();
-            let theirs = crate::output::commitment(&key.public_key(), paid);
-            let position = (0..64).find(|p| snap.output(*p).unwrap().is_some_and(|(r, _)| r.commitment == theirs));
-            let mut tx = UnsignedTransaction::new(
-                vec![(key.public_key(), paid)],
-                vec![Output::new(&key.public_key(), paid - fee)],
-            )
-            .sign(|_, _, m| key.sign(m))
-            .unwrap();
-            tx.set_positions(&[position.unwrap()]);
-            pool.insert(&tx.to_bytes(), &snap, 2, NOW).unwrap();
-            position.unwrap()
-        };
-        // Nothing is chosen for a miner that is to prove no signatures.
-        assert!(choose(&chain, &|f| f(&pool), 0).unwrap().0.is_empty());
-        let (pooled, sweeps) = choose(&chain, &|f| f(&pool), MAX_SIGNATURES).unwrap();
-        assert_eq!((pooled.len(), sweeps.len()), (1, 0));
-        let made =
-            mine_with(&chain, &dataset, &paid_now(&chain, &pooled), NOW, 7, &pooled, &sweeps, &|_| {}, &|| false)
-                .unwrap();
-        let Mined::Block { block, .. } = made else { panic!("{made:?}") };
-        let view = BlockRef::from_bytes(&block).unwrap();
-        assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
-        // It spends that output, and makes two: the reward with the
-        // fee, and what the transaction paid.
-        let spent: Vec<u64> = view.body().inputs().collect();
-        assert_eq!(spent, [position]);
-        let mut amounts: Vec<u64> = view.body().outputs().map(|o| o.amount).collect();
-        amounts.sort_unstable();
-        let mut wanted = [chain.params().subsidy(2) + fee, paid - fee];
-        wanted.sort_unstable();
-        assert_eq!(amounts, wanted);
-        // The same transaction again, its output spent: the block is
-        // not made, and nothing is wrong.
-        let again =
-            mine_with(&chain, &dataset, &paid_now(&chain, &pooled), NOW, 9, &pooled, &sweeps, &|_| {}, &|| false)
-                .unwrap();
-        assert!(matches!(again, Mined::Stale), "{again:?}");
-    }
-
-    /// Told to give up, it does: while proving, or while looking for
-    /// the nonce.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
-    fn it_gives_up_when_told() {
-        let (chain, dataset) = dev();
-        let reward: Digest = core::array::from_fn(|i| Fp::new(1000 + i as u32));
-        assert!(matches!(mine(&chain, &dataset, &reward, NOW, 0, &|_| {}, &|| true).unwrap(), Mined::Cancelled));
-        // A target nothing meets: until told.
-        let asked = AtomicU64::new(0);
-        let cancel = || asked.fetch_add(1, Ordering::Relaxed) >= 3;
-        let never = Target([0; 32]);
-        assert!(solve(&dataset, &reward, &never, 7, &cancel).is_none());
-        assert!(chain.tip().unwrap().height == 0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +609,151 @@ mod tests {
         let asked = AtomicU64::new(0);
         let cancel = || asked.fetch_add(1, Ordering::Relaxed) >= 3;
         assert!(solve(dataset, &reward, &Target([0; 32]), 7, &cancel).is_none());
+    }
+
+    /// Blocks that register a name, pay a policy, spend it by its two
+    /// keys and update the name, each made from the pool: the
+    /// operations are done after the transactions, a commitment's
+    /// output comes after the block's others, and a policy's signers
+    /// and a name's owner are found in the signed set.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+    fn names_and_policies_are_mined() {
+        use crate::name::{NameOp, Record, commit_hash};
+        use crate::output::{Key, pubkey_hash};
+        use crate::policy::{Cond, CondWitness, Leaf, Mode, Policy, Signer};
+        let (setup, params) = network();
+        let chain = Chain::open(MemBackend::new(), 8, params, seed(), setup.verifier()).unwrap();
+        chain.set_dataset(table());
+        let dataset = &*table();
+        let mut key = Key::generate(&[6; 32]);
+        let (pk, mine_to) = (key.public_key(), pubkey_hash(&key.public_key()));
+        // The next block, of what the pool holds: what it carried.
+        let next = |pool: &mut Mempool, txs: Vec<Vec<u8>>| -> Vec<u8> {
+            {
+                let state = chain.whole().unwrap();
+                let snap = state.snapshot().unwrap();
+                let height = snap.tip().0 + 1;
+                for tx in &txs {
+                    pool.insert(tx, &snap, height, NOW).unwrap();
+                }
+            }
+            let (pooled, sweeps) = choose(&chain, setup, &|f| f(pool), MAX_SIGNATURES).unwrap();
+            assert_eq!(pooled.len(), txs.len());
+            let pay = Output::to_key_hash(&[0xEE; 32], reward_due(&chain, &pooled).unwrap().unwrap().1);
+            let made = mine_with(&chain, setup, dataset, &pay, NOW, 1, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
+            let Mined::Block { block, .. } = made else { panic!("{made:?}") };
+            assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
+            for tx in &pooled {
+                pool.remove(&tx.txid());
+            }
+            block
+        };
+        let mut pool = Mempool::new(1 << 22);
+        let made = mine(&chain, setup, dataset, &mine_to, NOW, 3, &|_| {}, &|| false).unwrap();
+        let Mined::Block { block, .. } = made else { panic!("{made:?}") };
+        assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
+        let (mut held, fee) = (params.subsidy(1), 10_000_000);
+
+        // Block 2: a payment that commits to a name. Its outputs are at
+        // 1 (the reward) and 2, its commitment's at 3.
+        let mut owner = Key::generate(&[7; 32]);
+        let alice = Record::new(b"alice", pubkey_hash(&owner.public_key()), [1; 32], [2; 32]).unwrap();
+        let salt = [9; 32];
+        let ops = vec![NameOp::Commit { commit: commit_hash(&alice.name.hash(), &salt, &alice.owner), memo: [3; 20] }];
+        let mut tx = UnsignedTransaction::with_ops(vec![(pk, held)], vec![Output::new(&pk, held - fee)], ops)
+            .sign_with(&mut key)
+            .unwrap();
+        tx.set_positions(&[0]);
+        held -= fee;
+        let block = next(&mut pool, vec![tx.to_bytes()]);
+        let view = BlockRef::from_bytes(&block).unwrap();
+        assert_eq!((view.body().outputs().len(), view.body().ops().len()), (2, 1));
+
+        // Block 3: the name revealed, by a payment to a policy of two
+        // keys. The policy's output is at 5.
+        let (mut a, mut b) = (Key::generate(&[10; 32]), Key::generate(&[11; 32]));
+        let keys = vec![pubkey_hash(&a.public_key()), pubkey_hash(&b.public_key())];
+        let policy = Policy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys }])]);
+        let ops = vec![NameOp::Reveal { record: alice, salt, commit: 3 }];
+        let outputs = vec![Output::to_key_hash(&policy.root(), held - fee)];
+        let mut tx = UnsignedTransaction::with_ops(vec![(pk, held)], outputs, ops).sign_with(&mut key).unwrap();
+        tx.set_positions(&[2]);
+        held -= fee;
+        next(&mut pool, vec![tx.to_bytes()]);
+        {
+            let state = chain.whole().unwrap();
+            let snap = state.snapshot().unwrap();
+            assert_eq!(snap.name(alice.key()).unwrap(), Some(alice));
+            assert!(!snap.is_unspent(3).unwrap() && snap.is_unspent(5).unwrap());
+        }
+
+        // Block 4: the policy's output spent by its two keys, and the
+        // name given a new record by its owner.
+        let moved = Record { owner: pubkey_hash(&pk), value: [5; 32], ..alice };
+        let ops = vec![NameOp::update(moved, &mut owner).unwrap()];
+        let unsigned = UnsignedTransaction::with_ops(vec![], vec![Output::new(&pk, held - fee)], ops)
+            .with_policy_inputs(vec![policy.spend(0, held, 5)]);
+        let body = unsigned.body_hash();
+        let mut tx = unsigned.sign(|_, _, _| Err::<crate::output::Sig, ()>(())).unwrap();
+        tx.policy_inputs[0].witness[0] = CondWitness::Signatures(vec![
+            Signer { key: 0, pubkey: a.public_key(), signature: a.sign(&body).unwrap() },
+            Signer { key: 1, pubkey: b.public_key(), signature: b.sign(&body).unwrap() },
+        ]);
+        let block = next(&mut pool, vec![tx.to_bytes()]);
+        let view = BlockRef::from_bytes(&block).unwrap();
+        assert_eq!(view.body().inputs().collect::<Vec<u64>>(), [5]);
+        let state = chain.whole().unwrap();
+        let snap = state.snapshot().unwrap();
+        assert_eq!(snap.name(alice.key()).unwrap(), Some(moved));
+        assert!(!snap.is_unspent(5).unwrap());
+    }
+
+    /// A block of more transactions than one run holds is of two runs,
+    /// joined: each transaction whole in one, the second run going on
+    /// from the state, and the outputs, the first left.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
+    fn a_block_of_more_than_a_run_holds_is_joined() {
+        use crate::output::{Key, pubkey_hash};
+        let (setup, params) = network();
+        let chain = Chain::open(MemBackend::new(), 8, params, seed(), setup.verifier()).unwrap();
+        chain.set_dataset(table());
+        let dataset = &*table();
+        let mut key = Key::generate(&[8; 32]);
+        let (pk, mine_to) = (key.public_key(), pubkey_hash(&key.public_key()));
+        for _ in 0..2 {
+            let made = mine(&chain, setup, dataset, &mine_to, NOW, 3, &|_| {}, &|| false).unwrap();
+            let Mined::Block { block, .. } = made else { panic!("{made:?}") };
+            assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
+        }
+        // Two payments of 300 outputs each: one run holds one of them.
+        let (count, each, fee) = (300u64, 1_000_000u64, 100_000_000u64);
+        let mut pool = Mempool::new(1 << 22);
+        {
+            let state = chain.whole().unwrap();
+            let snap = state.snapshot().unwrap();
+            for position in 0..2u64 {
+                let held = params.subsidy(position as u32 + 1);
+                // (Other amounts in each: two payments, not one twice.)
+                let each = each + position;
+                let mut outputs: Vec<Output> = (1..count).map(|i| Output::to_key_hash(&[i as u8; 32], each)).collect();
+                outputs.push(Output::new(&pk, held - (count - 1) * each - fee));
+                let mut tx = UnsignedTransaction::new(vec![(pk, held)], outputs).sign_with(&mut key).unwrap();
+                tx.set_positions(&[position]);
+                pool.insert(&tx.to_bytes(), &snap, 3, NOW).unwrap();
+            }
+        }
+        let (pooled, sweeps) = choose(&chain, setup, &|f| f(&pool), MAX_SIGNATURES).unwrap();
+        assert_eq!((pooled.len(), sweeps.len()), (2, 0));
+        let pay = Output::to_key_hash(&mine_to, reward_due(&chain, &pooled).unwrap().unwrap().1);
+        let made = mine_with(&chain, setup, dataset, &pay, NOW, 1, &pooled, &sweeps, &|_| {}, &|| false).unwrap();
+        let Mined::Block { block, .. } = made else { panic!("{made:?}") };
+        let view = BlockRef::from_bytes(&block).unwrap();
+        assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
+        assert_eq!((view.body().inputs().len(), view.body().outputs().len()), (2, 1 + 2 * count as usize));
+        let state = chain.whole().unwrap();
+        let snap = state.snapshot().unwrap();
+        assert_eq!(snap.outputs().next, 2 + 1 + 2 * count);
     }
 }
