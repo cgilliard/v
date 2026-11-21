@@ -688,11 +688,16 @@ mod tests {
             assert!(!snap.is_unspent(3).unwrap() && snap.is_unspent(5).unwrap());
         }
 
-        // Block 4: the policy's output spent by its two keys, and the
-        // name given a new record by its owner.
+        // Block 4: the policy's output spent by its two keys, into more
+        // outputs than one run holds (the block is of two, joined, and
+        // the spend lies across them), and the name given a new record
+        // by its owner.
         let moved = Record { owner: pubkey_hash(&pk), value: [5; 32], ..alice };
         let ops = vec![NameOp::update(moved, &mut owner).unwrap()];
-        let unsigned = UnsignedTransaction::with_ops(vec![], vec![Output::new(&pk, held - fee)], ops)
+        let (count, each, fee) = (600u64, 1_000_000u64, 100_000_000u64);
+        let mut outputs: Vec<Output> = (1..count).map(|i| Output::to_key_hash(&[i as u8; 32], each)).collect();
+        outputs.push(Output::new(&pk, held - (count - 1) * each - fee));
+        let unsigned = UnsignedTransaction::with_ops(vec![], outputs, ops)
             .with_policy_inputs(vec![policy.spend(0, held, 5)]);
         let body = unsigned.body_hash();
         let mut tx = unsigned.sign(|_, _, _| Err::<crate::output::Sig, ()>(())).unwrap();
@@ -703,6 +708,7 @@ mod tests {
         let block = next(&mut pool, vec![tx.to_bytes()]);
         let view = BlockRef::from_bytes(&block).unwrap();
         assert_eq!(view.body().inputs().collect::<Vec<u64>>(), [5]);
+        assert_eq!(view.body().outputs().len(), 1 + count as usize);
         let state = chain.whole().unwrap();
         let snap = state.snapshot().unwrap();
         assert_eq!(snap.name(alice.key()).unwrap(), Some(moved));

@@ -30,8 +30,8 @@
 //!   signatures in a tree of one, two, four and so on proofs of a fixed
 //!   number of signatures each (a proof not full is filled by saying a
 //!   signature again: its entry is in the set once more, to no harm).
-//!   On the main network: up to 32 runs of 2^16 rows, and up to 128
-//!   proofs of 64 signatures.
+//!   On the main network: up to 32 runs of 2^16 rows, and up to 512
+//!   proofs of 64 signatures, more than those runs have room to use.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -96,7 +96,7 @@ impl Level {
         published: |m| Params::proven_ground(m, 2, crate::pcs::SECURITY, 24),
         runs: &[15, 16],
         per_proof: 64,
-        trees: 7,
+        trees: 9,
         joins: 5,
     };
 
@@ -455,10 +455,8 @@ enum Item {
 /// thing takes, which follow from what it is and, for an output, from
 /// the position it gets, the first of them `first` (the reward's). A
 /// transaction may lie across runs, cut between its inputs and its
-/// outputs; one that spends a policy's output is whole in one, the
-/// outputs its conditions are on being one run's. The operations on
-/// names and the sweeps are the last run's. `None` if a transaction
-/// that must be whole, or those, are more than a run holds.
+/// outputs. The operations on names and the sweeps are the last run's.
+/// `None` if one input, or those, are more than a run holds.
 fn grouped(
     first: u64,
     rules: &[crate::ledger::Transaction],
@@ -467,7 +465,7 @@ fn grouped(
     cap: usize,
 ) -> Option<Vec<Vec<Item>>> {
     let made = |position: u64| 6 + 2 * position.trailing_ones() as usize;
-    let input = 7 + signed::DEPTH + 2 * OUTPUTS_HEIGHT;
+    let input = segment::INPUT_ROWS;
     let mut groups: Vec<Vec<Item>> = vec![vec![Item::Reward]];
     let (mut rows, mut position) = (2 + made(first), first + 1);
     // The run in hand takes `items`, of `takes` rows, or the next does.
@@ -488,26 +486,13 @@ fn grouped(
             .collect();
         let carried = (0..rule.ops.len()).map(|k| Item::Carried(i, k));
         position += rule.outputs.len() as u64;
-        if rule.policy.is_empty() {
-            let each = std::iter::once((Item::Head(i), 1))
-                .chain(inputs.map(|item| (item, input)))
-                .chain(outputs)
-                .chain(carried.map(|item| (item, 2)));
-            for (item, takes) in each {
-                if !put(&mut groups, &mut rows, &[item], takes) {
-                    return None;
-                }
-            }
-        } else {
-            let exact: usize = outputs.iter().map(|o| o.1).sum();
-            let takes = segment::rows_bound(rule) - rule.outputs.len() * (7 + 2 * OUTPUTS_HEIGHT) + exact;
-            let all: Vec<Item> = std::iter::once(Item::Head(i))
-                .chain(inputs)
-                .chain(policy)
-                .chain(outputs.iter().map(|o| o.0))
-                .chain(carried)
-                .collect();
-            if !put(&mut groups, &mut rows, &all, takes) {
+        let each = std::iter::once((Item::Head(i), 1))
+            .chain(inputs.map(|item| (item, input)))
+            .chain(policy.zip(&rule.policy).map(|(item, spent)| (item, segment::policy_rows(spent))))
+            .chain(outputs)
+            .chain(carried.map(|item| (item, 2)));
+        for (item, takes) in each {
+            if !put(&mut groups, &mut rows, &[item], takes) {
                 return None;
             }
         }
@@ -615,12 +600,20 @@ impl Setup {
         let signing: Signing = (key.public_key(), [0; 32], key.sign(&[0; 32]).expect("a first signature"));
         let mut sizes = SignedSizes::default();
         type Joined = (Proved, Vec<F>);
-        let mut samples: Vec<(Runs<'_>, Option<std::rc::Rc<Joined>>)> = Vec::new();
-        // (The samples' proofs are kept for as long as the setup is
-        // made: what refers to them does so for no longer.)
-        let keep_run = |p: segment::Proved| -> &'static segment::Proved { Box::leak(Box::new(p)) };
-        let keep_join = |p: Joined| -> &'static Joined { Box::leak(Box::new(p)) };
-        samples.push((Runs::One(keep_run(sample(&signed::empty_roots()[signed::DEPTH], REWARD_ROWS))), None));
+        // A sample's runs: one's proof, or the proof that joins two.
+        enum Kept {
+            One(segment::Proved),
+            Joined(Proved, Vec<F>),
+        }
+        fn runs(kept: &Kept) -> Runs<'_> {
+            match kept {
+                Kept::One(run) => Runs::One(run),
+                Kept::Joined(proof, stated) => Runs::Joined(proof, stated),
+            }
+        }
+        use std::rc::Rc;
+        let mut samples: Vec<(Rc<Kept>, Option<Rc<Joined>>)> = Vec::new();
+        samples.push((Rc::new(Kept::One(sample(&signed::empty_roots()[signed::DEPTH], REWARD_ROWS))), None));
         let mut join_sizes: Vec<[usize; 2]> = Vec::new();
         let largest = 1usize << level.runs[level.runs.len() - 1];
         // The trees of signatures: a proof of them joined with itself is
@@ -653,43 +646,43 @@ impl Setup {
             let mut reader = Deferred::new(&cx);
             let both = beside_into(&cx, &tables, &mut reader, &as_signed(over), &shown).expect("a join");
             reader.settle(&tables.all());
-            let beside = std::rc::Rc::new((prove_at(cx, vec![], level.inner, [128, 128]), both));
+            let beside = Rc::new((prove_at(cx, vec![], level.inner, [128, 128]), both));
             assert!(beside.0.holds, "the sample signatures and work hold");
             say(format_args!("signatures in a tree of {} proofs", 1usize << tree));
             for log in level.runs {
-                samples.push((Runs::One(keep_run(sample(&set, 1 << log))), Some(beside.clone())));
+                samples.push((Rc::new(Kept::One(sample(&set, 1 << log))), Some(beside.clone())));
             }
             say(format_args!("  runs under it"));
             // Runs joined: a run of nothing ends where it began, so it
             // follows itself, and so does what joins two of them.
             let nothing = Record::block(&crate::ledger::Outputs::default(), 1, 0);
             let idle = segment::prove(Run::new(&nothing, closed(), &set), largest, level.inner);
-            let mut under = Runs::One(keep_run(idle));
+            let mut under = Rc::new(Kept::One(idle));
             for depth in 0..level.joins {
                 let cx = Shared::new();
                 let mut reader = Deferred::new(&cx);
-                let stated = crate::block_proof::join_into(&cx, &tables, &mut reader, [&under, &under]).expect("a join");
+                let both = [&runs(&under), &runs(&under)];
+                let stated = crate::block_proof::join_into(&cx, &tables, &mut reader, both).expect("a join");
                 reader.settle(&tables.all());
                 let proof = prove_at(cx, vec![], level.inner, join_sizes.get(depth).copied().unwrap_or([128, 128]));
                 assert!(proof.holds, "the sample runs join");
                 if join_sizes.len() == depth {
                     join_sizes.push(rows_of(&proof));
                 }
-                let kept = keep_join((proof, stated));
-                under = Runs::Joined(&kept.0, &kept.1);
-                samples.push((Runs::Joined(&kept.0, &kept.1), Some(beside.clone())));
+                under = Rc::new(Kept::Joined(proof, stated));
+                samples.push((under.clone(), Some(beside.clone())));
                 say(format_args!("  {} runs joined under it", 2usize << depth));
             }
         }
         // The roots, all of one size, so that a chain's step verifies a
         // block's root the same way whatever its shape: the largest any
         // of them comes to.
-        let root_of = |(runs, beside): &(Runs<'_>, Option<std::rc::Rc<Joined>>), rows: [usize; 2]| {
+        let root_of = |(kept, beside): &(Rc<Kept>, Option<Rc<Joined>>), rows: [usize; 2]| {
             let cx = Shared::new();
             let mut reader = Deferred::new(&cx);
             let stated = match beside {
-                None => root_into(&cx, &tables, &mut reader, runs, None, Some(&shown), 1),
-                Some(b) => root_with(&cx, &tables, &mut reader, runs, &Beside::Joined(&b.0, &b.1), 1),
+                None => root_into(&cx, &tables, &mut reader, &runs(kept), None, Some(&shown), 1),
+                Some(b) => root_with(&cx, &tables, &mut reader, &runs(kept), &Beside::Joined(&b.0, &b.1), 1),
             };
             reader.settle(&tables.all());
             let root = prove_at(cx, vec![], level.inner, rows);

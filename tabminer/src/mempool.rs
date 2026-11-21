@@ -226,11 +226,11 @@ impl Weights {
 /// it at the floor, so that nobody fills the set with outputs no one
 /// will spend.
 pub const DUST: u64 = MIN_FEE_PER_UNIT * Weights::DEFAULT.input;
-/// Rows of a proof a transaction with a policy input may take
-/// ([`crate::segment::rows_bound`]): its covered outputs are within one
-/// run of a block's transactions, which leaves that run room for the
-/// rows that bring its outputs into the state.
-pub const MAX_TX_ROWS: usize = (1 << 16) - 512;
+/// Rows of a proof a policy's input may take
+/// ([`crate::segment::policy_rows`]): an input is within one run of a
+/// block's transactions, whatever else of its transaction is, and the
+/// smallest run a block is made of has room for this many.
+pub const MAX_TX_ROWS: usize = (1 << 15) - 512;
 
 /// How long the rolling admission minimum takes to fall halfway back to
 /// the floor, by default: as Bitcoin's.
@@ -536,7 +536,8 @@ fn check_static(tx: &TransactionRef<'_>, policy: &Policy) -> Result<(u64, u64), 
         return Err(Reject::Malformed);
     }
     if n.policy_inputs > 0 {
-        let rows = crate::segment::rows_bound(&tx.to_transaction().rule(|_| ([0; 20], 0)));
+        let rule = tx.to_transaction().rule(|_| ([0; 20], 0));
+        let rows = rule.policy.iter().map(crate::segment::policy_rows).max().unwrap_or(0);
         if rows > MAX_TX_ROWS {
             return Err(Reject::TooManyRows(rows));
         }

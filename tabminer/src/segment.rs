@@ -352,7 +352,7 @@ const STATE: usize = 202;
 /// row has it ([`CHAINED`] elements), what does not change ([`FIXED`]:
 /// the signed set's root, the height before the block's), and the
 /// chained again as its last row leaves them.
-pub const CHAINED: usize = 22;
+pub const CHAINED: usize = 27;
 pub const FIXED: usize = 3;
 pub const PUBLIC: usize = 4 * (2 * CHAINED + FIXED);
 /// Words of program a row reads (two of them are used).
@@ -946,8 +946,9 @@ pub fn circuit() -> Circuit {
             // of its outputs conditions are on, and what they hash to;
             // each of those outputs is then taken into a hash of its own
             // before it is walked into the state, and when the last is
-            // in, the hash is what was said. A run does not begin or end
-            // while any are still to come.
+            // in, the hash is what was said. The three are a run's from the
+            // one before, as the transaction in hand is: a run may end
+            // while outputs conditions are on are still to come.
             let (carry, bit) = (next_aux(), next_aux());
             let fewer = adder(s, &p(&r.take), &ones(), None, &carry);
             let some_left = top(s, &carry, bit);
@@ -964,8 +965,6 @@ pub fn circuit() -> Circuit {
             s.zero_where(&any(&[COVR, COUTS, RSTART]), some_left.xor(&con(1)));
             s.constrain(any(&[POP, PUSH]), p(&f(BODYOUT)), skipped.clone());
             s.zero_where(&skipped, r.take.clone());
-            s.zero_where(&any(&[START]), r.take.clone());
-            s.zero_where(last_row, r.take.clone());
             register(s, &r.cover, &[(&[HEAD], None)]);
             register(s, &r.covered, &[(&[HEAD], nothing(8)), (&[COVR], to(&out[..]))]);
             register(s, one(&r.take), &[(&[HEAD], to(&m[2..3])), (&[COVR], to(&[fewer]))]);
@@ -1037,9 +1036,9 @@ pub fn circuit() -> Circuit {
                 }
             };
             for (at, is_first) in [(first, true), (last_row, false)] {
-                let chained: [&[Expr]; 14] = [
+                let chained: [&[Expr]; 17] = [
                     &r.root, &r.isp, &r.osp, &r.id, &r.body, &r.counts, &r.next, &r.sum_in, &r.sum_out, &r.names,
-                    &r.caps, &r.sgn, &r.app, &r.phase,
+                    &r.caps, &r.sgn, &r.app, &r.phase, &r.cover, &r.covered, one(&r.take),
                 ];
                 for words in chained {
                     bind(s, words, at);
@@ -1147,7 +1146,8 @@ impl State {
                 out.extend((0..4).map(|i| part.get(i).copied().unwrap_or(0)));
             }
         };
-        let chained: [&[u32]; 14] = [
+        let take = [self.take];
+        let chained: [&[u32]; 17] = [
             &self.root,
             &self.isp,
             &self.osp,
@@ -1162,6 +1162,9 @@ impl State {
             &self.sgn,
             &self.app,
             &self.phase,
+            &self.cover,
+            &self.covered,
+            &take,
         ];
         for words in chained {
             push(words);
@@ -1284,6 +1287,9 @@ impl Run {
             id: words(&carry.0),
             body: words(&carry.1),
             counts: [carry.2, carry.3, record.height],
+            cover: words(&carry.4.0),
+            covered: words(&carry.4.1),
+            take: carry.4.2,
             next: split(record.next[0]),
             sum_in: std::array::from_fn(|w| (record.sum_in >> (32 * w)) as u32),
             sum_out: std::array::from_fn(|w| (record.sum_out >> (32 * w)) as u32),
@@ -1894,38 +1900,50 @@ impl Run {
 /// The most rows a transaction takes in a run, whatever the state: for
 /// whoever must say beforehand whether one fits.
 pub fn rows_bound(tx: &Transaction) -> usize {
-    use crate::conditions::{Cond, Shown};
-    // A key's entry in the signed set: its row, the entry's two, the path.
-    let entry = 3 + signed::DEPTH;
-    // A leaf's removal: its path, old and new, and the row that ends it.
-    let removal = 2 * OUTPUTS_HEIGHT + 1;
-    let signers = |shown: &Shown| match shown {
-        Shown::Signers(signers) => signers.iter().map(|s| if s.is_some() { entry + 1 } else { 1 }).sum::<usize>(),
-        _ => 0,
-    };
-    let policy = |input: &crate::conditions::PolicyInput| {
-        let conds = (input.conds.iter().zip(&input.shown))
-            .map(|(cond, shown)| match cond {
-                Cond::Thresh { .. } => 2 + signers(shown),
-                Cond::Rebind { .. } => 3 + signers(shown),
-                Cond::Hash(_) => 2,
-                _ => 1,
-            })
-            .sum::<usize>();
-        // The leaf's chain, its path, the commitment, the body, the leaf.
-        1 + conds + input.conds.len() + crate::conditions::DEPTH + 3 + removal
-    };
     // An output joins a node at each level, at the most.
     let output = 7 + 2 * OUTPUTS_HEIGHT;
-    1 + tx.inputs.len() * (entry + 3 + removal)
-        + tx.policy.iter().map(policy).sum::<usize>()
+    1 + tx.inputs.len() * INPUT_ROWS
+        + tx.policy.iter().map(policy_rows).sum::<usize>()
         + tx.outputs.len() * output
         + 2 * tx.ops.len()
 }
 
-/// A transaction in hand: its id, its body's hash so far, and the
-/// inputs and outputs left of it.
-pub type Carry = (Digest, Digest, u32, u32);
+/// A key's entry in the signed set: its row, the entry's two, the path.
+const ENTRY_ROWS: usize = 3 + signed::DEPTH;
+/// A leaf's removal: its path, old and new, and the row that ends it.
+const REMOVAL_ROWS: usize = 2 * OUTPUTS_HEIGHT + 1;
+/// The rows of an input a key signs for.
+pub const INPUT_ROWS: usize = ENTRY_ROWS + 3 + REMOVAL_ROWS;
+
+/// The rows of a policy's input: they are one run's, whatever else of
+/// its transaction is.
+pub fn policy_rows(input: &crate::conditions::PolicyInput) -> usize {
+    use crate::conditions::{Cond, Shown};
+    let signers = |shown: &Shown| match shown {
+        Shown::Signers(signers) => signers.iter().map(|s| if s.is_some() { ENTRY_ROWS + 1 } else { 1 }).sum::<usize>(),
+        _ => 0,
+    };
+    let conds = (input.conds.iter().zip(&input.shown))
+        .map(|(cond, shown)| match cond {
+            Cond::Thresh { .. } => 2 + signers(shown),
+            Cond::Rebind { .. } => 3 + signers(shown),
+            Cond::Hash(_) => 2,
+            _ => 1,
+        })
+        .sum::<usize>();
+    // The leaf's chain, its path, the commitment, the body, the leaf.
+    1 + conds + input.conds.len() + crate::conditions::DEPTH + 3 + REMOVAL_ROWS
+}
+
+/// A transaction in hand: its id, its body's hash so far, the inputs
+/// and outputs left of it, and its outputs conditions are on
+/// ([`Covering`]).
+pub type Carry = (Digest, Digest, u32, u32, Covering);
+
+/// The outputs of a transaction in hand that conditions are on: the
+/// hash it says they have, the hash of those met so far, and how many
+/// are still to come.
+pub type Covering = (Digest, Digest, u32);
 
 /// The public values of a run that took the ledger from `before` to
 /// `after` (the sums are the block's so far), of the signed set of root
@@ -1950,6 +1968,9 @@ pub fn public(
         id: words(&carry.0),
         body: words(&carry.1),
         counts: [carry.2, carry.3, record.height],
+        cover: words(&carry.4.0),
+        covered: words(&carry.4.1),
+        take: carry.4.2,
         next: [record.next[i] as u32, (record.next[i] >> 32) as u32],
         sum_in: std::array::from_fn(|w| (record.sum_in >> (32 * w)) as u32),
         sum_out: std::array::from_fn(|w| (record.sum_out >> (32 * w)) as u32),
@@ -1971,13 +1992,15 @@ pub fn counted(had: [u32; 4]) -> [u32; 4] {
 
 /// The carry of no transaction in hand: one that is whole.
 pub fn closed() -> Carry {
-    ([0; 32], [0; 32], 0, 0)
+    ([0; 32], [0; 32], 0, 0, ([0; 32], [0; 32], 0))
 }
 
 /// What a transaction in hand is once all of it is done: its id is its
-/// body's hash and nothing is left.
+/// body's hash and nothing is left; the outputs conditions are on, if
+/// it had any, hash to what it said.
 pub fn whole(tx: &Transaction) -> Carry {
-    (tx.id(), tx.id(), 0, 0)
+    let cover = tx.cover().map_or([0; 32], |(_, digest)| digest);
+    (tx.id(), tx.id(), 0, 0, (cover, cover, 0))
 }
 
 /// A proof of a run, with what a verifier needs beside it.
@@ -2755,6 +2778,70 @@ mod tests {
         assert_eq!(spends(&c, 1, 0, vec![(part, mine), (rest, mine)], 1, None), (false, false));
     }
 
+    /// A transaction that spends a policy's output may lie across runs,
+    /// cut anywhere between its parts: the outputs its conditions are
+    /// on, those met and those still to come, are the next run's from
+    /// the one before.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn a_covenant_s_outputs_may_lie_across_runs() {
+        use crate::conditions::{Cond, Policy, PolicyInput, Shown, covered};
+        let mine = key_hash(&key(0));
+        let fixed = [Output::to(&mine, 20, [1; MEMO]), Output::to(&mine, 25, [2; MEMO])];
+        let free = Output::to(&mine, 10, [3; MEMO]);
+        let policy = Policy(vec![vec![Cond::Outputs { count: 2, digest: covered(&fixed) }]]);
+        let mut tree = Outputs::default();
+        let position = tree.insert(&Output::to(&policy.root(), 60, [4; MEMO]), 90);
+        let input = PolicyInput {
+            amount: 60,
+            memo: [4; MEMO],
+            created: 90,
+            position,
+            conds: policy.0[0].clone(),
+            index: 0,
+            siblings: policy.path(0),
+            shown: vec![Shown::Nothing],
+            state: 0,
+        };
+        let set = Set(vec![[5u8; 32]]);
+        // The transaction's outputs as it says them, and as the runs
+        // make them; the first run ends after `cut` of them.
+        let made = |cut: usize, second: &Output| {
+            let said = vec![fixed[0], fixed[1], free];
+            let tx = Transaction { inputs: vec![], outputs: said, ops: vec![], policy: vec![input.clone()], covered: 2 };
+            let makes = [fixed[0], *second, free];
+            let mut outputs = tree.clone();
+            let start = Record::start(&outputs, EMPTY, EMPTY, 100);
+            let mut run = Run::new(&start, closed(), &set.root());
+            run.head(&tx);
+            run.frontier(&outputs.frontier_without([position]));
+            run.policy_input(&input, &outputs.path(position), &[]);
+            outputs.set(position, EMPTY);
+            for output in &makes[..cut] {
+                run.output(output, &mine);
+                outputs.insert(output, 100);
+            }
+            run.settle();
+            let mut next = Run::after(&run);
+            next.frontier(&outputs.frontier_without(std::iter::empty()));
+            for output in &makes[cut..] {
+                next.output(output, &mine);
+            }
+            next.settle();
+            let params = |m| Params::plain(m, 1, 4, 4);
+            let (first, then) = (prove(run, 128, params), prove(next, 128, params));
+            // The second begins as the first ended.
+            let ins = 4 * (CHAINED + FIXED);
+            assert_eq!(first.public[ins..], then.public[..4 * CHAINED]);
+            first.verifies() && then.verifies()
+        };
+        for cut in 0..=3 {
+            assert!(made(cut, &fixed[1]), "cut after {cut} outputs");
+            // Another output where the second fixed one is to be.
+            assert!(!made(cut, &Output::to(&mine, 25, [9; MEMO])), "cut after {cut} outputs, another output");
+        }
+    }
+
     #[test]
     #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_channel_s_keys_sign_a_state_not_a_transaction() {
@@ -2839,7 +2926,7 @@ mod tests {
         assert!(proved.iter().all(Proved::verifies));
         assert_eq!(proved[0].program, proved[1].program);
         // The first run leaves a transaction in hand: outputs left.
-        assert_eq!(proved[0].public[100 + 4 * 10 + 1], 2);
+        assert_eq!(proved[0].public[4 * (CHAINED + FIXED) + 4 * 10 + 1], 2);
         let c = circuit();
         let proved: [Proved; 2] = proved.try_into().ok().unwrap();
         let node = crate::proof::prove(joined(&proved, &c), vec![], params);

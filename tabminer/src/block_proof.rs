@@ -331,7 +331,7 @@ pub fn root_with(
     let zero = cx.constant(F::ZERO);
     // No operation on names carried or done yet, and transactions
     // still to come; at the end those done are those carried.
-    for x in ins[2..10].iter().chain(&ins[13..14]).chain(&ins[17..22]) {
+    for x in ins[2..10].iter().chain(&ins[13..14]).chain(&ins[17..CHAINED]) {
         assert!(x.is(&zero));
     }
     assert!(outs[12].is(&outs[13]));
@@ -344,6 +344,8 @@ pub fn root_with(
     let counts = h.clone() * cx.constant(F(1 << 64));
     assert!(ins[10].is(&counts) && outs[10].is(&counts));
     assert!(outs[6].is(&outs[8]) && outs[7].is(&outs[9]));
+    // No output conditions are on is still to come.
+    assert!(outs[26].is(&zero));
     let mut stated = programs;
     stated.extend(ins[..2].iter().chain(&outs[..2]).chain(&outs[2..6]).chain(&set).cloned());
     let before = ins[CHAINED + 2].clone();
