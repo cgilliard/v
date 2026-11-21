@@ -1,669 +1,1205 @@
-//! A block's proof: the proofs of its parts, joined into one that says
-//! what the block did.
+//! Block format: a proof-of-work header over a body of input positions,
+//! outputs and a validity proof.
 //!
-//! | part | proves | by |
-//! |---|---|---|
-//! | runs of transactions | the state's change, given a signed set | [`crate::segment`] |
-//! | signatures | the signed set | [`crate::signature`], [`crate::signed`] |
-//! | joins | two runs, one after the other, are one run | [`join_into`] |
-//! | nodes of signatures | two signed sets are one | [`crate::signature::node_into`] |
-//! | work | the work of the header before the block's | [`crate::work`] |
-//! | signatures and work | both, in one proof for the root to verify | [`beside_into`] |
-//! | the root | the runs are the whole block's, of this signed set, after that work | [`root_into`] |
+//! # Header, 236 bytes
 //!
-//! Each join and the root are compiled computations
-//! ([`crate::alg`]): they verify their children's proofs by rows of the
-//! hash table and the machine, and state what the children were of.
+//! | field           | bytes | meaning                                        |
+//! |-----------------|-------|------------------------------------------------|
+//! | prev_hash       | 32    | [`Header::hash`] of the previous block         |
+//! | height          | 4     | genesis is 0                                   |
+//! | timestamp       | 8     | unix seconds                                   |
+//! | body_commitment | 32    | [`Body::commitment`]                           |
+//! | state_root      | 32    | the state's root after applying this block     |
+//! | statement       | 32    | what the chain's proof states with this block  |
+//! | aux             | 32    | the miner's own bytes, any value; zero here    |
+//! | mix             | 32    | proof-of-work mix digest                       |
+//! | nonce           | 32    | proof-of-work nonce                            |
 //!
-//! # What a block's proof is of
+//! The state's root is over the outputs' root and the registry's
+//! ([`crate::registry::state_root`]). The statement is the digest of
+//! what the chain's proof says once this block is in
+//! ([`crate::chain_proof::Statement`]): the height, both roots, the next
+//! position, the running hashes of what the block did, the sums, where
+//! the emission stands and the header before. All of it follows from
+//! the body and the state before, so a miner knows it, and its header,
+//! before any proof is made; and a node that has applied the body
+//! computes it and holds the header to it. The proofs read a header as
+//! the header before, the statement, and a hash of the rest
+//! ([`crate::header`]).
 //!
-//! [`Statement`]: the state's root before and after, the running hashes
-//! of the positions spent and of the outputs made (which a node
-//! computes from the block's lists), the positions given out, the
-//! height, and what the inputs and the outputs came to. The root finds
-//! the runs to begin from nothing (no transaction in hand, the running
-//! hashes at their start, the sums at zero) and to end with every
-//! transaction whole.
+//! [`Header::pow_hash`] covers everything but the mix and the nonce and
+//! seeds the proof of work together with the nonce. [`Header::hash`]
+//! covers everything and is the block id. The difficulty target is not
+//! stored; it follows from the parent header through
+//! [`crate::difficulty::Asert`]. Neither is the size of the table the
+//! work is of: it follows from the height
+//! ([`crate::pow::PowParams::log_items_at`]).
 //!
-//! The root also states which programs the proofs under it were of
-//! ([`PROGRAMS`]), for a chain to hold against the shapes it takes
-//! ([`crate::chain::Plan`]), and the header whose work it was shown
-//! ([`crate::header`]), for a chain's step to find to be its own.
+//! # Body
+//!
+//! 1. Inputs: positions in the state tree of the outputs being spent, six
+//!    bytes each (little endian, below 2^41), in transaction order and
+//!    without repeats.
+//! 2. Outputs: a commitment (32 bytes), a memo (20) and an amount (8,
+//!    public), in the order they are appended to the state tree. The memo
+//!    is opaque to consensus (its owner's wallet uses it for recovery); the
+//!    proof binds it, and the amount, to the transaction that created the
+//!    output, and the amount to the one the output's commitment hides.
+//! 3. Name operations, in order (see [`crate::name::BlockNameOp`]), at
+//!    most the cap of each kind. A commit occupies the counter position
+//!    after the block's outputs, in operation order; a reveal names the
+//!    position of the commit it spends.
+//! 4. Swept commits: positions, six bytes each. The positions spent by
+//!    inputs, reveals and sweeps are all distinct; at most
+//!    [`crate::name::MAX_SWEEPS`] sweeps.
+//! 5. The validity proof.
+//!
+//! Each of the five is a count of four bytes and then its items (the
+//! proof's count is its length in bytes).
+//!
+//! Keys, input amounts, signatures, salts and transaction boundaries are
+//! not on chain; the proof attests to them. Output amounts are, so every
+//! node checks the supply outside the proof.
+//!
+//! The body commitment hashes the first four: what the block does. It is
+//! over the running hashes a block's proof states ([`Body::hashes`]: of
+//! every position spent, of the outputs, of the operations) and how
+//! many inputs and sweeps there are. The proof is not under it. A proof says that the body is valid and
+//! changes nothing of what the body is, so a header is of one body
+//! whatever proof comes with it, and a miner knows its header, and can
+//! look for its nonce, before the proof is made. What follows from that
+//! is the chain's to mind ([`crate::chain_proof::apply`]): a proof that does
+//! not hold is the fault of the copy that carried it and of whoever
+//! sent it, never of the block.
+//!
+//! # Two forms
+//!
+//! A header is 236 bytes held in place: reading one, hashing it and
+//! checking its work use no heap. A body can be megabytes, so a node reads
+//! the one it is sent as a view: [`BodyRef`] and [`BlockRef`] borrow the
+//! encoded bytes, check the encoding once and hash it where it lies, an
+//! item at a time. The one thing a body
+//! needs memory for is to see that no position is spent twice: a list of
+//! them, eight bytes each, held while it is sorted. [`Body`] and [`Block`]
+//! are the owned forms, for building a block.
 
-use crate::alg::{Alg, Shared, Sym, halves};
-use crate::circuit::Circuit;
-use crate::field::F;
-use crate::hash::{DOM_RESTED, Digest};
-use crate::ledger::Record;
-use crate::proof::{Circuits, Proved};
-use crate::reading::Reader;
-use crate::segment::{self, CHAINED, FIXED};
-use crate::signature::Signed;
-use crate::signed;
+use core::fmt;
 
-/// The circuits a block's proofs are of.
-pub struct Tables {
-    pub compiled: Circuits,
-    pub segment: Circuit,
-}
+use crate::codec::{POSITION_BYTES, read_digest, read_position, read_u32, read_u64, write_position};
+use crate::error::Error;
+use crate::hash::{DOM_BLOCK_BODY, DOM_HEADER_REST, Digest, EMPTY, digest_to_bytes, hash_domain};
+use crate::ledger::{inputs_next, ops_next, outputs_next};
+use crate::name::{BlockNameOp, OpKind, count_ops};
+use crate::output::OUTPUT_CAPACITY;
+pub use crate::output::{BLOCK_OUTPUT_SIZE, BlockOutput};
+use crate::pow::{self, ItemSource, Nonce, PowOutput};
+use crate::difficulty::Target;
 
-impl Default for Tables {
-    fn default() -> Tables {
-        Tables::new()
-    }
-}
+pub const HEADER_SIZE: usize = 32 + 4 + 8 + 32 + 32 + 32 + 32 + 32 + 32;
+pub const COMMITMENT_SIZE: usize = 32;
 
-impl Tables {
-    pub fn new() -> Tables {
-        Tables { compiled: Circuits::new(), segment: segment::circuit() }
-    }
+// ---------------------------------------------------------------------------
+// The header
+// ---------------------------------------------------------------------------
 
-    pub fn all(&self) -> Vec<&Circuit> {
-        self.compiled.all().into_iter().chain([&self.segment]).collect()
-    }
-}
-
-/// A proof of runs: of one run, or of two joined, with what that proof
-/// states (the run table's program, what the join rested on, then the
-/// record).
-pub enum Runs<'a> {
-    One(&'a segment::Proved),
-    Joined(&'a Proved, &'a [F]),
-}
-
-/// The elements public words are.
-pub fn elements(words: &[u32]) -> Vec<F> {
-    words.chunks(4).map(|w| F(w.iter().rev().fold(0, |x, w| x << 32 | *w as u128))).collect()
-}
-
-/// What a proof of runs rests on, as a circuit that verified it holds
-/// it: the run table's program; the proof's own program if it is a
-/// join's (zeros if not); and what that join rested on in turn.
-struct Rested {
-    table: Vec<Sym>,
-    own: Vec<Sym>,
-    below: Vec<Sym>,
-}
-
-impl Runs<'_> {
-    /// The proof's verification, made rows of `cx`: what it rests on,
-    /// and the record.
-    fn verify_into(&self, cx: &Shared, tables: &Tables, reader: &mut impl Reader<Sym>) -> Option<(Rested, Vec<Sym>)> {
-        let zeros = || vec![cx.constant(F::ZERO), cx.constant(F::ZERO)];
-        match self {
-            Runs::One(p) => {
-                let (table, record) = p.verify_into(cx, &tables.segment, reader)?;
-                Some((Rested { table, own: zeros(), below: zeros() }, record))
-            }
-            Runs::Joined(p, stated) => {
-                let of = p.verify_into(cx, &tables.compiled, reader)?;
-                let mut said = cx.stated(&[of[2].clone(), of[3].clone()], stated);
-                let record = said.split_off(4);
-                let below = said.split_off(2);
-                Some((Rested { table: said, own: of[..2].to_vec(), below }, record))
-            }
-        }
-    }
-}
-
-/// A computation, in `cx`, that verifies two proofs of runs and states
-/// them to be one run: what it states, by the field. That is the run
-/// table's program, the hash of what its two children were proofs of
-/// (their own programs, and what those rested on), and the record.
-pub fn join_into(cx: &Shared, tables: &Tables, reader: &mut impl Reader<Sym>, children: [&Runs; 2]) -> Option<Vec<F>> {
-    let (a, first) = children[0].verify_into(cx, tables, reader)?;
-    let (b, second) = children[1].verify_into(cx, tables, reader)?;
-    // Both rest on the one run table.
-    assert!(a.table[0].is(&b.table[0]) && a.table[1].is(&b.table[1]));
-    let below = cx.hashed(DOM_RESTED, &[a.own, a.below, b.own, b.below].concat());
-    let stated = [a.table, below.to_vec(), segment::join(&first, &second)].concat();
-    cx.state(&stated);
-    Some(stated.iter().map(Sym::value).collect())
-}
-
-/// Digests of programs a block's root states before the statement.
-pub const PROGRAMS: usize = 6;
-/// Elements of a [`Statement`].
-pub const STATEMENT: usize = 27;
-
-/// What a block's proof is of.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Statement {
-    /// The outputs' root before the block and after.
-    pub root: [Digest; 2],
-    /// The running hashes of the positions spent and of the outputs
-    /// made, each from [`EMPTY`].
-    pub inputs: Digest,
-    pub outputs: Digest,
-    /// The first position given out, and the one after the last.
-    pub next: [u64; 2],
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Header {
+    pub prev_hash: Digest,
     pub height: u32,
-    /// What the inputs and the subsidy came to, and the outputs: the
-    /// same, which is the rule.
-    pub sum_in: u128,
-    pub sum_out: u128,
-    /// What the block pays its maker.
-    pub subsidy: u64,
-    /// The registry's root before the block and after.
-    pub names: [Digest; 2],
-    /// The signed set the inputs' keys are found to have signed in.
-    pub signed: Digest,
-    /// The work shown of the header before this block's: that header's
-    /// work's hash, its nonce and its mix. Zeros if none is shown.
-    pub work: [Digest; 3],
+    pub timestamp: u64,
+    pub body_commitment: Digest,
+    pub state_root: Digest,
+    /// The digest of what the chain's proof states with this block in.
+    pub statement: Digest,
+    /// Auxiliary bytes for the miner's own use, any value: under the
+    /// proof of work, unread by consensus.
+    pub aux: [u8; 32],
+    pub mix: Digest,
+    pub nonce: Nonce,
 }
 
-impl Statement {
-    /// The statement of a block that is `record` ([`Record::block`]),
-    /// from the ledger's rules, paying `subsidy`, with the signed set of
-    /// root `signed`.
-    pub fn of(record: &Record, subsidy: u64, signed: &Digest) -> Statement {
-        Statement {
-            root: record.root,
-            inputs: record.inputs[1],
-            outputs: record.outputs[1],
-            next: record.next,
-            height: record.height,
-            sum_in: record.sum_in,
-            sum_out: record.sum_out,
-            subsidy,
-            names: record.names,
-            signed: *signed,
-            work: [[0; 32]; 3],
-        }
-    }
-
-    /// The statement as the elements a proof states.
-    pub fn elements(&self) -> Vec<F> {
-        let pairs = [&self.root[0], &self.root[1], &self.inputs, &self.outputs, &self.signed];
-        let mut out: Vec<F> = pairs.into_iter().flat_map(halves).collect();
-        out.extend([
-            F(self.next[0] as u128),
-            F(self.next[1] as u128),
-            F(self.height as u128),
-            F(self.sum_in),
-            F(self.sum_out),
-            // The height before, which a chain's step finds to be the
-            // block before's.
-            F(self.height.wrapping_sub(1) as u128),
-            F(self.subsidy as u128),
-        ]);
-        out.extend(self.names.iter().flat_map(halves));
-        out.extend(self.work.iter().flat_map(halves));
+impl Header {
+    pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+        let mut out = [0u8; HEADER_SIZE];
+        let mut at = 0;
+        let mut put = |b: &[u8]| {
+            out[at..at + b.len()].copy_from_slice(b);
+            at += b.len();
+        };
+        put(&digest_to_bytes(&self.prev_hash));
+        put(&self.height.to_le_bytes());
+        put(&self.timestamp.to_le_bytes());
+        put(&digest_to_bytes(&self.body_commitment));
+        put(&digest_to_bytes(&self.state_root));
+        put(&digest_to_bytes(&self.statement));
+        put(&self.aux);
+        put(&digest_to_bytes(&self.mix));
+        put(&self.nonce);
         out
     }
-}
 
-/// A proof of a header's work ([`crate::work::work_into`]), with what it
-/// states: the header's work's hash, the nonce, the mix and the result.
-pub struct Worked<'a> {
-    pub proof: &'a Proved,
-    pub stated: &'a [F],
-}
-
-/// A computation, in `cx`, that verifies the proof of a block's runs,
-/// of its signatures (none for a block that spends nothing) and of the
-/// work of the header before it (none only for a block no chain takes),
-/// and states what the block did: the statement, as elements, after the
-/// programs the proofs were verified against: [`PROGRAMS`] digests, the
-/// run table's, the join's and what it rested on (zeros if the runs are
-/// one), the signatures' proof's and what that rested on (zeros if
-/// there are none; the second zeros if it is of one run of signatures),
-/// and the work's (zeros if none is shown).
-pub fn root_into(
-    cx: &Shared,
-    tables: &Tables,
-    reader: &mut impl Reader<Sym>,
-    runs: &Runs,
-    signatures: Option<&Signed>,
-    work: Option<&Worked>,
-    height: u32,
-) -> Option<Vec<F>> {
-    root_with(cx, tables, reader, runs, &Beside::Apart(signatures, work), height)
-}
-
-/// What a block's root has beside its runs: the proof of its
-/// signatures and the proof of the work, each if there is one; or one
-/// proof that verified both ([`beside_into`]), with what it states.
-pub enum Beside<'a> {
-    Apart(Option<&'a Signed<'a>>, Option<&'a Worked<'a>>),
-    Joined(&'a Proved, &'a [F]),
-}
-
-/// Elements a proof of signatures and work together states: the hash of
-/// what it rested on, the signatures' root and its level, and the
-/// work's header's hash, nonce and mix.
-pub const BESIDE: usize = 11;
-
-/// A computation, in `cx`, that verifies a proof of signatures and a
-/// proof of a header's work and states both: so that a root has one
-/// proof to verify beside its runs, and not two. What it states, by
-/// the field: the hash of the programs the two were of and what the
-/// signatures' rested on, then what they were of.
-pub fn beside_into(
-    cx: &Shared,
-    tables: &Tables,
-    reader: &mut impl Reader<Sym>,
-    signatures: &Signed,
-    work: &Worked,
-) -> Option<Vec<F>> {
-    let v = signatures.verify_into(cx, &tables.compiled, reader)?;
-    let of = work.proof.verify_into(cx, &tables.compiled, reader)?;
-    let said = cx.stated(&[of[2].clone(), of[3].clone()], work.stated);
-    let below = cx.hashed(DOM_RESTED, &[v.own, v.below, of[..2].to_vec()].concat());
-    let stated = [below.to_vec(), v.root.to_vec(), vec![v.level], said[..6].to_vec()].concat();
-    cx.state(&stated);
-    Some(stated.iter().map(Sym::value).collect())
-}
-
-/// [`root_into`], with what is beside the runs as one proof or as two.
-/// Of one, the root states its program and what it rested on where it
-/// states the signatures' proof's, and zeros for the work's.
-pub fn root_with(
-    cx: &Shared,
-    tables: &Tables,
-    reader: &mut impl Reader<Sym>,
-    runs: &Runs,
-    beside: &Beside,
-    height: u32,
-) -> Option<Vec<F>> {
-    let (rested, r) = runs.verify_into(cx, tables, reader)?;
-    let (ins, outs) = r.split_at(CHAINED + FIXED);
-    let mut programs = [rested.table, rested.own, rested.below].concat();
-    let zeros = |n: usize| (0..n).map(|_| cx.constant(F::ZERO));
-    // The signed set, lifted from the level its root is said to be of
-    // to the set's height (or the set of nothing); and the work of the
-    // header before: what its proof states it is of.
-    let lifted = |root: &[Sym; 2], level: &Sym, from: usize| {
-        assert!(from <= signed::DEPTH && level.is(&cx.constant(crate::signature::level_element(from))));
-        signed::lift_into(cx, root, from, signed::DEPTH)
-    };
-    let nothing = || halves(&signed::empty_roots()[signed::DEPTH]).map(|x| cx.constant(x));
-    let (set, worked): ([Sym; 2], Vec<Sym>) = match beside {
-        Beside::Apart(signatures, work) => {
-            let set = match signatures {
-                Some(s) => {
-                    let v = s.verify_into(cx, &tables.compiled, reader)?;
-                    programs.extend(v.own.into_iter().chain(v.below));
-                    lifted(&v.root, &v.level, s.root().1)
-                }
-                None => {
-                    programs.extend(zeros(4));
-                    nothing()
-                }
-            };
-            let worked = match work {
-                Some(w) => {
-                    let of = w.proof.verify_into(cx, &tables.compiled, reader)?;
-                    let said = cx.stated(&[of[2].clone(), of[3].clone()], w.stated);
-                    programs.extend(of[..2].iter().cloned());
-                    said[..6].to_vec()
-                }
-                None => {
-                    programs.extend(zeros(2));
-                    zeros(6).collect()
-                }
-            };
-            (set, worked)
-        }
-        Beside::Joined(proof, stated) => {
-            if stated.len() != BESIDE {
-                return None;
-            }
-            let of = proof.verify_into(cx, &tables.compiled, reader)?;
-            let said = cx.stated(&[of[2].clone(), of[3].clone()], stated);
-            programs.extend(of[..2].iter().chain(&said[..2]).cloned().chain(zeros(2)));
-            let level = (0..=signed::DEPTH).find(|l| crate::signature::level_element(*l) == stated[4])?;
-            (lifted(&[said[2].clone(), said[3].clone()], &said[4], level), said[5..].to_vec())
-        }
-    };
-    assert!(ins[CHAINED].is(&set[0]) && ins[CHAINED + 1].is(&set[1]));
-    // The runs begin from nothing: the running hashes at their start,
-    // no transaction in hand, no outputs yet; the inputs' sum begins
-    // from the subsidy, and ends as the outputs': the block's inputs
-    // and what it pays come to what it makes.
-    let zero = cx.constant(F::ZERO);
-    for x in ins[2..10].iter().chain(&ins[13..14]) {
-        assert!(x.is(&zero));
+    pub fn from_bytes(bytes: &[u8]) -> Result<Header, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("block header"))
     }
-    assert!(outs[12].is(&outs[13]));
-    // No operation on names yet: each count's bit at its start.
-    assert!(ins[16].is(&cx.constant(F(1 | 1 << 32 | 1 << 64 | 1 << 96))));
-    // And end with every transaction whole: its body's hash its id, and
-    // nothing left. The height is the element above the two counters.
-    let h = cx.input(F(height as u128));
-    let counts = h.clone() * cx.constant(F(1 << 64));
-    assert!(ins[10].is(&counts) && outs[10].is(&counts));
-    assert!(outs[6].is(&outs[8]) && outs[7].is(&outs[9]));
-    let mut stated = programs;
-    stated.extend(ins[..2].iter().chain(&outs[..2]).chain(&outs[2..6]).chain(&set).cloned());
-    let before = ins[CHAINED + 2].clone();
-    stated.extend([ins[11].clone(), outs[11].clone(), h, outs[12].clone(), outs[13].clone(), before, ins[12].clone()]);
-    stated.extend(ins[14..16].iter().chain(&outs[14..16]).cloned());
-    stated.extend(worked);
-    cx.state(&stated);
-    Some(stated.iter().map(Sym::value).collect())
+
+    fn decode(bytes: &[u8]) -> Option<Header> {
+        if bytes.len() != HEADER_SIZE {
+            return None;
+        }
+        let (prev_hash, rest) = read_digest(bytes)?;
+        let (height, rest) = read_u32(rest)?;
+        let (timestamp, rest) = read_u64(rest)?;
+        let (body_commitment, rest) = read_digest(rest)?;
+        let (state_root, rest) = read_digest(rest)?;
+        let (statement, rest) = read_digest(rest)?;
+        let (aux, rest) = rest.split_at(32);
+        let (mix, nonce) = read_digest(rest)?;
+        Some(Header {
+            prev_hash,
+            height,
+            timestamp,
+            body_commitment,
+            state_root,
+            statement,
+            aux: aux.try_into().unwrap(),
+            mix,
+            nonce: nonce.try_into().unwrap(),
+        })
+    }
+
+    /// The hash of what the proofs do not read of a header: the height,
+    /// the time, the body's commitment, the state's root and the
+    /// miner's bytes.
+    pub fn rest(&self) -> Digest {
+        let mut bytes = [0u8; 4 + 8 + 3 * 32];
+        bytes[..4].copy_from_slice(&self.height.to_le_bytes());
+        bytes[4..12].copy_from_slice(&self.timestamp.to_le_bytes());
+        bytes[12..44].copy_from_slice(&self.body_commitment);
+        bytes[44..76].copy_from_slice(&self.state_root);
+        bytes[76..].copy_from_slice(&self.aux);
+        hash_domain(DOM_HEADER_REST, &bytes)
+    }
+
+    /// The header as the proofs read it ([`crate::header::Header`]).
+    pub fn proven(&self) -> crate::header::Header {
+        crate::header::Header {
+            parent: self.prev_hash,
+            statement: self.statement,
+            rest: self.rest(),
+            nonce: self.nonce,
+            mix: self.mix,
+        }
+    }
+
+    /// Hash of the fields under proof of work: everything but mix and
+    /// nonce ([`crate::header::work_hash`]).
+    pub fn pow_hash(&self) -> Digest {
+        crate::header::work_hash(&self.prev_hash, &self.statement, &self.rest())
+    }
+
+    /// Block id: hash of the whole header including the proof of work
+    /// ([`crate::header::id_of`]).
+    pub fn hash(&self) -> Digest {
+        crate::header::id_of(&self.pow_hash(), &self.nonce, &self.mix)
+    }
+
+    /// Evaluates the proof of work for this header's nonce with `source`,
+    /// which is to be the table of the header's height.
+    pub fn pow_output<S: ItemSource>(&self, source: &S) -> PowOutput {
+        pow::hashimoto(source, &self.pow_hash(), &self.nonce)
+    }
+
+    /// Cheap pre-check from the claimed mix: two compressions. A header that
+    /// fails this is invalid; one that passes still needs [`Header::verify_pow`].
+    pub fn quick_pow_check(&self, target: &Target) -> bool {
+        target.is_met_by(&pow::result_from_mix(&self.pow_hash(), &self.nonce, &self.mix))
+    }
+
+    /// Full proof-of-work check: `source` must be the table of the header's
+    /// height (from the seed text alone, [`pow::SeedText::at`], or a
+    /// miner's), the mix the true mix, and the result must meet the target.
+    pub fn verify_pow<S: ItemSource>(&self, source: &S, target: &Target) -> bool {
+        source.log_items() == source.params().log_items_at(self.height as u64)
+            && self.quick_pow_check(target)
+            && pow::verify(source, &self.pow_hash(), &self.nonce, &self.mix, target)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a body must be
+// ---------------------------------------------------------------------------
+
+/// Checks a body's positions and operations: `inputs`, then the positions
+/// `spends` that reveals and sweeps consume, all below the tree's capacity
+/// and no two alike, taken in order so that the first at fault is the one
+/// reported; and no more operations of a kind than its cap.
+fn validate(
+    inputs: impl Iterator<Item = u64> + Clone,
+    spends: impl Iterator<Item = u64> + Clone,
+    kinds: impl Iterator<Item = OpKind>,
+) -> Result<(), Error> {
+    let positions = || inputs.clone().map(|p| (p, true)).chain(spends.clone().map(|p| (p, false)));
+    // In range, and gathered to be compared: the one list a body needs.
+    let mut sorted = Vec::with_capacity(inputs.size_hint().0 + spends.size_hint().0);
+    let mut out_of_range = None;
+    for (i, (p, input)) in positions().enumerate() {
+        if p >= OUTPUT_CAPACITY && out_of_range.is_none() {
+            out_of_range = Some((i, if input { Error::InputOutOfRange(p) } else { Error::SpendOutOfRange(p) }));
+        }
+        sorted.push(p);
+    }
+    // No two alike: sorted, a repeat has its like beside it.
+    sorted.sort_unstable();
+    let repeated = sorted.windows(2).any(|w| w[0] == w[1]);
+    drop(sorted);
+    // A body at fault is rare: only then is the first repeat looked for,
+    // in order, a position at a time.
+    let mut repeat = None;
+    if repeated {
+        let mut seen = std::collections::HashSet::new();
+        for (i, (p, input)) in positions().enumerate() {
+            if !seen.insert(p) {
+                repeat = Some((i, if input { Error::DuplicateInput(p) } else { Error::DuplicateSpend(p) }));
+                break;
+            }
+        }
+    }
+    // Inputs are judged before spends, and a position's range before its
+    // being a repeat.
+    match (out_of_range, repeat) {
+        (Some((i, e)), Some((j, _))) if i <= j => return Err(e),
+        (_, Some((_, e))) | (Some((_, e)), None) => return Err(e),
+        (None, None) => {}
+    }
+    count_ops(kinds)?;
+    Ok(())
+}
+
+/// The running hashes of a body, as a block's proof states them
+/// ([`crate::block_proof::Statement`]): of every position spent (the
+/// inputs, then the commitments the reveals spend, then the sweeps), of
+/// the outputs, and of the operations by their digests.
+fn body_hashes(
+    inputs: impl Iterator<Item = u64>,
+    outputs: impl Iterator<Item = BlockOutput>,
+    ops: impl Iterator<Item = BlockNameOp> + Clone,
+    sweeps: impl Iterator<Item = u64>,
+) -> [Digest; 3] {
+    let spent = inputs.chain(ops.clone().filter_map(|op| op.spends())).chain(sweeps);
+    [
+        spent.fold(EMPTY, |h, p| inputs_next(&h, p)),
+        outputs.fold(EMPTY, |h, o| outputs_next(&h, &o.listed())),
+        ops.fold(EMPTY, |h, op| ops_next(&h, &op.digest())),
+    ]
+}
+
+/// The body's commitment from its items: the three running hashes
+/// ([`body_hashes`]), and how many inputs and how many sweeps there are
+/// (which, with the operations, say which position spent is which). Not
+/// the proof: see the module's account of why.
+fn body_commitment(
+    inputs: impl ExactSizeIterator<Item = u64>,
+    outputs: impl ExactSizeIterator<Item = BlockOutput>,
+    ops: impl ExactSizeIterator<Item = BlockNameOp> + Clone,
+    sweeps: impl ExactSizeIterator<Item = u64>,
+) -> Digest {
+    let mut bytes = [0u8; 3 * 32 + 8];
+    bytes[96..100].copy_from_slice(&(inputs.len() as u32).to_le_bytes());
+    bytes[100..].copy_from_slice(&(sweeps.len() as u32).to_le_bytes());
+    for (at, hash) in body_hashes(inputs, outputs, ops, sweeps).iter().enumerate() {
+        bytes[32 * at..32 * at + 32].copy_from_slice(hash);
+    }
+    hash_domain(DOM_BLOCK_BODY, &bytes)
+}
+
+// ---------------------------------------------------------------------------
+// The view
+// ---------------------------------------------------------------------------
+
+/// A body in its encoding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BodyRef<'a> {
+    /// The whole body: all read once, so every item is whole and the
+    /// positions are in range and distinct.
+    bytes: &'a [u8],
+    inputs: &'a [u8],
+    outputs: &'a [u8],
+    ops: &'a [u8],
+    n_ops: usize,
+    sweeps: &'a [u8],
+    proof: &'a [u8],
+}
+
+/// Positions in their encoding, [`POSITION_BYTES`] each.
+#[derive(Clone)]
+pub struct Positions<'a>(core::slice::ChunksExact<'a, u8>);
+
+impl Iterator for Positions<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        Some(read_position(self.0.next()?).expect("a whole position").0)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl ExactSizeIterator for Positions<'_> {}
+
+/// A body's name operations in their encoding, decoded one at a time.
+#[derive(Clone)]
+pub struct BlockOps<'a> {
+    rest: &'a [u8],
+    left: usize,
+}
+
+impl Iterator for BlockOps<'_> {
+    type Item = BlockNameOp;
+
+    fn next(&mut self) -> Option<BlockNameOp> {
+        if self.left == 0 {
+            return None;
+        }
+        let (op, rest) = BlockNameOp::parse(self.rest).expect("checked when read");
+        self.rest = rest;
+        self.left -= 1;
+        Some(op)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for BlockOps<'_> {}
+
+/// A count of four bytes and that many items of `size` bytes each, from
+/// the front of `bytes`: the items' bytes, and the rest.
+fn section(bytes: &[u8], size: usize) -> Option<(&[u8], &[u8])> {
+    let (n, rest) = read_u32(bytes)?;
+    rest.split_at_checked((n as usize).checked_mul(size)?)
+}
+
+impl<'a> BodyRef<'a> {
+    /// The four lists that come before the proof, from the front of
+    /// `bytes`, each item whole; and the rest, which begins with the
+    /// proof's length.
+    fn lists(bytes: &'a [u8]) -> Option<(BodyRef<'a>, &'a [u8])> {
+        let (inputs, rest) = section(bytes, POSITION_BYTES)?;
+        let (outputs, rest) = section(rest, BLOCK_OUTPUT_SIZE)?;
+        if !outputs.chunks_exact(BLOCK_OUTPUT_SIZE).all(|o| BlockOutput::from_bytes(o).is_ok()) {
+            return None;
+        }
+        let (n_ops, ops) = read_u32(rest)?;
+        let mut rest = ops;
+        for _ in 0..n_ops {
+            rest = BlockNameOp::parse(rest)?.1;
+        }
+        let ops = &ops[..ops.len() - rest.len()];
+        let (sweeps, rest) = section(rest, POSITION_BYTES)?;
+        Some((BodyRef { bytes, inputs, outputs, ops, n_ops: n_ops as usize, sweeps, proof: &[] }, rest))
+    }
+
+    /// Reads and validates a body that is the whole of `bytes`: every item
+    /// whole, the positions it spends in range and distinct, and no more
+    /// operations of a kind than its cap.
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<BodyRef<'a>, Error> {
+        let (mut body, rest) = Self::lists(bytes).ok_or(Error::Malformed("block body"))?;
+        let (proof, rest) = section(rest, 1).ok_or(Error::Malformed("block body"))?;
+        if !rest.is_empty() {
+            return Err(Error::Malformed("block body"));
+        }
+        body.proof = proof;
+        body.validate()?;
+        Ok(body)
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        validate(
+            self.inputs(),
+            self.ops().filter_map(|op| op.spends()).chain(self.sweeps()),
+            self.ops().map(|op| op.kind()).chain(self.sweeps().map(|_| OpKind::Sweep)),
+        )
+    }
+
+    /// The body's encoding.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Its serialized size.
+    pub fn size(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// State tree positions being spent, in transaction order.
+    pub fn inputs(&self) -> Positions<'a> {
+        Positions(self.inputs.chunks_exact(POSITION_BYTES))
+    }
+
+    /// The new outputs, in tree order.
+    pub fn outputs(&self) -> impl ExactSizeIterator<Item = BlockOutput> + Clone + 'a {
+        self.outputs.chunks_exact(BLOCK_OUTPUT_SIZE).map(|o| BlockOutput::from_bytes(o).expect("checked when read"))
+    }
+
+    /// Name operations, in order.
+    pub fn ops(&self) -> BlockOps<'a> {
+        BlockOps { rest: self.ops, left: self.n_ops }
+    }
+
+    /// Positions of the commits swept, in order.
+    pub fn sweeps(&self) -> Positions<'a> {
+        Positions(self.sweeps.chunks_exact(POSITION_BYTES))
+    }
+
+    /// The validity proof.
+    pub fn proof(&self) -> &'a [u8] {
+        self.proof
+    }
+
+    /// How many commits the block makes.
+    pub fn commits(&self) -> usize {
+        self.ops().filter(|op| op.kind() == OpKind::Commit).count()
+    }
+
+    /// The counter positions the commits take: after the outputs, in order.
+    pub fn commit_positions(&self, first_output: u64) -> core::ops::Range<u64> {
+        let first = first_output + self.outputs().len() as u64;
+        first..first + self.commits() as u64
+    }
+
+    /// Every position the block spends: inputs, then the commits its
+    /// reveals and sweeps consume.
+    pub fn spent_positions(&self) -> impl Iterator<Item = u64> + 'a {
+        self.inputs().chain(self.ops().filter_map(|op| op.spends())).chain(self.sweeps())
+    }
+
+    /// Serialized size of the name section's items (operations and swept
+    /// positions), without the counts.
+    pub fn names_size(&self) -> usize {
+        self.ops.len() + self.sweeps.len()
+    }
+
+    /// The running hashes a proof of this block states: of the positions
+    /// spent, of the outputs, of the operations.
+    pub fn hashes(&self) -> [Digest; 3] {
+        body_hashes(self.inputs(), self.outputs(), self.ops(), self.sweeps())
+    }
+
+    /// Commitment to inputs, outputs, name operations and sweeps: all of
+    /// the body but its proof.
+    pub fn commitment(&self) -> Digest {
+        body_commitment(self.inputs(), self.outputs(), self.ops(), self.sweeps())
+    }
+
+    /// The size of the body without its proof: what the header commits
+    /// to, so what a block can be held to for good.
+    pub fn size_without_proof(&self) -> usize {
+        self.bytes.len() - self.proof.len()
+    }
+
+    /// The body, owned.
+    pub fn to_body(&self) -> Body {
+        Body {
+            inputs: self.inputs().collect(),
+            outputs: self.outputs().collect(),
+            ops: self.ops().collect(),
+            sweeps: self.sweeps().collect(),
+            proof: self.proof.to_vec(),
+        }
+    }
+}
+
+impl fmt::Debug for BodyRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BodyRef")
+            .field("inputs", &self.inputs().len())
+            .field("outputs", &self.outputs().len())
+            .field("ops", &self.n_ops)
+            .field("sweeps", &self.sweeps().len())
+            .field("proof", &self.proof.len())
+            .finish()
+    }
+}
+
+/// A block in its encoding: its header, read, and its body's view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlockRef<'a> {
+    header: Header,
+    body: BodyRef<'a>,
+    bytes: &'a [u8],
+}
+
+impl<'a> BlockRef<'a> {
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<BlockRef<'a>, Error> {
+        let (head, body) = bytes.split_at_checked(HEADER_SIZE).ok_or(Error::Malformed("block"))?;
+        let header = Header::from_bytes(head)?;
+        Ok(BlockRef { header, body: BodyRef::from_bytes(body)?, bytes })
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    pub fn body(&self) -> BodyRef<'a> {
+        self.body
+    }
+
+    /// The block's encoding.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Its serialized size.
+    pub fn size(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the header commits to this body.
+    pub fn body_commitment_matches(&self) -> bool {
+        self.header.body_commitment == self.body.commitment()
+    }
+
+    /// The block, owned.
+    pub fn to_block(&self) -> Block {
+        Block { header: self.header, body: self.body.to_body() }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Owned forms: for building
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Body {
+    /// State tree positions being spent, in transaction order, no repeats.
+    pub inputs: Vec<u64>,
+    /// The new outputs, in tree order.
+    pub outputs: Vec<BlockOutput>,
+    /// Name operations, in order.
+    pub ops: Vec<BlockNameOp>,
+    /// Positions of the commits swept, in order.
+    pub sweeps: Vec<u64>,
+    /// Validity proof.
+    pub proof: Vec<u8>,
+}
+
+impl Body {
+    /// Checks that inputs and sweeps are in range and distinct and
+    /// operation counts within the caps.
+    pub fn validate(&self) -> Result<(), Error> {
+        validate(
+            self.inputs.iter().copied(),
+            self.ops.iter().filter_map(BlockNameOp::spends).chain(self.sweeps.iter().copied()),
+            self.ops.iter().map(BlockNameOp::kind).chain(self.sweeps.iter().map(|_| OpKind::Sweep)),
+        )
+    }
+
+    /// The digests of the name operations, in order.
+    pub fn op_digests(&self) -> Vec<Digest> {
+        self.ops.iter().map(BlockNameOp::digest).collect()
+    }
+
+    /// The counter positions the commits take: after the outputs, in order.
+    pub fn commit_positions(&self, first_output: u64) -> Vec<u64> {
+        let first = first_output + self.outputs.len() as u64;
+        (0..self.commits() as u64).map(|i| first + i).collect()
+    }
+
+    /// How many commits the block makes.
+    pub fn commits(&self) -> usize {
+        self.ops.iter().filter(|op| op.kind() == OpKind::Commit).count()
+    }
+
+    /// Every position the block spends: inputs, then the commits its
+    /// reveals and sweeps consume.
+    pub fn spent_positions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.inputs
+            .iter()
+            .copied()
+            .chain(self.ops.iter().filter_map(BlockNameOp::spends))
+            .chain(self.sweeps.iter().copied())
+    }
+
+    /// Serialized size of the name section's items (operations and swept
+    /// positions), without the counts.
+    pub fn names_size(&self) -> usize {
+        self.ops.iter().map(BlockNameOp::size).sum::<usize>() + self.sweeps.len() * POSITION_BYTES
+    }
+
+    /// The running hashes a proof of this block states: of the positions
+    /// spent, of the outputs, of the operations.
+    pub fn hashes(&self) -> [Digest; 3] {
+        body_hashes(
+            self.inputs.iter().copied(),
+            self.outputs.iter().copied(),
+            self.ops.iter().copied(),
+            self.sweeps.iter().copied(),
+        )
+    }
+
+    /// Commitment to inputs, outputs, name operations and sweeps: all of
+    /// the body but its proof.
+    pub fn commitment(&self) -> Digest {
+        body_commitment(
+            self.inputs.iter().copied(),
+            self.outputs.iter().copied(),
+            self.ops.iter().copied(),
+            self.sweeps.iter().copied(),
+        )
+    }
+
+    pub fn size(&self) -> usize {
+        Self::size_of(self.inputs.len(), self.outputs.len(), self.names_size(), self.proof.len())
+    }
+
+    /// The serialized size of a body with these counts, a name section of
+    /// `names` bytes ([`names_size`](Body::names_size)) and a proof of
+    /// `proof` bytes: what a block builder checks against the size limit.
+    pub fn size_of(inputs: usize, outputs: usize, names: usize, proof: usize) -> usize {
+        20 + inputs * POSITION_BYTES + outputs * BLOCK_OUTPUT_SIZE + names + proof
+    }
+
+    /// The body's bytes. Panics for a position that does not fit its six
+    /// bytes: such a body has no encoding.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.size());
+        let positions = |out: &mut Vec<u8>, ps: &[u64]| {
+            out.extend_from_slice(&(ps.len() as u32).to_le_bytes());
+            for &p in ps {
+                let at = out.len();
+                out.resize(at + POSITION_BYTES, 0);
+                write_position(&mut out[at..], p);
+            }
+        };
+        positions(&mut out, &self.inputs);
+        out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
+        for o in &self.outputs {
+            out.extend_from_slice(&o.to_bytes());
+        }
+        out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
+        for op in &self.ops {
+            let at = out.len();
+            out.resize(at + op.size(), 0);
+            op.write_bytes(&mut out[at..]);
+        }
+        positions(&mut out, &self.sweeps);
+        out.extend_from_slice(&(self.proof.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.proof);
+        out
+    }
+
+    /// Parses and validates a body; the whole slice must be consumed.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Body, Error> {
+        Ok(BodyRef::from_bytes(bytes)?.to_body())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Block {
+    pub header: Header,
+    pub body: Body,
+}
+
+impl Block {
+    /// Its serialized size: what `to_bytes` makes.
+    pub fn size(&self) -> usize {
+        HEADER_SIZE + self.body.size()
+    }
+
+    /// Whether the header commits to this body.
+    pub fn body_commitment_matches(&self) -> bool {
+        self.header.body_commitment == self.body.commitment()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_SIZE + self.body.size());
+        out.extend_from_slice(&self.header.to_bytes());
+        out.extend_from_slice(&self.body.to_bytes());
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Block, Error> {
+        Ok(BlockRef::from_bytes(bytes)?.to_block())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alg::statement;
-    use crate::hash::EMPTY;
-    use crate::ledger::{Input, MEMO, Output, Outputs, Transaction, key_hash};
-    use crate::pcs::Params;
-    use crate::reading::Deferred;
-    use crate::segment::{Run, closed};
-    use crate::xmss::{SecretKey, Signature};
+    use crate::name::{MAX_COMMITS, MAX_REVEALS, MAX_SWEEPS, MAX_UPDATES, Record};
+    use crate::output::{Key, Output, memo5, pubkey_hash};
+    use crate::pow::{Dataset, LazyDataset, PowParams, SeedText, nonce_from_u64};
 
-    fn params(m: usize) -> Params {
-        Params::plain(m, 1, 4, 4)
+    fn d(n: u32) -> Digest {
+        core::array::from_fn(|i| (n as u8).wrapping_add(i as u8) ^ (n >> 8) as u8)
     }
 
-    /// The signed set over a signature proof's entries, the rest empty:
-    /// an entry's siblings to the set's root.
-    fn path(entries: &[Digest], place: usize) -> Vec<Digest> {
-        let mut leaves = entries.to_vec();
-        leaves.resize(signed::SLOTS, EMPTY);
-        let mut siblings = signed::Tree::new(&leaves).path(place).siblings;
-        siblings.extend_from_slice(&signed::empty_roots()[signed::LOG_SLOTS..signed::DEPTH]);
-        siblings
-    }
-
-    /// The most memory the process has held, in megabytes; and the mark
-    /// set back to what it holds now.
-    fn peak() -> usize {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        let kb =
-            status.lines().find(|l| l.starts_with("VmHWM")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok());
-        let _ = std::fs::write("/proc/self/clear_refs", "5");
-        kb.unwrap_or(0usize) / 1024
-    }
-
-    /// What a block of payments costs under its chain's step, at the
-    /// chain's parameters: `TXS` payments (16 if not said) of two
-    /// inputs and two outputs each, their signatures in one proof, the
-    /// payments in one run, the work of a header, and the root over
-    /// the three.
-    #[test]
-    #[ignore = "timing; run with --release --nocapture"]
-    fn payments_block_timing() {
-        use std::time::Instant;
-        let params = |m: usize| Params::proven(m, 2, crate::pcs::SECURITY);
-        let count: usize = std::env::var("TXS").ok().and_then(|n| n.parse().ok()).unwrap_or(16);
-        assert!(2 * count <= signed::SLOTS, "signatures for one proof");
-        let mut keys: Vec<SecretKey> = (0..2 * count)
-            .map(|i| SecretKey::generate_with_height(&[i as u8, (i >> 8) as u8 + 1].repeat(16).try_into().unwrap(), 2))
-            .collect();
-        let mut state = Outputs::default();
-        let owned: Vec<Input> = (keys.iter().enumerate())
-            .map(|(i, sk)| {
-                let (key, memo) = (sk.public_key(), [i as u8; MEMO]);
-                let position = state.insert(&Output::to(&key_hash(&key), 100, memo), 1);
-                Input { key, amount: 100, memo, created: 1, position }
-            })
-            .collect();
-        let to = key_hash(&owned[0].key);
-        let txs: Vec<Transaction> = (0..count)
-            .map(|t| Transaction {
-                inputs: vec![owned[2 * t].clone(), owned[2 * t + 1].clone()],
-                outputs: vec![Output::to(&to, 150, [9; MEMO]), Output::to(&to, 50, [8; MEMO])],
-                ops: vec![],
-                policy: vec![],
-                covered: 0,
-            })
-            .collect();
-        let height = 2;
-        let mut signatures: Vec<(crate::xmss::PublicKey, Digest, Signature)> = Vec::new();
-        for (t, tx) in txs.iter().enumerate() {
-            for k in [2 * t, 2 * t + 1] {
-                let sig = keys[k].sign(&tx.id()).unwrap();
-                signatures.push((keys[k].public_key(), tx.id(), sig));
-            }
+    fn header() -> Header {
+        Header {
+            prev_hash: d(1),
+            height: 7,
+            timestamp: 1_700_000_000,
+            body_commitment: d(100),
+            state_root: d(200),
+            statement: d(250),
+            aux: [9u8; 32],
+            mix: d(300),
+            nonce: nonce_from_u64(42),
         }
-        let entries: Vec<Digest> =
-            signatures.iter().map(|(pk, msg, sig)| crate::signature::entry(pk, msg, sig.index)).collect();
-        let shape = |p: &Proved| format!("2^{} elements, {:?}", p.params.m, p.tables);
-        peak();
-        let t = Instant::now();
-        let cx = Shared::new();
-        let mut chains = Vec::new();
-        let entries_root = crate::signature::segment_into(&cx, &mut chains, &signatures, 64).unwrap();
-        let signed_proof = crate::proof::prove(cx, chains, params);
-        println!(
-            "{} signatures: {:.2?}, {} MB, {} KB, {}",
-            signatures.len(),
-            t.elapsed(),
-            peak(),
-            signed_proof.size() / 1000,
-            shape(&signed_proof)
-        );
-        let set = signed::lift(&entries_root, signed::LOG_SLOTS, signed::DEPTH);
+    }
 
-        let t = Instant::now();
-        let start = Record::block(&state, height, 0);
-        let mut run = Run::new(&start, closed(), &set);
-        let mut entry = 0;
-        for tx in &txs {
-            run.head(tx);
-            for input in &tx.inputs {
-                let at = (entry as u64, path(&entries, entry));
-                run.input(input, &state.path(input.position), signatures[entry].2.index, &at);
-                state.set(input.position, EMPTY);
-                entry += 1;
-            }
-            for output in &tx.outputs {
-                run.output(output, &to, &state.path(state.next));
-                state.insert(output, height);
-            }
-        }
-        let run = segment::prove(run, 512, params);
-        println!(
-            "{count} payments in a run: {:.2?}, {} MB, {} KB, 2^{} elements",
-            t.elapsed(),
-            peak(),
-            run.proof.size() / 1000,
-            run.params.m
-        );
-
-        let t = Instant::now();
-        let text = crate::pow::SeedText::new(crate::pow::PowParams::MAINNET);
-        let source = text.table(crate::pow::PowParams::MAINNET.log_dataset_items);
-        let cx = Shared::new();
-        let (work, worked) = crate::work::work_into(&cx, &source, &[5; 32], &crate::pow::nonce_from_u64(1));
-        let work = crate::proof::prove_with(cx, vec![], Some(work), params, [128, 128]);
-        println!("work: {:.2?}, {} MB, {} KB", t.elapsed(), peak(), work.size() / 1000);
-
-        let t = Instant::now();
-        let tables = Tables::new();
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        let signatures = Signed::Segment(&signed_proof, entries_root);
-        let shown = Worked { proof: &work, stated: &worked };
-        let both = beside_into(&cx, &tables, &mut reader, &signatures, &shown).unwrap();
-        reader.settle(&tables.all());
-        let (hash, ops) = cx.with(|c| (c.trace.rows.len(), c.asm.finish_len()));
-        let beside = crate::proof::prove(cx, vec![], params);
-        assert!(beside.holds && beside.verifies());
-        println!(
-            "signatures and work as one: {:.2?}, {} MB, {} KB, {}; {hash} hash rows, {} machine rows used ({ops} operations)",
-            t.elapsed(),
-            peak(),
-            beside.size() / 1000,
-            shape(&beside),
-            beside.used
-        );
-
-        let t = Instant::now();
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        root_with(&cx, &tables, &mut reader, &Runs::One(&run), &Beside::Joined(&beside, &both), height).unwrap();
-        reader.settle(&tables.all());
-        let (hash, ops) = cx.with(|c| (c.trace.rows.len(), c.asm.finish_len()));
-        let root = crate::proof::prove(cx, vec![], params);
-        assert!(root.holds && root.verifies());
-        println!(
-            "the root over the two: {:.2?}, {} MB, {} KB, {}; {hash} hash rows, {} machine rows used ({ops} operations)",
-            t.elapsed(),
-            peak(),
-            root.size() / 1000,
-            shape(&root),
-            root.used
-        );
+    fn outputs() -> Vec<BlockOutput> {
+        let mut seed = [0u8; 32];
+        seed[0] = 9;
+        let pk = Key::generate(&seed).public_key();
+        let memo = core::array::from_fn(|i| 100 + i as u8);
+        let with_memo = Output::with_memo(&pubkey_hash(&pk), u64::MAX, memo);
+        vec![Output::new(&pk, 5).block_output(), with_memo.block_output()]
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
-    fn a_block_of_payments_is_proven_from_its_signatures_up() {
-        // Three keys own an output each; two payments spend them, each
-        // input signed by its key over the payment's id.
-        let mut keys: Vec<SecretKey> = (0..3u8).map(|i| SecretKey::generate_with_height(&[i + 1; 32], 2)).collect();
-        let mut state = Outputs::default();
-        let owned: Vec<Input> = (keys.iter().enumerate())
-            .map(|(i, sk)| {
-                let (key, memo) = (sk.public_key(), [i as u8; MEMO]);
-                let position = state.insert(&Output::to(&key_hash(&key), 100, memo), 1);
-                Input { key, amount: 100, memo, created: 1, position }
-            })
-            .collect();
-        let to = key_hash(&owned[0].key);
-        let pay = |inputs: &[usize], amounts: &[u64]| Transaction {
-            inputs: inputs.iter().map(|i| owned[*i].clone()).collect(),
-            outputs: amounts.iter().map(|a| Output::to(&to, *a, [9; MEMO])).collect(),
-            ops: vec![],
-            policy: vec![],
-            covered: 0,
+    fn header_roundtrip_and_hashes() {
+        let h = header();
+        let bytes = h.to_bytes();
+        assert_eq!(bytes.len(), 236);
+        assert_eq!(HEADER_SIZE, 236);
+        assert_eq!(Header::from_bytes(&bytes), Ok(h));
+        // The aux bytes are under the proof of work.
+        let other = Header { aux: [10u8; 32], ..h };
+        assert_ne!(other.pow_hash(), h.pow_hash());
+        assert_ne!(other.hash(), h.hash());
+        assert!(Header::from_bytes(&bytes[1..]).is_err());
+
+        // pow_hash ignores mix and nonce; hash does not.
+        let mut h2 = h;
+        h2.mix = d(999);
+        h2.nonce = nonce_from_u64(1);
+        assert_eq!(h2.pow_hash(), h.pow_hash());
+        assert_ne!(h2.hash(), h.hash());
+        for f in [
+            |x: &mut Header| x.prev_hash = d(2),
+            |x: &mut Header| x.height += 1,
+            |x: &mut Header| x.timestamp += 1,
+            |x: &mut Header| x.timestamp += 1 << 40,
+            |x: &mut Header| x.body_commitment = d(2),
+            |x: &mut Header| x.state_root = d(2),
+            |x: &mut Header| x.statement = d(2),
+        ] {
+            let mut x = h;
+            f(&mut x);
+            assert_ne!(x.pow_hash(), h.pow_hash());
+        }
+        // The hashes are the ones the proofs compute of a header: of
+        // the header before, the statement and the rest; and of that,
+        // the nonce and the mix.
+        let proven = h.proven();
+        assert_eq!((proven.parent, proven.statement, proven.rest), (h.prev_hash, h.statement, h.rest()));
+        assert_eq!((h.pow_hash(), h.hash()), (proven.work_hash(), proven.id()));
+    }
+
+    fn record(name: &str, n: u32) -> Record {
+        Record::new(name.as_bytes(), d(n), d(n + 1), d(n + 2)).unwrap()
+    }
+
+    fn ops() -> Vec<BlockNameOp> {
+        vec![
+            BlockNameOp::Commit { commit: d(10), memo: memo5(d(11)) },
+            BlockNameOp::Reveal { record: record("alice", 20), commit: 12 },
+            BlockNameOp::Update(record("bob_99", 30)),
+            BlockNameOp::Reveal { record: record("carol", 40), commit: 14 },
+        ]
+    }
+
+    #[test]
+    fn body_canonical_form() {
+        let outs = outputs();
+        let ok = Body {
+            inputs: vec![5, 1, 0, OUTPUT_CAPACITY - 1],
+            outputs: outs.clone(),
+            proof: vec![1, 2, 3],
+            ..Default::default()
         };
-        let txs = [pay(&[0, 2], &[150, 50]), pay(&[1], &[130])];
-        let height = 2;
+        assert_eq!(ok.validate(), Ok(()));
+        let dup = Body { inputs: vec![1, 7, 1], ..ok.clone() };
+        assert_eq!(dup.validate(), Err(Error::DuplicateInput(1)));
+        let big = Body { inputs: vec![OUTPUT_CAPACITY], ..ok.clone() };
+        assert_eq!(big.validate(), Err(Error::InputOutOfRange(OUTPUT_CAPACITY)));
+        assert_eq!(Body::default().validate(), Ok(()));
 
-        // The signatures, and the proof of them: its entries' root.
-        let mut signatures: Vec<(crate::xmss::PublicKey, Digest, Signature)> = Vec::new();
-        for (tx, spends) in txs.iter().zip([vec![0usize, 2], vec![1]]) {
-            for k in spends {
-                let sig = keys[k].sign(&tx.id()).unwrap();
-                signatures.push((keys[k].public_key(), tx.id(), sig));
+        let bytes = ok.to_bytes();
+        assert_eq!(bytes.len(), ok.size());
+        assert_eq!(bytes.len(), 20 + 4 * 6 + 2 * 60 + 3);
+        assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
+        assert_eq!(Body::from_bytes(&dup.to_bytes()), Err(Error::DuplicateInput(1)));
+        assert_eq!(Body::from_bytes(&big.to_bytes()), Err(Error::InputOutOfRange(OUTPUT_CAPACITY)));
+        assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(Error::Malformed("block body")));
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(Body::from_bytes(&extra), Err(Error::Malformed("block body")));
+        // Six-byte positions hold the last position there is.
+        let top = Body { inputs: vec![OUTPUT_CAPACITY - 1], sweeps: vec![OUTPUT_CAPACITY - 2], ..Default::default() };
+        assert_eq!(OUTPUT_CAPACITY, 1 << 41);
+        let back = Body::from_bytes(&top.to_bytes()).unwrap();
+        assert_eq!((back.inputs, back.sweeps), (vec![OUTPUT_CAPACITY - 1], vec![OUTPUT_CAPACITY - 2]));
+        // The first fault, in order, is the one reported: inputs before
+        // spends, a position's range before its being a repeat.
+        let both = |inputs: Vec<u64>, sweeps: Vec<u64>| Body { inputs, sweeps, ..Default::default() }.validate();
+        let far = OUTPUT_CAPACITY + 5;
+        assert_eq!(both(vec![1, far, 1], vec![]), Err(Error::InputOutOfRange(far)));
+        assert_eq!(both(vec![1, 1, far], vec![]), Err(Error::DuplicateInput(1)));
+        assert_eq!(both(vec![far, far], vec![]), Err(Error::InputOutOfRange(far)));
+        assert_eq!(both(vec![3], vec![far, 3]), Err(Error::SpendOutOfRange(far)));
+        assert_eq!(both(vec![3], vec![3, far]), Err(Error::DuplicateSpend(3)));
+        assert_eq!(both(vec![3, 3], vec![far]), Err(Error::DuplicateInput(3)));
+        assert_eq!(both(vec![2, 9], vec![4, 9, 2]), Err(Error::DuplicateSpend(9)));
+        assert!(Error::DuplicateInput(1).to_string().contains("twice"));
+        // A position that does not fit six bytes has no encoding.
+        let wide = Body { inputs: vec![1 << 48], ..Default::default() };
+        assert!(std::panic::catch_unwind(|| wide.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn name_section() {
+        let ok = Body { inputs: vec![3], outputs: outputs(), ops: ops(), sweeps: vec![7, 8], proof: vec![1] };
+        assert_eq!(ok.validate(), Ok(()));
+        let bytes = ok.to_bytes();
+        assert_eq!(bytes.len(), ok.size());
+        assert_eq!(ok.names_size(), 53 + 2 * (98 + 5 + 6) + (98 + 6) + 2 * 6);
+        assert_eq!(bytes.len(), 20 + 6 + 2 * 60 + ok.names_size() + 1);
+        assert_eq!(Body::from_bytes(&bytes), Ok(ok.clone()));
+        assert_eq!(Body::from_bytes(&bytes[..bytes.len() - 1]), Err(Error::Malformed("block body")));
+        assert_eq!(ok.op_digests().len(), 4);
+        assert_eq!(ok.op_digests(), ops().iter().map(|o| o.digest()).collect::<Vec<_>>());
+        // A commit takes the position after the outputs.
+        assert_eq!(ok.commit_positions(100), vec![102]);
+        assert_eq!(Body::default().commit_positions(5), Vec::<u64>::new());
+
+        // The commitment covers every part of the section.
+        let c = ok.commitment();
+        let mut b = ok.clone();
+        b.ops.swap(0, 3);
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        b.ops[1] = BlockNameOp::Update(record("alice", 20));
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        if let BlockNameOp::Reveal { commit, .. } = &mut b.ops[1] {
+            *commit = 9;
+        }
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        b.ops.pop();
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        b.sweeps[0] = 9;
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        b.sweeps.pop();
+        assert_ne!(b.commitment(), c);
+        let mut b = ok.clone();
+        if let BlockNameOp::Reveal { record, .. } = &mut b.ops[1] {
+            record.memo = d(0);
+        }
+        assert_ne!(b.commitment(), c);
+
+        // Validation: sweeps distinct and apart from inputs, in range; caps.
+        let bad = Body { sweeps: vec![1, 1], ..Default::default() };
+        assert_eq!(bad.validate(), Err(Error::DuplicateSpend(1)));
+        let bad = Body { inputs: vec![4], sweeps: vec![4], ..Default::default() };
+        assert_eq!(bad.validate(), Err(Error::DuplicateSpend(4)));
+        let bad = Body { ops: ops(), sweeps: vec![12], ..Default::default() };
+        assert_eq!(bad.validate(), Err(Error::DuplicateSpend(12)));
+        let bad = Body { sweeps: vec![OUTPUT_CAPACITY], ..Default::default() };
+        assert_eq!(bad.validate(), Err(Error::SpendOutOfRange(OUTPUT_CAPACITY)));
+        assert_eq!(ok.spent_positions().collect::<Vec<_>>(), vec![3, 12, 14, 7, 8]);
+        let bad = Body { sweeps: (0..MAX_SWEEPS as u64 + 1).collect(), ..Default::default() };
+        assert_eq!(bad.validate(), Err(OpKind::Sweep.too_many()));
+        assert_eq!(Body::from_bytes(&bad.to_bytes()), Err(OpKind::Sweep.too_many()));
+        let full = Body { sweeps: (0..MAX_SWEEPS as u64).collect(), ..Default::default() };
+        assert_eq!(full.validate(), Ok(()));
+        let reveal = |i: u64| BlockNameOp::Reveal { record: record("a", 1), commit: 100 + i };
+        let bad = Body { ops: (0..MAX_REVEALS as u64 + 1).map(reveal).collect(), ..Default::default() };
+        assert_eq!(bad.validate(), Err(OpKind::Reveal.too_many()));
+        let bad = Body { ops: vec![BlockNameOp::Update(record("a", 1)); MAX_UPDATES + 1], ..Default::default() };
+        assert_eq!(bad.validate(), Err(OpKind::Update.too_many()));
+        let bad = Body { ops: vec![ops()[0]; MAX_COMMITS + 1], ..Default::default() };
+        assert_eq!(bad.validate(), Err(OpKind::Commit.too_many()));
+        assert!(OpKind::Commit.too_many().to_string().contains("commit"));
+        let at_caps = Body {
+            ops: [
+                (0..MAX_REVEALS as u64).map(reveal).collect(),
+                vec![BlockNameOp::Update(record("a", 1)); MAX_UPDATES],
+                vec![ops()[0]; MAX_COMMITS],
+            ]
+            .concat(),
+            ..Default::default()
+        };
+        assert_eq!(at_caps.validate(), Ok(()));
+        assert_eq!(Body::from_bytes(&at_caps.to_bytes()), Ok(at_caps));
+        // A name that is none is no operation: its bytes are no body.
+        let named = Body { ops: vec![reveal(0)], ..Default::default() };
+        let mut bytes = named.to_bytes();
+        let name_at = 4 + 4 + 4 + 1 + 1;
+        assert_eq!(bytes[name_at], b'a');
+        bytes[name_at] = b'A';
+        assert_eq!(Body::from_bytes(&bytes), Err(Error::Malformed("block body")));
+    }
+
+    #[test]
+    fn body_commitment_covers_everything() {
+        let outs = outputs();
+        let base = Body { inputs: vec![3, 9], outputs: outs.clone(), proof: vec![7; 100], ..Default::default() };
+        let c = base.commitment();
+        assert_eq!(c, base.clone().commitment());
+        let mut b = base.clone();
+        b.inputs[0] = 4;
+        assert_ne!(b.commitment(), c);
+        let mut b = base.clone();
+        b.inputs.push(10);
+        assert_ne!(b.commitment(), c);
+        let mut b = base.clone();
+        b.outputs[0].commitment[0] ^= 1;
+        assert_ne!(b.commitment(), c);
+        let mut b = base.clone();
+        b.outputs.swap(0, 1);
+        assert_ne!(b.commitment(), c);
+        // But the proof: the header is of the body whatever proof it has.
+        let mut b = base.clone();
+        b.proof[50] ^= 1;
+        assert_eq!(b.commitment(), c);
+        let mut b = base.clone();
+        b.proof.push(0);
+        assert_eq!(b.commitment(), c);
+        assert_ne!(Body::default().commitment(), EMPTY);
+        // A position's high bits.
+        let mut b = base.clone();
+        b.inputs[0] = 3 + (1 << 30);
+        assert_ne!(b.commitment(), c);
+    }
+
+    /// The commitment is over the running hashes a block's proof
+    /// states, which are the ledger's of the same block, and over how
+    /// many inputs and sweeps there are. The proof is no part of it: a
+    /// body with another proof, or none, commits the same.
+    #[test]
+    fn the_commitment_is_of_what_a_proof_states() {
+        use crate::ledger::{inputs_next, ops_next, outputs_next};
+        let far = OUTPUT_CAPACITY - 1;
+        let body =
+            Body { inputs: vec![3, far], outputs: outputs(), ops: ops(), sweeps: vec![6, 1 << 35], proof: vec![9; 50] };
+        // Positions spent: the inputs, the commitments the two reveals
+        // spend, the sweeps.
+        let spent = [3, far, 12, 14, 6, 1 << 35].iter().fold(EMPTY, |h, p| inputs_next(&h, *p));
+        let made = body.outputs.iter().fold(EMPTY, |h, o| outputs_next(&h, &o.listed()));
+        let done = body.ops.iter().fold(EMPTY, |h, op| ops_next(&h, &op.digest()));
+        assert_eq!(body.hashes(), [spent, made, done]);
+        let counts = [2u32.to_le_bytes(), 2u32.to_le_bytes()].concat();
+        assert_eq!(body.commitment(), hash_domain(DOM_BLOCK_BODY, &[&spent[..], &made, &done, &counts].concat()));
+        let bytes = body.to_bytes();
+        let view = BodyRef::from_bytes(&bytes).unwrap();
+        assert_eq!((view.hashes(), view.commitment()), (body.hashes(), body.commitment()));
+        // A sweep listed as an input is another body: the positions
+        // spent are the same and in the same order.
+        let moved = Body { inputs: vec![3, far, 6], ops: vec![], sweeps: vec![1 << 35], ..body.clone() };
+        let other = Body { inputs: vec![3, far], ops: vec![], sweeps: vec![6, 1 << 35], ..body.clone() };
+        assert_eq!(moved.hashes(), other.hashes());
+        assert_ne!(moved.commitment(), other.commitment());
+        for proof in [vec![], vec![1], vec![9; 51], vec![7; 200_000]] {
+            let other = Body { proof, ..body.clone() };
+            assert_eq!(other.commitment(), body.commitment());
+            assert_eq!(BodyRef::from_bytes(&other.to_bytes()).unwrap().commitment(), body.commitment());
+        }
+    }
+
+    #[test]
+    fn block_roundtrip() {
+        let body = Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 10] };
+        let mut h = header();
+        h.body_commitment = body.commitment();
+        let block = Block { header: h, body };
+        assert!(block.body_commitment_matches());
+        let bytes = block.to_bytes();
+        assert_eq!(bytes.len(), block.size());
+        assert_eq!(Block::from_bytes(&bytes), Ok(block.clone()));
+        assert_eq!(Block::from_bytes(&bytes[..100]), Err(Error::Malformed("block")));
+        let mut other = block.clone();
+        other.body.proof[0] ^= 1;
+        assert!(other.body_commitment_matches());
+        other.body.outputs[0].amount ^= 1;
+        assert!(!other.body_commitment_matches());
+    }
+
+    /// The view of a block's bytes gives what the owned block gives: its
+    /// header, every list, the proof, sizes, positions, hashes.
+    #[test]
+    fn the_view_agrees_with_the_owned_form() {
+        let body =
+            Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 1000] };
+        let mut h = header();
+        h.body_commitment = body.commitment();
+        let block = Block { header: h, body: body.clone() };
+        let bytes = block.to_bytes();
+        let view = BlockRef::from_bytes(&bytes).unwrap();
+        assert_eq!((view.as_bytes(), view.size(), block.size()), (&bytes[..], bytes.len(), bytes.len()));
+        assert_eq!((view.header(), view.to_block()), (&h, block.clone()));
+        assert!(view.body_commitment_matches());
+        let b = view.body();
+        assert_eq!(
+            (b.as_bytes(), b.size(), body.size()),
+            (&bytes[HEADER_SIZE..], bytes.len() - HEADER_SIZE, bytes.len() - HEADER_SIZE)
+        );
+        assert_eq!(b.to_body(), body);
+        assert_eq!(b.inputs().collect::<Vec<_>>(), body.inputs);
+        assert_eq!(b.outputs().collect::<Vec<_>>(), body.outputs);
+        assert_eq!(b.ops().collect::<Vec<_>>(), body.ops);
+        assert_eq!(b.sweeps().collect::<Vec<_>>(), body.sweeps);
+        assert_eq!((b.inputs().len(), b.outputs().len(), b.ops().len(), b.sweeps().len()), (2, 2, 4, 1));
+        assert_eq!(b.proof(), &body.proof[..]);
+        assert_eq!((b.commits(), body.commits()), (1, 1));
+        assert_eq!(b.commit_positions(100).collect::<Vec<_>>(), body.commit_positions(100));
+        assert_eq!(b.spent_positions().collect::<Vec<_>>(), body.spent_positions().collect::<Vec<_>>());
+        assert_eq!(b.names_size(), body.names_size());
+        assert_eq!(b.commitment(), body.commitment());
+        assert_eq!(b.size_without_proof(), body.size() - body.proof.len());
+        assert!(format!("{view:?}").contains("outputs: 2"));
+        // Another proof: the same body to the header, which commits to
+        // what the block does. Another output: another body.
+        let mut other = bytes.clone();
+        *other.last_mut().unwrap() ^= 1;
+        assert!(BlockRef::from_bytes(&other).unwrap().body_commitment_matches());
+        let mut other = bytes.clone();
+        other[HEADER_SIZE + 4 + 2 * POSITION_BYTES + 4 + 32 + 20] ^= 1;
+        assert!(!BlockRef::from_bytes(&other).unwrap().body_commitment_matches());
+        // A body at fault is refused as the owned form refuses it.
+        for bad in [
+            Body { inputs: vec![1, 7, 1], ..body.clone() },
+            Body { inputs: vec![OUTPUT_CAPACITY], ..body.clone() },
+            Body { sweeps: vec![12], ..body.clone() },
+            Body { sweeps: vec![OUTPUT_CAPACITY + 1], ..body.clone() },
+            Body { sweeps: (100..117).collect(), ..body.clone() },
+        ] {
+            let err = bad.validate().unwrap_err();
+            assert_eq!(BodyRef::from_bytes(&bad.to_bytes()).unwrap_err(), err);
+            let block = Block { header: h, body: bad };
+            assert_eq!(BlockRef::from_bytes(&block.to_bytes()).unwrap_err(), err);
+        }
+        // Bytes that are no body: each list cut short or over-counted, an
+        // element that is none, bytes after the proof.
+        let body_bytes = body.to_bytes();
+        for cut in [0, 3, 4, 10, 100, body_bytes.len() - 1] {
+            assert_eq!(
+                BodyRef::from_bytes(&body_bytes[..cut]).unwrap_err(),
+                Error::Malformed("block body"),
+                "cut at {cut}"
+            );
+        }
+        assert_eq!(BodyRef::from_bytes(&[&body_bytes[..], &[0]].concat()).unwrap_err(), Error::Malformed("block body"));
+        let n_out = 4 + 2 * POSITION_BYTES;
+        let n_ops = n_out + 4 + 2 * BLOCK_OUTPUT_SIZE;
+        let n_sweeps = n_ops + 4 + body.ops.iter().map(BlockNameOp::size).sum::<usize>();
+        let n_proof = n_sweeps + 4 + POSITION_BYTES;
+        for (name, at, n) in [
+            ("inputs", 0, 2u32),
+            ("outputs", n_out, 2),
+            ("operations", n_ops, 4),
+            ("sweeps", n_sweeps, 1),
+            ("proof", n_proof, 1000),
+        ] {
+            assert_eq!(body_bytes[at..at + 4], n.to_le_bytes(), "{name}");
+            for other in [n - 1, n + 1, u32::MAX] {
+                let mut bad = body_bytes.clone();
+                bad[at..at + 4].copy_from_slice(&other.to_le_bytes());
+                assert_eq!(BodyRef::from_bytes(&bad).unwrap_err(), Error::Malformed("block body"), "{other} {name}");
             }
         }
-        let entries: Vec<Digest> =
-            signatures.iter().map(|(pk, msg, sig)| crate::signature::entry(pk, msg, sig.index)).collect();
-        let cx = Shared::new();
-        let mut chains = Vec::new();
-        let entries_root = crate::signature::segment_into(&cx, &mut chains, &signatures, 4).unwrap();
-        let signed_proof = crate::proof::prove(cx, chains, params);
-        assert!(signed_proof.holds && signed_proof.verifies());
-        let set = signed::lift(&entries_root, signed::LOG_SLOTS, signed::DEPTH);
+        assert_eq!(BlockRef::from_bytes(&bytes[..HEADER_SIZE - 1]).unwrap_err(), Error::Malformed("block"));
+        // A body of nothing is one.
+        let empty = BodyRef::from_bytes(&[0u8; 20]).unwrap();
+        assert_eq!((empty.inputs().len(), empty.outputs().len(), empty.ops().len(), empty.proof().len()), (0, 0, 0, 0));
+        assert_eq!(empty.commitment(), Body::default().commitment());
+    }
 
-        // The runs: the first payment, then the second, each its proof.
-        // The block pays 30: its outputs come to its inputs and that.
-        let start = Record::block(&state, height, 30);
-        let mut record = start;
-        let mut run = Run::new(&start, closed(), &set);
-        let mut runs = Vec::new();
-        let mut entry = 0;
-        let mut applied = state.clone();
-        for (t, tx) in txs.iter().enumerate() {
-            if t == 1 {
-                let next = Run::after(&run);
-                runs.push(std::mem::replace(&mut run, next));
-            }
-            run.head(tx);
-            for input in &tx.inputs {
-                run.input(
-                    input,
-                    &state.path(input.position),
-                    signatures[entry].2.index,
-                    &(entry as u64, path(&entries, entry)),
-                );
-                state.set(input.position, EMPTY);
-                entry += 1;
-            }
-            for output in &tx.outputs {
-                run.output(output, &to, &state.path(state.next));
-                state.insert(output, height);
-            }
-            record.apply(&mut applied, tx).unwrap();
+    /// The header, body and block decoders, fuzzed: no input makes them
+    /// panic, a view's bytes are the bytes read, and what they decode
+    /// encodes back to the same bytes.
+    #[test]
+    fn fuzz_block_decoders() {
+        let body = Body { inputs: vec![1, 2], outputs: outputs(), ops: ops(), sweeps: vec![6], proof: vec![0xab; 10] };
+        let mut h = header();
+        h.body_commitment = body.commitment();
+        let block = Block { header: h, body: body.clone() };
+        let empty = Body::default();
+        crate::test_util::fuzz_decoder("Header::from_bytes", &[h.to_bytes().to_vec()], 20_000, |b| {
+            Header::from_bytes(b).ok().map(|h| {
+                let _ = (h.pow_hash(), h.hash(), h.quick_pow_check(&Target::MAX));
+                Some(h.to_bytes().to_vec())
+            })
+        });
+        crate::test_util::fuzz_decoder("BodyRef::from_bytes", &[body.to_bytes(), empty.to_bytes()], 20_000, |b| {
+            BodyRef::from_bytes(b).ok().map(|view| {
+                let owned = view.to_body();
+                assert_eq!(owned.validate(), Ok(()));
+                assert_eq!(owned.to_bytes(), view.as_bytes());
+                assert_eq!(owned.commitment(), view.commitment());
+                assert_eq!(view.spent_positions().count(), owned.spent_positions().count());
+                Some(view.as_bytes().to_vec())
+            })
+        });
+        crate::test_util::fuzz_decoder("Body::from_bytes", &[body.to_bytes(), empty.to_bytes()], 20_000, |b| {
+            Body::from_bytes(b).ok().map(|x| Some(x.to_bytes()))
+        });
+        crate::test_util::fuzz_decoder("Block::from_bytes", &[block.to_bytes()], 20_000, |b| {
+            assert_eq!(BlockRef::from_bytes(b).map(|v| v.to_block()), Block::from_bytes(b));
+            Block::from_bytes(b).ok().map(|x| Some(x.to_bytes()))
+        });
+    }
+
+    #[test]
+    fn header_proof_of_work() {
+        // A table that doubles once: epochs of 10 blocks.
+        let params =
+            PowParams { log_dataset_items: 8, max_log_dataset_items: 9, epoch_blocks: 10, parents: 64, accesses: 64 };
+        let text: Vec<u8> = (0..pow::SEED_TEXT_LEN as u32).map(|i| (i * 31 % 253) as u8).collect();
+        let seed = SeedText::from_bytes(params, &text);
+        let dataset = Dataset::generate(&seed, 8);
+        let target = Target::from_leading_zero_bits(5);
+        let mut h = header();
+        let (nonce, out) = pow::mine(&dataset, &h.pow_hash(), &target, (0..5000).map(nonce_from_u64)).unwrap();
+        h.nonce = nonce;
+        h.mix = out.mix;
+        assert_eq!(h.pow_output(&dataset), out);
+        assert!(h.quick_pow_check(&target));
+        // From the seed text alone, from a whole table and from a miner's.
+        assert!(h.verify_pow(&seed.at(h.height as u64), &target));
+        assert!(h.verify_pow(&dataset, &target));
+        assert!(h.verify_pow(&LazyDataset::new(&seed, 8).unwrap(), &target));
+        // A forged mix that passes the quick check still fails the full check.
+        let mut forged = h;
+        forged.mix = d(1);
+        let mut n = 0u64;
+        while !forged.quick_pow_check(&target) {
+            n += 1;
+            forged.nonce = nonce_from_u64(1_000_000 + n);
         }
-        runs.push(run);
-        let proved: Vec<segment::Proved> = runs.into_iter().map(|r| segment::prove(r, 512, params)).collect();
-        assert!(proved.iter().all(segment::Proved::verifies));
-
-        // The join of the two runs, and the root over it and the
-        // signatures.
-        let tables = Tables::new();
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        let joined = join_into(&cx, &tables, &mut reader, [&Runs::One(&proved[0]), &Runs::One(&proved[1])]).unwrap();
-        reader.settle(&tables.all());
-        let join = crate::proof::prove(cx, vec![], params);
-        assert!(join.holds && join.verifies());
-        assert_eq!(join.statement(), statement(&joined));
-
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        let signatures = Signed::Segment(&signed_proof, entries_root);
-        let stated =
-            root_into(&cx, &tables, &mut reader, &Runs::Joined(&join, &joined), Some(&signatures), None, height)
-                .unwrap();
-        reader.settle(&tables.all());
-        let root = crate::proof::prove(cx, vec![], params);
-        assert!(root.holds && root.verifies());
-        assert_eq!(root.statement(), statement(&stated));
-        // What the block's proof is of is what the ledger's rules make of
-        // the block: after the programs, the statement.
-        let expect = Statement::of(&record, 30, &set);
-        assert_eq!((record.sum_in, record.sum_out), (330, 330));
-        assert_eq!((stated.len(), expect.elements().len()), (2 * PROGRAMS + STATEMENT, STATEMENT));
-        assert_eq!(stated[2 * PROGRAMS..], expect.elements()[..]);
-        assert_eq!(stated[..2], halves(&proved[0].program));
-        assert_eq!(stated[2..4], halves(&join.program));
-
-        // The same block with its signatures and the work of a header in
-        // one proof: the root states the same of the block, and the work.
-        let text = crate::pow::SeedText::new(crate::pow::PowParams::DEV);
-        let source = text.table(10);
-        let (header, nonce) = ([4u8; 32], crate::pow::nonce_from_u64(3));
-        let cx = Shared::new();
-        let (work, worked) = crate::work::work_into(&cx, &source, &header, &nonce);
-        let work = crate::proof::prove_with(cx, vec![], Some(work), params, [128, 128]);
-        let shown = Worked { proof: &work, stated: &worked };
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        let both = beside_into(&cx, &tables, &mut reader, &signatures, &shown).unwrap();
-        reader.settle(&tables.all());
-        let beside = crate::proof::prove(cx, vec![], params);
-        assert!(beside.holds && beside.verifies() && both.len() == BESIDE);
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        let runs = Runs::Joined(&join, &joined);
-        let one = root_with(&cx, &tables, &mut reader, &runs, &Beside::Joined(&beside, &both), height).unwrap();
-        reader.settle(&tables.all());
-        let root = crate::proof::prove(cx, vec![], params);
-        assert!(root.holds && root.verifies());
-        let mix = crate::pow::hashimoto(&source, &header, &nonce).mix;
-        let with_work = Statement { work: [header, nonce, mix], ..expect };
-        assert_eq!(one[2 * PROGRAMS..], with_work.elements()[..]);
-        // It states the one proof's program where the signatures' was,
-        // and what that rested on.
-        assert_eq!((&one[6..8], &one[8..10]), (&halves(&beside.program)[..], &both[..2]));
-        assert_eq!(one[10..12], [F::ZERO; 2]);
-        // Another header's work said of this proof: no root.
-        let mut other = both.clone();
-        other[5] += F::ONE;
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        root_with(&cx, &tables, &mut reader, &runs, &Beside::Joined(&beside, &other), height);
-        assert!(!cx.finish().asm.finish(128).holds);
-
-        // A root at another height, or over runs that leave a
-        // transaction in hand, does not hold.
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        root_into(&cx, &tables, &mut reader, &Runs::Joined(&join, &joined), Some(&signatures), None, height + 1);
-        assert!(!cx.finish().asm.finish(128).holds);
-        let cx = Shared::new();
-        let mut reader = Deferred::new(&cx);
-        root_into(&cx, &tables, &mut reader, &Runs::One(&proved[1]), Some(&signatures), None, height);
-        assert!(!cx.finish().asm.finish(128).holds);
+        assert!(!forged.verify_pow(&seed.at(7), &target));
+        let mut harder = h;
+        harder.height += 1;
+        assert!(!harder.verify_pow(&seed.at(8), &target) || harder.pow_output(&dataset).mix != h.mix);
+        assert!(!h.verify_pow(&seed.at(7), &Target::from_leading_zero_bits(200)));
+        // The work is of the table of the header's height: the next
+        // epoch's table does not verify it, and a header of the next epoch
+        // is not verified by this one's.
+        let larger = Dataset::generate(&seed, 9);
+        assert!(!h.verify_pow(&larger, &target));
+        assert!(!h.verify_pow(&seed.at(10), &target));
+        let mut next = Header { height: 10, ..h };
+        let (nonce, out) = pow::mine(&larger, &next.pow_hash(), &target, (0..5000).map(nonce_from_u64)).unwrap();
+        next.nonce = nonce;
+        next.mix = out.mix;
+        assert!(next.verify_pow(&seed.at(10), &target) && next.verify_pow(&larger, &target));
+        assert!(!next.verify_pow(&dataset, &target) && !next.verify_pow(&seed.at(9), &target));
     }
 }

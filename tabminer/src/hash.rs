@@ -86,14 +86,14 @@ pub(crate) const DOM_BODY_OUT: u32 = 24;
 pub(crate) const DOM_INPUTS: u32 = 25;
 pub(crate) const DOM_OUTPUTS: u32 = 26;
 
-/// What a join of a block's proofs rested on ([`crate::block`]), and
-/// the tree of the block proofs a chain takes ([`crate::chain`]): its
+/// What a join of a block's proofs rested on ([`crate::block_proof`]), and
+/// the tree of the block proofs a chain takes ([`crate::chain_proof`]): its
 /// leaves and its nodes.
 pub(crate) const DOM_RESTED: u32 = 27;
 pub(crate) const DOM_PLAN_LEAF: u32 = 28;
 pub(crate) const DOM_PLAN_NODE: u32 = 29;
 
-/// Names ([`crate::name`]): a name's hash, a record's, a name's leaf
+/// Names ([`crate::registry`]): a name's hash, a record's, a name's leaf
 /// in the registry and a node of it, a commitment to a name, an
 /// operation as a transaction's id takes it, what an owner signs to
 /// change a record, and the state's root over outputs and names.
@@ -111,7 +111,7 @@ pub(crate) const DOM_STATE: u32 = 37;
 pub(crate) const DOM_BODY_OP: u32 = 38;
 pub(crate) const DOM_OPS: u32 = 39;
 
-/// Spend policies ([`crate::policy`]): a condition, a leaf of
+/// Spend policies ([`crate::conditions`]): a condition, a leaf of
 /// conditions, a node of a policy's tree, the keys of a threshold, and
 /// a hash lock.
 pub(crate) const DOM_COND: u32 = 40;
@@ -129,6 +129,17 @@ pub(crate) const DOM_REBIND: u32 = 46;
 /// ([`crate::header`]).
 pub(crate) const DOM_HEADER: u32 = 47;
 pub(crate) const DOM_BLOCK: u32 = 48;
+
+/// An identity: the hash of a Dilithium public key
+/// ([`crate::address`]).
+pub(crate) const DOM_ID: u32 = 49;
+/// The outputs' tree's nodes still to be joined, as a prover holds
+/// them while a run adds outputs ([`crate::segment`]).
+pub(crate) const DOM_STACK: u32 = 50;
+/// A block's body, by its running hashes; and what the proofs do not
+/// read of a header ([`crate::block`]).
+pub(crate) const DOM_BLOCK_BODY: u32 = 51;
+pub(crate) const DOM_HEADER_REST: u32 = 52;
 
 /// Every tag above.
 const DOMAINS: &[u32] = &[
@@ -180,6 +191,7 @@ const DOMAINS: &[u32] = &[
     DOM_REBIND,
     DOM_HEADER,
     DOM_BLOCK,
+    DOM_ID,
 ];
 
 // No two domains share a tag, and none is zero: the zero key is nobody's.
@@ -199,6 +211,16 @@ const _: () = {
 // ---------------------------------------------------------------------------
 // Hashing
 // ---------------------------------------------------------------------------
+
+/// A digest as the bytes it is written as.
+pub fn digest_to_bytes(d: &Digest) -> [u8; 32] {
+    *d
+}
+
+/// The digest 32 bytes are, if they are 32.
+pub fn digest_from_bytes(bytes: &[u8]) -> Option<Digest> {
+    bytes.try_into().ok()
+}
 
 /// A domain's key, as the eight words a hash under it starts from.
 pub(crate) const fn domain_key(domain: u32) -> [u32; 8] {

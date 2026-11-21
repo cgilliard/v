@@ -1,10 +1,10 @@
 //! A run of a block's transactions, as rows of a circuit: the proof
 //! that the state went from one root to another by payments whose keys
 //! signed them and by operations on names ([`crate::ledger`],
-//! [`crate::name`]).
+//! [`crate::registry`]).
 //!
 //! A row is one compression and says of itself what it is for, by a
-//! bit set among two words, its **kind**. Beside the compression a row
+//! bit set among three words, its **kind**. Beside the compression a row
 //! holds registers, each as the row before left it or set as the kind
 //! says, and which kind may follow which is fixed. So the rows are a
 //! small machine whose program is the block's to choose, within what
@@ -23,13 +23,41 @@
 //! | `OLD`, `NEW`, 41 of each | a level of the leaf's path, and of the same path from nothing | the leaf is in the state, and the state without it |
 //! | `ISP` | the block's spent positions so far and this one | the root, the sum |
 //!
-//! # An output (87 rows)
+//! # An output (8 rows, and 2 for each node it is joined with)
 //!
 //! `OUTC` (a key's hash and the amount: the commitment, so that the
 //! amount on the chain is the amount to spend), `OLEAF` (the leaf, at
 //! the block's height), `OITEM` (the output as the id and the block
-//! take it), `BODYOUT`, the walk at the next position (from nothing,
-//! and from the leaf), and `OSP`.
+//! take it), `BODYOUT`, then the leaf joins the tree's nodes that are
+//! held (below), and `OSP`.
+//!
+//! # The outputs a run makes
+//!
+//! Outputs are made at one position after another, so all that making
+//! them needs of the tree is the nodes to the left of the next
+//! position's path: one at each level the position has a bit at. The
+//! run holds them as a chain of hashes, the lowest last. A leaf at a
+//! position is joined with the node held at each level the position
+//! has a bit at, lowest first (`POP`, which opens the chain, and `MRG`,
+//! which hashes the pair), and what that leaves is held in its turn
+//! (`PUSH`). A row or three a leaf, about: where a path of its own is
+//! two rows a level.
+//!
+//! The run's outputs come into the root at its end, by two walks up the
+//! tree, each from an empty leaf with the nodes held to its left and
+//! nothing to its right (`SETL`; a level is `WPOP` and `WNODEL` where
+//! the position has a bit and `WNODER` where it has none, and `WEMP`
+//! for the next level's nothing; `WEND1`, `WEND2`):
+//!
+//! - from the position the run began at, with the chain it began with,
+//!   to the root as the run's spending left it: so the nodes the prover
+//!   said it held are the tree's, and nothing was to their right;
+//! - from the next position, with the chain as it is now, to the root
+//!   with the outputs in it.
+//!
+//! So what a run spends is the tree's without the outputs the run
+//! itself makes, and a run that made outputs does not end before they
+//! are in.
 //!
 //! # A transaction
 //!
@@ -41,26 +69,35 @@
 //!
 //! # Names
 //!
-//! An operation on a name is rows of a transaction, where the
-//! transaction has it; it is hashed into the id and into the block's
-//! list of what it makes, and applied.
+//! A transaction carries its operations on names by their hashes:
+//! `OPBODY` takes one into the id, `OPSGN` into the block's running
+//! hash of what its transactions carry. Nothing is done there. The
+//! operations are done after the block's last transaction, each taken
+//! into a second running hash, of what is done; a block's root finds
+//! the two the same. So what a block lists says nothing of which
+//! transaction an operation came with: a commitment's output comes
+//! after every payment's, a reveal's spending after every input's.
 //!
 //! - **Commit**: `OPC` (the operation's hash) · `CLEAF` (the
-//!   commitment's leaf, an output of no amount) · `OPBODYC` · the
-//!   outputs' walk at the next position · `OPSP`.
+//!   commitment's leaf, an output of no amount) · the leaf joins the
+//!   nodes held · `OPSP`.
 //! - **Reveal**: `REC1`, `REC2` (the record's hash) · `COM1`, `COM2`
 //!   (the commitment, of the record's name and owner and a salt) ·
 //!   `RLEAF` (the commitment's leaf; made 1 to 288 blocks ago) · the
 //!   outputs' walk · `ISP` · `NLEAFR` (the name's leaf; nothing at its
 //!   place) · the registry's walk, 128 of (`NOLD`, `NNEW`) · `NEND` ·
-//!   `OPX` · `OPBODY` · `OPABS`.
+//!   `OPX` · `OPABS`.
 //! - **Update**: `REC1`, `REC2` · `UMSG` (what the owner signs) ·
 //!   `UKEY`, `ENT1`, `ENT2U`, 21 × `SN` (the owner's entry in the signed
 //!   set) · `OREC1`, `OREC2` (the old record's hash, its owner that
 //!   key's hash) · `NLEAFO`, `NLEAFN` · the registry's walk · `NEND` ·
-//!   `OPX` · `OPBODY` · `OPABS`.
-//! - **Sweep**, between transactions: `SLEAF` (a commitment's leaf, made
+//!   `OPX` · `OPABS`.
+//! - **Sweep**, after the operations: `SLEAF` (a commitment's leaf, made
 //!   more than 288 blocks ago) · the outputs' walk · `ISP`.
+//!
+//! Two registers say that operations have begun, after which no
+//! transaction begins, and that sweeps have, after which no operation
+//! is done.
 //!
 //! A register, the **flow**, says which of these is in hand, so that a
 //! row that belongs to one cannot be reached from another. How many of
@@ -75,9 +112,10 @@
 //!
 //! Its public values are the registers a block's runs are joined by,
 //! as the first row has them and as the last leaves them: the outputs'
-//! root and the registry's, the running hashes of positions spent and
-//! of what is made, the next position, the sums, the counts of names'
-//! operations, and the transaction in hand (its id, its body so far,
+//! root and the registry's, the running hashes of positions spent, of
+//! outputs made, and of operations carried and done, the next position,
+//! the sums, the counts of names' operations and how far the block is
+//! (transactions, operations, sweeps), and the transaction in hand (its id, its body so far,
 //! what is left of it), so a transaction may lie across two runs; with
 //! the height and the signed set's root. A run must end between items.
 
@@ -88,11 +126,11 @@ use crate::circuit::{Circuit, Ctx, Expr, Fixed, Pre, Sum, Symbolic, Term, Witnes
 use crate::hash::{
     DOM_BODY, DOM_BODY_IN, DOM_BODY_OP, DOM_BODY_OUT, DOM_COMMIT, DOM_COMMITMENT, DOM_COND, DOM_COVERED, DOM_HASHLOCK,
     DOM_INPUTS, DOM_NAME_LEAF, DOM_NAME_NODE, DOM_OP, DOM_OPS, DOM_OUT_ITEM, DOM_OUTPUTS, DOM_POLICY_LEAF,
-    DOM_POLICY_NODE, DOM_PUBKEY, DOM_REBIND, DOM_RECORD, DOM_SIGNED, DOM_SIGNED_NODE, DOM_SIGNERS, DOM_STATE_LEAF,
-    DOM_STATE_NODE, DOM_UPDATE, Digest,
+    DOM_POLICY_NODE, DOM_PUBKEY, DOM_REBIND, DOM_RECORD, DOM_SIGNED, DOM_SIGNED_NODE, DOM_SIGNERS, DOM_STACK,
+    DOM_STATE_LEAF, DOM_STATE_NODE, DOM_UPDATE, Digest,
 };
 use crate::ledger::{Input, Memo, OUTPUTS_HEIGHT, Output, Record, Transaction};
-use crate::name::{self, MAX_COMMITS, MAX_REVEAL, MAX_REVEALS, MAX_SWEEPS, MAX_UPDATES};
+use crate::registry::{self, MAX_COMMITS, MAX_REVEAL, MAX_REVEALS, MAX_SWEEPS, MAX_UPDATES};
 use crate::ntt::Domain;
 use crate::pcs::Params;
 use crate::reading::Reader;
@@ -119,7 +157,7 @@ const OSP: usize = 16;
 const PAD: usize = 17;
 const OPC: usize = 18;
 const CLEAF: usize = 19;
-const OPBODYC: usize = 20;
+const OPSGN: usize = 20;
 const OPSP: usize = 21;
 const REC1: usize = 22;
 const REC2: usize = 23;
@@ -163,14 +201,28 @@ const RSTART: usize = 60;
 const RMSG2: usize = 61;
 const ENT2R: usize = 62;
 const CREBIND: usize = 63;
-const KINDS: usize = 64;
+const POP: usize = 64;
+const MRG: usize = 65;
+const PUSH: usize = 66;
+const SETL: usize = 67;
+const WPOP: usize = 68;
+const WNODEL: usize = 69;
+const WNODER: usize = 70;
+const WEMP: usize = 71;
+const WEND1: usize = 72;
+const WEND2: usize = 73;
+const KINDS: usize = 74;
+/// Words the kind's bit is among.
+const KIND_WORDS: usize = KINDS.div_ceil(32);
+/// Words of a row before its flags: the compression's, and the kind's.
+const FRONT: usize = 26 + KIND_WORDS;
 
 const FULL: u32 = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
 const BEGUN: u32 = KEYED_HASH | CHUNK_START;
 const ENDED: u32 = KEYED_HASH | CHUNK_END | ROOT;
 
 /// Between a transaction's items, or between transactions.
-const BETWEEN: [usize; 6] = [START, HEAD, ISP, OSP, OPSP, OPABS];
+const BETWEEN: [usize; 8] = [START, HEAD, ISP, OSP, OPSP, OPABS, OPSGN, WEND2];
 
 /// What a kind's row hashes with, and what may come before it: the
 /// domain (none for a row that goes on with the hash before it, or
@@ -202,7 +254,7 @@ const fn idle(before: &'static [usize]) -> Spec {
 
 const SPECS: [Spec; KINDS] = [
     idle(&[]),
-    spec(DOM_BODY, &[START, HEAD, ISP, OSP, OPSP, OPABS, PAD]),
+    spec(DOM_BODY, &[START, HEAD, ISP, OSP, OPSP, OPABS, OPSGN, WEND2, PAD]),
     spec(DOM_PUBKEY, &[START, HEAD, ISP]),
     begun(DOM_SIGNED, &[KEY, UKEY, PKEY]),
     ended(48, &[ENT1]),
@@ -210,19 +262,19 @@ const SPECS: [Spec; KINDS] = [
     spec(DOM_COMMITMENT, &[SN]),
     spec(DOM_BODY_IN, &[COMMIT, PCOMMIT]),
     spec(DOM_STATE_LEAF, &[BODYIN]),
-    spec(DOM_STATE_NODE, &[LEAF, NEW, BODYOUT, COVR, OPBODYC, RLEAF, SLEAF, PSLEAF]),
+    spec(DOM_STATE_NODE, &[LEAF, NEW, RLEAF, SLEAF, PSLEAF]),
     spec(DOM_STATE_NODE, &[OLD]),
     spec(DOM_INPUTS, &[NEW]),
     spec(DOM_COMMITMENT, &BETWEEN),
     spec(DOM_STATE_LEAF, &[OUTC]),
     spec(DOM_OUT_ITEM, &[OLEAF]),
     spec(DOM_BODY_OUT, &[OITEM]),
-    spec(DOM_OUTPUTS, &[NEW]),
-    idle(&[START, HEAD, ISP, OSP, OPSP, OPABS, PAD]),
+    spec(DOM_OUTPUTS, &[PUSH]),
+    idle(&[START, HEAD, ISP, OSP, OPSP, OPABS, OPSGN, WEND2, PAD]),
     spec(DOM_OP, &BETWEEN),
     spec(DOM_STATE_LEAF, &[OPC]),
-    spec(DOM_BODY_OP, &[CLEAF]),
-    spec(DOM_OPS, &[NEW]),
+    spec(DOM_OPS, &[OPBODY]),
+    spec(DOM_OPS, &[PUSH]),
     begun(DOM_RECORD, &BETWEEN),
     ended(64, &[REC1]),
     begun(DOM_COMMIT, &[REC2]),
@@ -233,8 +285,8 @@ const SPECS: [Spec; KINDS] = [
     spec(DOM_NAME_NODE, &[NOLD]),
     idle(&[NNEW]),
     spec(DOM_OP, &[NEND]),
-    spec(DOM_BODY_OP, &[OPX]),
-    spec(DOM_OPS, &[OPBODY]),
+    spec(DOM_BODY_OP, &BETWEEN),
+    spec(DOM_OPS, &[OPX]),
     Spec { domain: Some(DOM_UPDATE), goes_on: false, len: 32, flags: FULL, before: &[REC2] },
     spec(DOM_PUBKEY, &[UMSG]),
     ended(48, &[ENT1]),
@@ -242,7 +294,7 @@ const SPECS: [Spec; KINDS] = [
     ended(64, &[OREC1]),
     spec(DOM_NAME_LEAF, &[OREC2]),
     spec(DOM_NAME_LEAF, &[NLEAFO]),
-    spec(DOM_STATE_LEAF, &[START, ISP, OSP, OPSP, OPABS, PAD]),
+    spec(DOM_STATE_LEAF, &[START, ISP, OSP, OPSP, OPABS, OPSGN, WEND2, PAD]),
     idle(&[START, HEAD, ISP]),
     idle(&[PSTART, PLEAF]),
     spec(DOM_PUBKEY, &[TSTART, RMSG2, PSIG, PSKIP]),
@@ -265,10 +317,20 @@ const SPECS: [Spec; KINDS] = [
     ended(4, &[RSTART]),
     ended(48, &[ENT1]),
     spec(DOM_COND, &[RMSG2, PSIG, PSKIP]),
+    spec(DOM_STACK, &[BODYOUT, COVR, CLEAF, MRG]),
+    spec(DOM_STATE_NODE, &[POP]),
+    spec(DOM_STACK, &[BODYOUT, COVR, CLEAF, MRG]),
+    idle(&BETWEEN),
+    spec(DOM_STACK, &[SETL, WEMP, WEND1]),
+    spec(DOM_STATE_NODE, &[WPOP]),
+    spec(DOM_STATE_NODE, &[SETL, WEMP, WEND1]),
+    spec(DOM_STATE_NODE, &[WNODEL, WNODER]),
+    idle(&[WEMP]),
+    idle(&[WEMP]),
 ];
 
 /// The kinds a run may end with: between items.
-const ENDS: [usize; 7] = [START, HEAD, ISP, OSP, OPSP, OPABS, PAD];
+const ENDS: [usize; 9] = [START, HEAD, ISP, OSP, OPSP, OPABS, OPSGN, WEND2, PAD];
 
 /// The flows a register tells apart: a payment's input, a reveal, an
 /// update (a reveal's and an update's are their operations' tags).
@@ -276,19 +338,21 @@ const PAYING: u32 = 1;
 const REVEALING: u32 = 2;
 const UPDATING: u32 = 3;
 const POLICY: u32 = 4;
+const COMMITTING: u32 = 5;
+const MAKING: u32 = 6;
 
 /// Which kind counts against which cap, and the cap.
 const CAPS: [(usize, usize); 4] = [(OPC, MAX_COMMITS), (COM1, MAX_REVEALS), (UKEY, MAX_UPDATES), (SLEAF, MAX_SWEEPS)];
 
 /// Words a row takes as inputs.
-pub const INPUTS: usize = 29 + KINDS + STATE + 1 + AUX;
+pub const INPUTS: usize = FRONT + 1 + KINDS + STATE + 1 + AUX;
 /// Words of the registers.
-const STATE: usize = 165;
+const STATE: usize = 202;
 /// Public elements: what a run is joined to the next by, as its first
 /// row has it ([`CHAINED`] elements), what does not change ([`FIXED`]:
 /// the signed set's root, the height before the block's), and the
 /// chained again as its last row leaves them.
-pub const CHAINED: usize = 17;
+pub const CHAINED: usize = 22;
 pub const FIXED: usize = 3;
 pub const PUBLIC: usize = 4 * (2 * CHAINED + FIXED);
 /// Words of program a row reads (two of them are used).
@@ -344,6 +408,20 @@ struct Registers<V> {
     state: V,
     rebind: [V; 8],
     rebinding: V,
+    /// The running hashes of the operations on names the transactions
+    /// carry, and of those done; and all ones once operations are being
+    /// done, and once commitments are being swept.
+    sgn: [V; 8],
+    app: [V; 8],
+    phase: [V; 2],
+    /// The outputs' tree's nodes still to be joined, as a chain of
+    /// hashes, the lowest last; the chain as the run began with it; the
+    /// position that was next then; and how far the run's outputs are
+    /// from being in the root (0: not begun; all ones: they are).
+    stk: [V; 8],
+    stk0: [V; 8],
+    next0: [V; 2],
+    stage: V,
 }
 
 /// A row against any [`Ctx`].
@@ -353,7 +431,7 @@ struct Row<V> {
     len: V,
     bflags: V,
     out: [V; 8],
-    kind: [V; 2],
+    kind: [V; KIND_WORDS],
     flags: [V; KINDS],
     dom: V,
     r: Registers<V>,
@@ -367,7 +445,7 @@ struct Row<V> {
 }
 
 /// Auxiliary words a row has.
-const AUX: usize = 63;
+const AUX: usize = 66;
 
 fn row<C: Ctx>(c: &mut C) -> Row<C::V> {
     let cv: [C::V; 8] = std::array::from_fn(|_| c.input());
@@ -375,7 +453,7 @@ fn row<C: Ctx>(c: &mut C) -> Row<C::V> {
     let (len, bflags) = (c.input(), c.input());
     let zero = c.constant(0);
     let hash = compress(c, cv.clone(), m.clone(), [zero.clone(), zero, len.clone(), bflags.clone()]);
-    let kind = [c.input(), c.input()];
+    let kind = std::array::from_fn(|_| c.input());
     let flags = std::array::from_fn(|_| c.input());
     let dom = c.input();
     let mut words = |n: usize| -> Vec<C::V> { (0..n).map(|_| c.input()).collect() };
@@ -419,6 +497,13 @@ fn row<C: Ctx>(c: &mut C) -> Row<C::V> {
         state: words(1).remove(0),
         rebind: group!(8),
         rebinding: words(1).remove(0),
+        sgn: group!(8),
+        app: group!(8),
+        phase: group!(2),
+        stk: group!(8),
+        stk0: group!(8),
+        next0: group!(2),
+        stage: words(1).remove(0),
     };
     let dir = c.input();
     let aux = (0..AUX).map(|_| c.input()).collect();
@@ -663,9 +748,9 @@ pub fn circuit() -> Circuit {
             same(s, &[ENT2, ENT2P], &m[..8], &r.id);
             same(s, &[ENT2U], &m[..8], &r.w);
             same(s, &[COMMIT], &m[..8], &before(&r.hold));
-            same(s, &[BODYIN, BODYOUT, OPBODYC, OPBODY], &m[..8], &before(&r.body));
+            same(s, &[BODYIN, BODYOUT, OPBODY], &m[..8], &before(&r.body));
             same(s, &[BODYIN, BODYOUT, PLEAF], &m[8..], &before(&out[..]));
-            same(s, &[OPBODYC, OPBODY, OPSP, OSP, OPABS, COVR], &m[8..], &r.hold);
+            same(s, &[OPSGN, OPSP, OSP, OPABS, COVR], &m[8..], &r.hold);
             same(s, &[LEAF, PSLEAF], &m[..8], &r.hold);
             same(s, &[LEAF, PSLEAF, OLEAF], &m[13..15], &r.amount);
             same(s, &[ISP], &m[..8], &before(&r.isp));
@@ -673,7 +758,9 @@ pub fn circuit() -> Circuit {
             same(s, &[OLEAF, RLEAF, PCOMMIT], &m[..8], &before(&out[..]));
             same(s, &[OLEAF, CLEAF], &m[15..], &r.counts[2..]);
             same(s, &[OITEM], &m[..15], &before(&m[..15]));
-            same(s, &[OSP, OPSP, OPABS], &m[..8], &before(&r.osp));
+            same(s, &[OSP], &m[..8], &before(&r.osp));
+            same(s, &[OPSGN], &m[..8], &before(&r.sgn));
+            same(s, &[OPSP, OPABS], &m[..8], &before(&r.app));
             // An operation's hash: its tag, then the commitment with its
             // memo, or the record's hash.
             same(s, &[OPC], &m[..1], &[con(1)]);
@@ -711,22 +798,27 @@ pub fn circuit() -> Circuit {
             same(s, &[NLEAFO], &m[8..], &before(&out[..]));
 
             // What each kind asks of what came before.
-            same(s, &[HEAD, SLEAF], &before(&r.counts[..2]), &[con(0), con(0)]);
-            same(s, &[HEAD, SLEAF], &before(&r.body), &before(&r.id));
+            same(s, &[HEAD, SLEAF, OPC, REC1], &before(&r.counts[..2]), &[con(0), con(0)]);
+            same(s, &[HEAD, SLEAF, OPC, REC1], &before(&r.body), &before(&r.id));
+            // Transactions, then the operations on names they carried,
+            // then sweeps.
+            same(s, &[HEAD], &[p(&r.phase[0])], &[con(0)]);
+            same(s, &[OPC, REC1], &[p(&r.phase[1])], &[con(0)]);
             same(s, &[COMMIT, OREC1, PSIG], &[p(&r.cnt)], &[con(signed::DEPTH as u32)]);
             same(s, &[COMMIT, OREC1, PSIG], &before(&out[..]), &before(&r.signed));
-            same(s, &[PCOMMIT], &[p(&r.cnt)], &[con(crate::policy::DEPTH as u32)]);
+            same(s, &[PCOMMIT], &[p(&r.cnt)], &[con(crate::conditions::DEPTH as u32)]);
             s.zero_where(&f(CAFTER), not_future.xor(&con(1)));
             same(s, &[OUTC], &[p(&r.counts[0])], &[con(0)]);
-            same(s, &[ISP, OSP, OPSP], &[p(&r.cnt)], &[con(OUTPUTS_HEIGHT as u32)]);
-            same(s, &[ISP, OSP, OPSP], &before(&r.pos), &[con(0), con(0)]);
-            same(s, &[ISP, OSP, OPSP], &before(&r.w), &before(&r.root));
+            same(s, &[ISP, WEND1, WEND2], &[p(&r.cnt)], &[con(OUTPUTS_HEIGHT as u32)]);
+            same(s, &[ISP, WEND1, WEND2], &before(&r.pos), &[con(0), con(0)]);
+            same(s, &[ISP], &before(&r.w), &before(&r.root));
             same(s, &[ISP], &[p(&r.input)], &[ones()]);
-            same(s, &[OSP, OPSP], &[p(&r.input)], &[con(0)]);
-            same(s, &[NEND], &[p(&r.cnt)], &[con(name::HEIGHT as u32)]);
+            same(s, &[NEND], &[p(&r.cnt)], &[con(registry::HEIGHT as u32)]);
             same(s, &[NEND], &before(&r.w), &before(&r.names));
             // The flow a row is of.
             same(s, &[ENT2, COMMIT, LEAF], std::slice::from_ref(&r.flow), &[con(PAYING)]);
+            same(s, &[OSP], std::slice::from_ref(&r.flow), &[con(MAKING)]);
+            same(s, &[OPSP], std::slice::from_ref(&r.flow), &[con(COMMITTING)]);
             same(s, &[ENT2P, ENT2R, PSIG, PLEAF, PSLEAF], std::slice::from_ref(&r.flow), &[con(POLICY)]);
             same(s, &[NLEAFR], std::slice::from_ref(&r.flow), &[con(REVEALING)]);
             same(s, &[ENT2U, OREC1], std::slice::from_ref(&r.flow), &[con(UPDATING)]);
@@ -755,43 +847,58 @@ pub fn circuit() -> Circuit {
             let to = |words: &[Expr]| Some(words.to_vec());
             let nothing = |n: usize| Some(vec![con(0); n]);
             let one = std::slice::from_ref;
-            register(s, &r.root, &[(&[ISP, OSP, OPSP], to(&before(&r.v)))]);
+            register(s, &r.root, &[(&[ISP, WEND2], to(&before(&r.v)))]);
             register(s, &r.isp, &[(&[ISP], to(&out[..]))]);
-            register(s, &r.osp, &[(&[OSP, OPSP, OPABS], to(&out[..]))]);
+            register(s, &r.osp, &[(&[OSP], to(&out[..]))]);
+            register(s, &r.sgn, &[(&[OPSGN], to(&out[..]))]);
+            register(s, &r.app, &[(&[OPSP, OPABS], to(&out[..]))]);
+            register(s, &r.phase[..1], &[(&[OPC, REC1, SLEAF], to(&[ones()]))]);
+            register(s, &r.phase[1..], &[(&[SLEAF], to(&[ones()]))]);
             register(s, &r.signed, &[]);
             register(s, &r.id, &[(&[HEAD], None)]);
-            register(s, &r.body, &[(&[HEAD, BODYIN, BODYOUT, OPBODYC, OPBODY], to(&out[..]))]);
+            register(s, &r.body, &[(&[HEAD, BODYIN, BODYOUT, OPBODY], to(&out[..]))]);
             register(s, &r.counts[..1], &[(&[HEAD], to(&m[..1])), (&[BODYIN], to(&[less_in]))]);
-            register(s, &r.counts[1..2], &[(&[HEAD], to(&m[1..2])), (&[BODYOUT, OPBODYC, OPBODY], to(&[less_out]))]);
+            register(s, &r.counts[1..2], &[(&[HEAD], to(&m[1..2])), (&[BODYOUT, OPBODY], to(&[less_out]))]);
             register(s, &r.counts[2..], &[]);
             register(s, &r.next, &[(&[OSP, OPSP], to(&[next_low, next_high]))]);
             register(s, &r.sum_in, &[(&[ISP], to(&sum_in))]);
             register(s, &r.sum_out, &[(&[OSP, OPSP], to(&sum_out))]);
-            register(s, &r.hold, &[(&[KEY, UKEY, PKEY, COMMIT, PCOMMIT, OITEM, OPC, OPX], to(&out[..]))]);
+            register(
+                s,
+                &r.hold,
+                &[(&[KEY, UKEY, PKEY, COMMIT, PCOMMIT, OITEM, OPC, OPX], to(&out[..])), (&[OPBODY], to(&m[8..]))],
+            );
             register(s, &r.amount, &[(&[COMMIT, OUTC, PCOMMIT], to(&m[8..10])), (&[CLEAF, RLEAF, SLEAF], nothing(2))]);
             let leaves = [
                 (&[ENT2, ENT2U, ENT2P, ENT2R, PLEAF, LEAF, PSLEAF, RLEAF, SLEAF][..], None),
-                (&[SN, PNODE, NEW][..], to(&shifted)),
-                (&[OLEAF, CLEAF][..], to(&before(&r.next))),
+                (&[SN, PNODE, NEW, MRG, WNODEL, WNODER][..], to(&shifted)),
+                (&[OLEAF, CLEAF, WEND1][..], to(&before(&r.next))),
+                (&[SETL][..], to(&before(&r.next0))),
             ];
             register(s, &r.pos, &leaves);
             register(s, &r.pos0, &[(&[LEAF, PSLEAF, RLEAF, SLEAF], to(&r.pos))]);
-            let begun = [ENT2, ENT2U, ENT2P, ENT2R, PLEAF, LEAF, PSLEAF, OLEAF, CLEAF, RLEAF, SLEAF, NLEAFR, NLEAFN];
-            register(s, one(&r.cnt), &[(&begun, to(&[con(0)])), (&[SN, PNODE, NEW, NNEW], to(&[more]))]);
+            let begun = [
+                ENT2, ENT2U, ENT2P, ENT2R, PLEAF, LEAF, PSLEAF, OLEAF, CLEAF, RLEAF, SLEAF, NLEAFR, NLEAFN, SETL, WEND1,
+            ];
+            let counted = [SN, PNODE, NEW, NNEW, WNODEL, WNODER];
+            register(s, one(&r.cnt), &[(&begun, to(&[con(0)])), (&counted, to(&[more]))]);
             register(
                 s,
                 &r.w,
                 &[
-                    (&[LEAF, PSLEAF, PLEAF, OLD, NOLD, RLEAF, SLEAF, UMSG, NLEAFO], to(&out[..])),
-                    (&[OLEAF, CLEAF, NLEAFR, PSTART], nothing(8)),
+                    (&[LEAF, PSLEAF, PLEAF, OLD, NOLD, RLEAF, SLEAF, UMSG, NLEAFO, WEMP], to(&out[..])),
+                    (&[OLEAF, CLEAF, NLEAFR, PSTART, SETL, WEND1], nothing(8)),
                 ],
             );
             register(
                 s,
                 &r.v,
                 &[
-                    (&[LEAF, PSLEAF, RLEAF, SLEAF, TSTART], nothing(8)),
-                    (&[NEW, NNEW, OLEAF, CLEAF, NLEAFR, NLEAFN, PSIG, PSKIP], to(&out[..])),
+                    (&[LEAF, PSLEAF, RLEAF, SLEAF, TSTART, SETL, WEND1], nothing(8)),
+                    (
+                        &[NEW, NNEW, OLEAF, CLEAF, NLEAFR, NLEAFN, PSIG, PSKIP, MRG, WNODEL, WNODER],
+                        to(&out[..]),
+                    ),
                     (&[RSTART], to(&m[..8])),
                 ],
             );
@@ -811,6 +918,8 @@ pub fn circuit() -> Circuit {
                 (&[UKEY][..], UPDATING),
                 (&[SLEAF][..], 0),
                 (&[PSTART][..], POLICY),
+                (&[OPC][..], COMMITTING),
+                (&[OUTC][..], MAKING),
             ];
             register(s, one(&r.flow), &flows.map(|(ks, flow)| (ks, to(&[con(flow)]))));
             for (i, (k, _)) in CAPS.iter().enumerate() {
@@ -853,7 +962,7 @@ pub fn circuit() -> Circuit {
                 s.zero_where(&ending, word.xor(said));
             }
             s.zero_where(&any(&[COVR, COUTS, RSTART]), some_left.xor(&con(1)));
-            s.constrain(f(OLD), p(&f(BODYOUT)), skipped.clone());
+            s.constrain(any(&[POP, PUSH]), p(&f(BODYOUT)), skipped.clone());
             s.zero_where(&skipped, r.take.clone());
             s.zero_where(&any(&[START]), r.take.clone());
             s.zero_where(last_row, r.take.clone());
@@ -870,6 +979,54 @@ pub fn circuit() -> Circuit {
             register(s, &r.rebind, &[(&[RMSG2], to(&out[..]))]);
             register(s, one(&r.rebinding), &[(&[RSTART], to(&[ones()])), (&[TSTART], to(&[con(0)]))]);
 
+            // The outputs a run makes. The tree's nodes to the left of
+            // the next position's path are held as a chain of hashes, the
+            // lowest last. A leaf is joined with the node at each level
+            // its position has a bit at, and what that leaves is held
+            // in its turn: a row or three a leaf, where a path of its own
+            // would be two rows a level.
+            let zeros8 = vec![con(0); 8];
+            same(s, &[POP], &out[..], &before(&r.stk));
+            same(s, &[WPOP], &out[..], &before(&r.stk0));
+            same(s, &[MRG, WNODEL], &m[..8], &before(&m[8..]));
+            same(s, &[MRG, WNODEL, PUSH], &m[8..], &before(&r.v));
+            same(s, &[PUSH], &m[..8], &before(&r.stk));
+            same(s, &[WNODER], &m[..8], &before(&r.v));
+            same(s, &[WNODER, WEMP], &m[8..], &before(&r.w));
+            same(s, &[WEMP], &m[..8], &before(&r.w));
+            let (odd, even) = (next_aux(), next_aux());
+            s.constrain(any(&[POP, WPOP]), con(1), odd.clone());
+            s.zero_where(&odd, p(&r.pos[0]).xor(&con(1)));
+            s.constrain(any(&[PUSH, WNODER]), con(1), even.clone());
+            s.zero_where(&even, p(&r.pos[0]));
+            register(s, &r.stk, &[(&[POP], to(&m[..8])), (&[PUSH], to(&out[..]))]);
+            // The run's outputs come into the root at its end, in two
+            // walks up the tree from the nodes held, each with nothing to
+            // the right of it: from the position the run began at and the
+            // nodes it began with, to the root as the run's spending left
+            // it, which shows them to be the tree's; and from the next
+            // position and the nodes now held, to the root with the
+            // outputs in it.
+            same(s, &[WEND1, WEND2], &before(&r.stk0), &zeros8);
+            same(s, &[WEND1], &before(&r.v), &before(&r.root));
+            same(s, &[SETL], &[p(&r.stage)], &[con(0)]);
+            same(s, &[WEND1], &[p(&r.stage)], &[con(1)]);
+            same(s, &[WEND2], &[p(&r.stage)], &[con(2)]);
+            same(s, &[OLEAF, CLEAF], one(&r.stage), &[con(0)]);
+            same(s, &[START], &r.stk0, &r.stk);
+            same(s, &[START], &r.next0, &r.next);
+            same(s, &[START], one(&r.stage), &[con(0)]);
+            register(s, &r.stk0, &[(&[WPOP], to(&m[..8])), (&[WEND1], to(&before(&r.stk)))]);
+            register(s, &r.next0, &[(&[WEND1], to(&before(&r.next)))]);
+            let stages = [(&[SETL][..], con(1)), (&[WEND1][..], con(2)), (&[WEND2][..], ones())];
+            register(s, one(&r.stage), &stages.map(|(ks, stage)| (ks, to(&[stage]))));
+            // A run that made outputs does not end before they are in.
+            let open = next_aux();
+            s.constrain(last_row.clone(), r.stage.xor(&ones()), open.clone());
+            for (now, then) in r.next.iter().zip(&r.next0) {
+                s.zero_where(&open, now.xor(then));
+            }
+
             // The public values: the registers of the first row, then of
             // the last.
             let mut public = public.chunks(4);
@@ -880,9 +1037,9 @@ pub fn circuit() -> Circuit {
                 }
             };
             for (at, is_first) in [(first, true), (last_row, false)] {
-                let chained: [&[Expr]; 11] = [
+                let chained: [&[Expr]; 14] = [
                     &r.root, &r.isp, &r.osp, &r.id, &r.body, &r.counts, &r.next, &r.sum_in, &r.sum_out, &r.names,
-                    &r.caps,
+                    &r.caps, &r.sgn, &r.app, &r.phase,
                 ];
                 for words in chained {
                     bind(s, words, at);
@@ -934,7 +1091,19 @@ struct State {
     state: u32,
     rebind: [u32; 8],
     rebinding: u32,
+    sgn: [u32; 8],
+    app: [u32; 8],
+    phase: [u32; 2],
+    stk: [u32; 8],
+    stk0: [u32; 8],
+    next0: [u32; 2],
+    stage: u32,
 }
+
+/// Where the chains of nodes held are among a row's words, and the
+/// word that says whether a run's outputs are still to come in.
+const STK_AT: usize = FRONT + 1 + KINDS + STATE - 19;
+const OPEN_AT: usize = FRONT + 1 + KINDS + STATE + 1 + AUX - 1;
 
 impl State {
     fn words(&self) -> Vec<u32> {
@@ -962,6 +1131,10 @@ impl State {
         out.extend([self.take, self.state]);
         out.extend(self.rebind);
         out.push(self.rebinding);
+        for part in [&self.sgn[..], &self.app, &self.phase, &self.stk, &self.stk0, &self.next0] {
+            out.extend(part);
+        }
+        out.push(self.stage);
         assert_eq!(out.len(), STATE);
         out
     }
@@ -974,7 +1147,7 @@ impl State {
                 out.extend((0..4).map(|i| part.get(i).copied().unwrap_or(0)));
             }
         };
-        let chained: [&[u32]; 11] = [
+        let chained: [&[u32]; 14] = [
             &self.root,
             &self.isp,
             &self.osp,
@@ -986,6 +1159,9 @@ impl State {
             &self.sum_out,
             &self.names,
             &self.caps,
+            &self.sgn,
+            &self.app,
+            &self.phase,
         ];
         for words in chained {
             push(words);
@@ -1010,8 +1186,8 @@ fn carries(x: u32, y: u32, carry_in: u32) -> (u32, u32) {
 /// its block.
 fn auxiliary(old: &State, to: &State, kind: usize, before: usize, dir: u32, made: u32) -> Vec<u32> {
     let mut aux = Vec::with_capacity(AUX);
-    let bits = 1u64 << kind;
-    aux.extend([carries(bits as u32, !0, 0).0, carries((bits >> 32) as u32, !0, 0).0]);
+    let bits = 1u128 << kind;
+    aux.extend((0..KIND_WORDS).map(|w| carries((bits >> (32 * w)) as u32, !0, 0).0));
     aux.push(carries(old.counts[0], !0, 0).0);
     aux.push(carries(old.counts[1], !0, 0).0);
     aux.push(carries(old.cnt, 1, 0).0);
@@ -1057,10 +1233,14 @@ fn auxiliary(old: &State, to: &State, kind: usize, before: usize, dir: u32, made
     let (c, _) = carries(fewer, !0, 0);
     let last = if c >> 31 == 0 { !0u32 } else { 0 };
     aux.extend([c, c >> 31, last, if kind == COVR { last } else { 0 }]);
-    aux.push(if kind == OLD && before == BODYOUT { !0 } else { 0 });
+    aux.push(if (kind == POP || kind == PUSH) && before == BODYOUT { !0 } else { 0 });
     let (c, _) = carries(to.state, !made, 0);
     aux.extend([c, c >> 31]);
-    assert!(aux.len() <= AUX);
+    aux.extend([(kind == POP || kind == WPOP) as u32, (kind == PUSH || kind == WNODER) as u32]);
+    // Whether the run's outputs are still to come in: the last row's to
+    // say ([`Run::finish`]).
+    aux.push(0);
+    assert_eq!(aux.len(), AUX);
     aux
 }
 
@@ -1081,6 +1261,10 @@ pub struct Run {
     dir: u32,
     out: [u32; 8],
     start: State,
+    /// The nodes held, the lowest last, each with the chain below it;
+    /// and the same as the run began with them.
+    stack: Vec<([u32; 8], [u32; 8])>,
+    stack0: Vec<([u32; 8], [u32; 8])>,
 }
 
 /// Where a signature's entry is in the signed set: its place and its
@@ -1105,13 +1289,18 @@ impl Run {
             sum_out: std::array::from_fn(|w| (record.sum_out >> (32 * w)) as u32),
             names: words(&record.names[0]),
             caps: [1; 4],
+            sgn: words(&record.ops[0]),
+            app: words(&record.done[0]),
             ..State::default()
         };
         Run::from(state)
     }
 
     fn from(state: State) -> Run {
-        let mut run = Run { rows: Vec::new(), state, kind: START, dir: 0, out: [0; 8], start: state };
+        // The nodes held are a run's own: none until it is told them.
+        let state = State { stk: [0; 8], stk0: [0; 8], next0: state.next, stage: 0, ..state };
+        let (stack, stack0) = (Vec::new(), Vec::new());
+        let mut run = Run { rows: Vec::new(), state, kind: START, dir: 0, out: [0; 8], start: state, stack, stack0 };
         run.push(START, [0; 16], state);
         run
     }
@@ -1120,7 +1309,101 @@ impl Run {
     /// in a first row of its own.
     pub fn after(before: &Run) -> Run {
         assert!(ENDS.contains(&before.kind), "a run ends between items");
+        assert!(before.settled(), "a run's outputs are in the root before it ends");
         Run::from(before.state)
+    }
+
+    /// Whether the run's outputs, if it made any, are in the root.
+    fn settled(&self) -> bool {
+        self.state.stage == !0 || (self.state.stage == 0 && self.state.next == self.state.next0)
+    }
+
+    /// The chain of nodes held with `item` on it.
+    fn held(below: &[u32; 8], item: &[u32; 8]) -> [u32; 8] {
+        blake3::compress(&[DOM_STACK, 0, 0, 0, 0, 0, 0, 0], &Self::pair(below, item), 0, 64, FULL)
+    }
+
+    /// Tells the run the nodes of the outputs' tree to the left of the
+    /// next position's path, the lowest first, as they are once
+    /// everything the run spends is gone
+    /// ([`crate::ledger::Outputs::frontier`]): before it makes an
+    /// output, where the next position is not the tree's first.
+    pub fn frontier(&mut self, nodes: &[Digest]) {
+        assert!(self.stack.is_empty() && self.state.stage == 0 && self.state.next == self.state.next0);
+        let next = self.state.next[0] as u64 | (self.state.next[1] as u64) << 32;
+        assert_eq!(nodes.len(), next.count_ones() as usize, "a node for each bit of the next position");
+        let mut chain = [0u32; 8];
+        for node in nodes.iter().rev() {
+            let node = words(node);
+            self.stack.push((node, chain));
+            chain = Self::held(&chain, &node);
+        }
+        self.stack0 = self.stack.clone();
+        // The chain is a register no row has set yet: every row's.
+        for row in &mut self.rows {
+            row[STK_AT..STK_AT + 8].copy_from_slice(&chain);
+            row[STK_AT + 8..STK_AT + 16].copy_from_slice(&chain);
+        }
+        (self.state.stk, self.state.stk0) = (chain, chain);
+        (self.start.stk, self.start.stk0) = (chain, chain);
+    }
+
+    fn halved(pos: [u32; 2]) -> [u32; 2] {
+        split((pos[0] as u64 | (pos[1] as u64) << 32) >> 1)
+    }
+
+    /// The leaf in hand joins the nodes held: with each that its
+    /// position has a bit at, and what that leaves is held.
+    fn append(&mut self) {
+        while self.state.pos[0] & 1 == 1 {
+            let (node, below) = self.stack.pop().expect("the tree's nodes to the left: Run::frontier");
+            self.step(POP, Self::pair(&below, &node), |s, _| s.stk = below);
+            let block = Self::pair(&node, &self.state.v);
+            self.step(MRG, block, |s, out| (s.v, s.pos) = (out, Self::halved(s.pos)));
+        }
+        let (below, node) = (self.state.stk, self.state.v);
+        self.step(PUSH, Self::pair(&below, &node), |s, out| s.stk = out);
+        self.stack.push((node, below));
+    }
+
+    /// A walk up the tree from an empty leaf at the position in hand,
+    /// with `held` to its left and nothing to its right.
+    fn walk(&mut self, mut held: Vec<([u32; 8], [u32; 8])>) {
+        for _ in 0..OUTPUTS_HEIGHT {
+            let up = |s: &mut State, out: [u32; 8]| (s.v, s.pos, s.cnt) = (out, Self::halved(s.pos), s.cnt + 1);
+            if self.state.pos[0] & 1 == 1 {
+                let (node, below) = held.pop().expect("a node for each bit of the position");
+                self.step(WPOP, Self::pair(&below, &node), |s, _| s.stk0 = below);
+                let block = Self::pair(&node, &self.state.v);
+                self.step(WNODEL, block, up);
+            } else {
+                let block = Self::pair(&self.state.v, &self.state.w);
+                self.step(WNODER, block, up);
+            }
+            let block = Self::pair(&self.state.w, &self.state.w);
+            self.step(WEMP, block, |s, out| s.w = out);
+        }
+        assert!(held.is_empty());
+    }
+
+    /// The run's outputs come into the root: nothing more is made in
+    /// this run. Does nothing if it made none.
+    pub fn settle(&mut self) {
+        if self.state.stage != 0 || self.state.next == self.state.next0 {
+            return;
+        }
+        assert!(BETWEEN.contains(&self.kind), "outputs come into the root between items");
+        self.step(SETL, [0; 16], |s, _| (s.v, s.w, s.pos, s.cnt, s.stage) = ([0; 8], [0; 8], s.next0, 0, 1));
+        // (Where the nodes told are not the tree's, less what the run
+        // spends, this walk does not reach the root, and the rows are
+        // not proven.)
+        self.walk(self.stack0.clone());
+        self.step(WEND1, [0; 16], |s, _| {
+            (s.stk0, s.next0, s.pos) = (s.stk, s.next, s.next);
+            (s.v, s.w, s.cnt, s.stage) = ([0; 8], [0; 8], 0, 2);
+        });
+        self.walk(self.stack.clone());
+        self.step(WEND2, [0; 16], |s, _| (s.root, s.stage) = (s.v, !0));
     }
 
     /// The compression a row of `kind` does of `block`.
@@ -1146,10 +1429,10 @@ impl Run {
         r[8..24].copy_from_slice(&block);
         (r[24], r[25]) = (spec.len, spec.flags);
         r[26 + kind / 32] = 1 << (kind % 32);
-        r[28 + kind] = !0;
-        r[28 + KINDS] = spec.domain.unwrap_or(0);
+        r[FRONT + kind] = !0;
+        r[FRONT + KINDS] = spec.domain.unwrap_or(0);
         let state = to.words();
-        let at = 29 + KINDS;
+        let at = FRONT + 1 + KINDS;
         r[at..at + STATE].copy_from_slice(&state);
         r[at + STATE] = dir;
         let aux = auxiliary(&old, &to, kind, self.kind, dir, block[15]);
@@ -1269,8 +1552,8 @@ impl Run {
     /// the policy's root, and the output's removal by `path`. `signed`
     /// are the places in the signed set of the signers' entries, in the
     /// order the signers come.
-    pub fn policy_input(&mut self, input: &crate::policy::PolicyInput, path: &[Digest], signed: &[Signed]) {
-        use crate::policy::{Cond, Shown};
+    pub fn policy_input(&mut self, input: &crate::conditions::PolicyInput, path: &[Digest], signed: &[Signed]) {
+        use crate::conditions::{Cond, Shown};
         let mut signed = signed.iter();
         self.step(PSTART, [0; 16], |s, _| {
             (s.flow, s.w, s.made, s.state) = (POLICY, [0; 8], input.created, input.state)
@@ -1374,15 +1657,19 @@ impl Run {
         });
     }
 
-    /// The outputs' walk of a leaf that comes into the state at the next
-    /// position, and its end: a row of `kind`.
-    fn insertion(&mut self, path: &[Digest], kind: usize, amount: u64) {
-        for sibling in path {
-            self.level(sibling);
-        }
-        let block = Self::pair(&self.state.osp, &self.state.hold);
+    /// The leaf in hand joins the nodes held, at the next position; and
+    /// the row of `kind` that takes what was made into its running
+    /// hash.
+    fn made(&mut self, kind: usize, amount: u64) {
+        self.append();
+        let so_far = if kind == OSP { self.state.osp } else { self.state.app };
+        let block = Self::pair(&so_far, &self.state.hold);
         self.step(kind, block, |s, out| {
-            (s.osp, s.root) = (out, s.v);
+            if kind == OSP {
+                s.osp = out;
+            } else {
+                s.app = out;
+            }
             s.next = split((s.next[0] as u64 | (s.next[1] as u64) << 32) + 1);
             let sum = (0..4).fold(0u128, |x, i| x | (s.sum_out[i] as u128) << (32 * i)) + amount as u128;
             s.sum_out = std::array::from_fn(|i| (sum >> (32 * i)) as u32);
@@ -1399,7 +1686,9 @@ impl Run {
         block
     }
 
-    /// An input: the output it spends leaves the state by `path`, and
+    /// An input: the output it spends leaves the state by `path` (the
+    /// tree's as the run has it: without the outputs it has made, which
+    /// are in the root only at its end), and
     /// the entry of the key's signature with `leaf` is in the signed set
     /// at `signed`.
     pub fn input(&mut self, input: &Input, path: &[Digest], leaf: u64, signed: &Signed) {
@@ -1417,14 +1706,14 @@ impl Run {
         self.removal(path, input.amount);
     }
 
-    /// An output of the key of `key_hash`, made at the next position,
-    /// whose path from nothing is `path`.
-    pub fn output(&mut self, output: &Output, key_hash: &Digest, path: &[Digest]) {
+    /// An output of the key of `key_hash`, made at the next position.
+    pub fn output(&mut self, output: &Output, key_hash: &Digest) {
+        assert!(self.state.stage == 0, "the run's outputs are in the root: no more are made in it");
         let amount = split(output.amount);
         let mut block = [0u32; 16];
         block[..8].copy_from_slice(&words(key_hash));
         block[8..10].copy_from_slice(&amount);
-        self.step(OUTC, block, |s, _| s.amount = amount);
+        self.step(OUTC, block, |s, _| (s.amount, s.flow) = (amount, MAKING));
         let mut block = Self::leaf_block(&self.out, &output.memo, output.amount, self.state.counts[2]);
         self.step(OLEAF, block, |s, out| (s.w, s.v, s.cnt, s.pos, s.input) = ([0; 8], out, 0, s.next, 0));
         block[15] = 0;
@@ -1436,54 +1725,59 @@ impl Run {
             let block = Self::pair(&self.state.covered, &self.state.hold);
             self.step(COVR, block, |s, out| (s.covered, s.take) = (out, s.take - 1));
         }
-        self.insertion(path, OSP, output.amount);
+        self.made(OSP, output.amount);
     }
 
-    /// The body takes the operation whose hash is in hand.
-    fn op_body(&mut self, kind: usize) {
-        let block = Self::pair(&self.state.body, &self.state.hold);
-        self.step(kind, block, |s, out| (s.body, s.counts[1]) = (out, s.counts[1].wrapping_sub(1)));
+    /// An operation on a name that the transaction in hand carries, by
+    /// its hash: into the transaction's id and into the block's hash of
+    /// what its transactions carry. It is done after them
+    /// ([`Run::commit`], [`Run::reveal`], [`Run::update`]).
+    pub fn carried(&mut self, op: &Digest) {
+        let op = words(op);
+        let block = Self::pair(&self.state.body, &op);
+        self.step(OPBODY, block, |s, out| (s.body, s.counts[1], s.hold) = (out, s.counts[1].wrapping_sub(1), op));
+        let block = Self::pair(&self.state.sgn, &self.state.hold);
+        self.step(OPSGN, block, |s, out| s.sgn = out);
     }
 
-    /// A commitment to a name: an output of no amount at the next
-    /// position, whose path from nothing is `path`.
-    pub fn commit(&mut self, commit: &Digest, memo: &Memo, path: &[Digest]) {
+    /// A commitment to a name, done: an output of no amount at the next
+    /// position.
+    pub fn commit(&mut self, commit: &Digest, memo: &Memo) {
+        assert!(self.state.stage == 0, "the run's outputs are in the root: no more are made in it");
         let mut block = [0u32; 16];
         block[0] = 1;
         block[1..9].copy_from_slice(&words(commit));
         block[9..14].copy_from_slice(&blake3::words::<5>(memo));
         self.step(OPC, block, |s, out| {
-            s.hold = out;
+            (s.hold, s.flow, s.phase[0]) = (out, COMMITTING, !0);
             s.caps[0] <<= 1;
         });
         let block = Self::leaf_block(&words(commit), memo, 0, self.state.counts[2]);
         self.step(CLEAF, block, |s, out| {
             (s.w, s.v, s.cnt, s.pos, s.input, s.amount) = ([0; 8], out, 0, s.next, 0, [0; 2])
         });
-        self.op_body(OPBODYC);
-        self.insertion(path, OPSP, 0);
+        self.made(OPSP, 0);
     }
 
     /// The rows that hash `record`: its name's hash, its owner and its
     /// hash are then in hand.
-    fn record(&mut self, record: &name::Record) {
-        let block = Self::pair(&words(&name::name_hash(&record.name)), &words(&record.owner));
+    fn record(&mut self, record: &registry::Record) {
+        let block = Self::pair(&words(&registry::name_hash(&record.name)), &words(&record.owner));
         self.step(REC1, block, |s, _| {
-            (s.name, s.owner) = (block[..8].try_into().unwrap(), block[8..].try_into().unwrap())
+            (s.name, s.owner, s.phase[0]) = (block[..8].try_into().unwrap(), block[8..].try_into().unwrap(), !0)
         });
         let block = Self::pair(&words(&record.value), &words(&record.memo));
         self.step(REC2, block, |s, out| s.record = out);
     }
 
-    /// The operation's hash, into the body and into the block's list.
+    /// The operation's hash, into the block's hash of those done.
     fn op_done(&mut self) {
         let mut block = [0u32; 16];
         block[0] = self.state.flow;
         block[1..9].copy_from_slice(&self.state.record);
         self.step(OPX, block, |s, out| s.hold = out);
-        self.op_body(OPBODY);
-        let block = Self::pair(&self.state.osp, &self.state.hold);
-        self.step(OPABS, block, |s, out| s.osp = out);
+        let block = Self::pair(&self.state.app, &self.state.hold);
+        self.step(OPABS, block, |s, out| s.app = out);
     }
 
     /// A reveal: the commitment of `record` with `salt`, made at height
@@ -1493,7 +1787,7 @@ impl Run {
     #[allow(clippy::too_many_arguments)]
     pub fn reveal(
         &mut self,
-        record: &name::Record,
+        record: &registry::Record,
         salt: &Digest,
         memo: &Memo,
         made: u32,
@@ -1529,8 +1823,8 @@ impl Run {
     /// the path of the name's place.
     pub fn update(
         &mut self,
-        record: &name::Record,
-        old: &name::Record,
+        record: &registry::Record,
+        old: &registry::Record,
         key: &PublicKey,
         leaf: u64,
         signed: &Signed,
@@ -1560,7 +1854,7 @@ impl Run {
         let pos = split(position);
         self.step(SLEAF, block, |s, out| {
             (s.w, s.v, s.cnt, s.pos, s.pos0, s.input, s.amount, s.flow) = (out, [0; 8], 0, pos, pos, !0, [0; 2], 0);
-            s.caps[3] <<= 1;
+            (s.caps[3], s.phase) = (s.caps[3] << 1, [!0; 2]);
         });
         self.removal(path, 0);
     }
@@ -1577,6 +1871,7 @@ impl Run {
     /// The rows filled to a power of two (and to `at_least`), the
     /// program, and the public values.
     pub fn finish(mut self, at_least: usize) -> (Vec<[u32; INPUTS]>, Vec<u32>, Vec<u32>) {
+        self.settle();
         assert!(ENDS.contains(&self.kind), "a run ends between items");
         let n = self.rows.len().max(at_least).next_power_of_two();
         while self.rows.len() < n {
@@ -1585,14 +1880,47 @@ impl Run {
         // The first row's row before is the last: its carries are of
         // the last row's registers.
         let aux = auxiliary(&self.state, &self.start, START, self.kind, 0, 0);
-        let from = 29 + KINDS + STATE + 1;
+        let from = FRONT + 1 + KINDS + STATE + 1;
         self.rows[0][from..from + aux.len()].copy_from_slice(&aux);
+        self.rows[n - 1][OPEN_AT] = !self.state.stage;
         let mut program = vec![0u32; n * PROGRAM];
         program[0] = !0;
         program[(n - 1) * PROGRAM + 1] = !0;
         let public = [self.start.public(false), self.state.public(true)].concat();
         (self.rows, program, public)
     }
+}
+
+/// The most rows a transaction takes in a run, whatever the state: for
+/// whoever must say beforehand whether one fits.
+pub fn rows_bound(tx: &Transaction) -> usize {
+    use crate::conditions::{Cond, Shown};
+    // A key's entry in the signed set: its row, the entry's two, the path.
+    let entry = 3 + signed::DEPTH;
+    // A leaf's removal: its path, old and new, and the row that ends it.
+    let removal = 2 * OUTPUTS_HEIGHT + 1;
+    let signers = |shown: &Shown| match shown {
+        Shown::Signers(signers) => signers.iter().map(|s| if s.is_some() { entry + 1 } else { 1 }).sum::<usize>(),
+        _ => 0,
+    };
+    let policy = |input: &crate::conditions::PolicyInput| {
+        let conds = (input.conds.iter().zip(&input.shown))
+            .map(|(cond, shown)| match cond {
+                Cond::Thresh { .. } => 2 + signers(shown),
+                Cond::Rebind { .. } => 3 + signers(shown),
+                Cond::Hash(_) => 2,
+                _ => 1,
+            })
+            .sum::<usize>();
+        // The leaf's chain, its path, the commitment, the body, the leaf.
+        1 + conds + input.conds.len() + crate::conditions::DEPTH + 3 + removal
+    };
+    // An output joins a node at each level, at the most.
+    let output = 7 + 2 * OUTPUTS_HEIGHT;
+    1 + tx.inputs.len() * (entry + 3 + removal)
+        + tx.policy.iter().map(policy).sum::<usize>()
+        + tx.outputs.len() * output
+        + 2 * tx.ops.len()
 }
 
 /// A transaction in hand: its id, its body's hash so far, and the
@@ -1603,8 +1931,17 @@ pub type Carry = (Digest, Digest, u32, u32);
 /// `after` (the sums are the block's so far), of the signed set of root
 /// `signed`, with the transaction in hand at its start and at its end:
 /// what a verifier checks a proof of the run against. `caps` are the
-/// counts of names' operations before and after, each a bit ([`counted`]).
-pub fn public(before: &Record, after: &Record, signed: &Digest, carry: [Carry; 2], caps: [[u32; 4]; 2]) -> Vec<u32> {
+/// counts of names' operations before and after, each a bit ([`counted`]);
+/// `phase`, whether operations were being done, and commitments swept
+/// (all ones if so).
+pub fn public(
+    before: &Record,
+    after: &Record,
+    signed: &Digest,
+    carry: [Carry; 2],
+    caps: [[u32; 4]; 2],
+    phase: [[u32; 2]; 2],
+) -> Vec<u32> {
     let side = |record: &Record, i: usize, carry: &Carry| State {
         root: words(&record.root[i]),
         isp: words(&record.inputs[i]),
@@ -1618,6 +1955,9 @@ pub fn public(before: &Record, after: &Record, signed: &Digest, carry: [Carry; 2
         sum_out: std::array::from_fn(|w| (record.sum_out >> (32 * w)) as u32),
         names: words(&record.names[i]),
         caps: caps[i],
+        sgn: words(&record.ops[i]),
+        app: words(&record.done[i]),
+        phase: phase[i],
         ..State::default()
     };
     [side(before, 0, &carry[0]).public(false), side(after, 1, &carry[1]).public(true)].concat()
@@ -1791,25 +2131,39 @@ mod tests {
         Scene { state, txs, set: Set(entries), height: 2 }
     }
 
+    /// The positions transactions spend.
+    fn spent(txs: &[Transaction]) -> Vec<u64> {
+        let of = |tx: &Transaction| {
+            let policy = tx.policy.iter().map(|i| i.position);
+            tx.inputs.iter().map(|i| i.position).chain(policy).collect::<Vec<u64>>()
+        };
+        txs.iter().flat_map(of).collect()
+    }
+
     /// The run of the scene's transactions, with what it should be of.
     fn run_of(scene: &Scene, change: impl Fn(&mut Run, usize)) -> (Run, Record) {
         let mut state = scene.state.clone();
         let mut record = Record::start(&state, EMPTY, EMPTY, scene.height);
         let mut run = Run::new(&record, closed(), &scene.set.root());
+        run.frontier(&state.frontier_without(spent(&scene.txs)));
+        // The tree as the run has it: without the outputs it makes.
+        let mut tree = state.clone();
         let mut entry = 3;
         for (t, tx) in scene.txs.iter().enumerate() {
             run.head(tx);
             for input in &tx.inputs {
-                run.input(input, &state.path(input.position), 1, &scene.set.at(entry));
+                run.input(input, &tree.path(input.position), 1, &scene.set.at(entry));
+                tree.set(input.position, EMPTY);
                 state.set(input.position, EMPTY);
                 entry += 1;
             }
             for output in &tx.outputs {
-                run.output(output, &key_hash(&key(9)), &state.path(state.next));
+                run.output(output, &key_hash(&key(9)));
                 state.insert(output, scene.height);
             }
             change(&mut run, t);
         }
+        run.settle();
         // The record by the ledger's rules, where they take the
         // transactions at all.
         let mut applied = scene.state.clone();
@@ -1850,18 +2204,21 @@ mod tests {
     fn a_run_of_payments_is_proven_to_be_its_record() {
         let scene = a_scene();
         let (run, record) = run_of(&scene, |_, _| {});
-        assert_eq!(run.len(), 1 + 2 + 3 * 110 + 3 * 87);
+        // Three inputs; three outputs, the second joined with the first;
+        // and the two walks that bring them into the root, from positions
+        // of one bit and of three.
+        assert_eq!(run.len(), 1 + 2 + 3 * 110 + (6 + 8 + 6) + (1 + 83 + 1 + 85 + 1));
         // What the run says it is of is what the ledger's rules make of
         // the transactions.
         let last = whole(&scene.txs[1]);
         let start = Record::start(&scene.state, EMPTY, EMPTY, scene.height);
-        let expect = public(&start, &record, &scene.set.root(), [closed(), last], [counted([0; 4]); 2]);
+        let expect = public(&start, &record, &scene.set.root(), [closed(), last], [counted([0; 4]); 2], [[0; 2]; 2]);
         let (_, _, own) = run_of(&scene, |_, _| {}).0.finish(128);
         assert_eq!(own, expect);
         assert!(proves(run, Some(&expect)));
         // And of nothing else: another root after, another sum, another
         // signed set.
-        for word in [80 + 3, 80 + 48, 68 + 3, 76] {
+        for word in [100 + 3, 100 + 48, 88 + 3, 96] {
             let mut other = expect.clone();
             other[word] ^= 1;
             assert!(!proves(run_of(&scene, |_, _| {}).0, Some(&other)), "word {word}");
@@ -1876,13 +2233,41 @@ mod tests {
         // time: an amount where it is committed to, a sibling on the way
         // to the signed set and on the way to the state, a counter, the
         // id an entry is looked up under.
-        let places: [(usize, usize); 6] =
-            [(3 + 24, 8 + 8), (3 + 5, 8 + 9), (3 + 40, 8 + 12), (3 + 60, 29 + KINDS + 77), (5, 8), (3 + 27, 8 + 14)];
+        // And where the second output joins the first: the chain of
+        // nodes held, and the node joined.
+        let places: [(usize, usize); 8] = [
+            (3 + 24, 8 + 8),
+            (3 + 5, 8 + 9),
+            (3 + 40, 8 + 12),
+            (3 + 60, FRONT + 1 + KINDS + 77),
+            (5, 8),
+            (3 + 27, 8 + 14),
+            (232, 8 + 3),
+            (233, 8 + 12),
+        ];
         for (row, word) in places {
             let (mut run, _) = run_of(&scene, |_, _| {});
             run.rows[row][word] ^= 1;
             assert!(!proves(run, None), "row {row} word {word}");
         }
+        // Nodes told that are not the tree's.
+        let mut state = scene.state.clone();
+        let record = Record::start(&state, EMPTY, EMPTY, scene.height);
+        let mut run = Run::new(&record, closed(), &scene.set.root());
+        let mut nodes = state.frontier_without(spent(&scene.txs));
+        nodes[0][0] ^= 1;
+        run.frontier(&nodes);
+        let mut entry = 3;
+        for tx in &scene.txs {
+            run.head(tx);
+            for input in &tx.inputs {
+                run.input(input, &state.path(input.position), 1, &scene.set.at(entry));
+                state.set(input.position, EMPTY);
+                entry += 1;
+            }
+            tx.outputs.iter().for_each(|output| run.output(output, &key_hash(&key(9))));
+        }
+        assert!(!proves(run, None));
         // An input whose entry is not in the set; an output that is not
         // in the state where it says; a key that is not the output's.
         let mut other = a_scene();
@@ -1904,14 +2289,14 @@ mod tests {
     /// registered one, and a sweep of a commitment long unrevealed.
     struct Named {
         outputs: Outputs,
-        names: crate::name::Names,
+        names: crate::registry::Names,
         tx: Transaction,
         payer: Input,
         /// The revealed name's commitment: its salt, memo, height and
         /// position.
         revealed: (Digest, Memo, u32, u64),
         /// The updated name's record before, and its owner's key.
-        old: (crate::name::Record, PublicKey),
+        old: (crate::registry::Record, PublicKey),
         /// The swept commitment, its memo, height and position.
         stale: (Digest, Memo, u32, u64),
         set: Set,
@@ -1926,7 +2311,7 @@ mod tests {
     /// [`named`], with the revealed commitment and the swept one made at
     /// these heights.
     fn named_made(revealed_at: u32, stale_at: u32) -> Named {
-        use crate::name::{Names, Op, Record as Name, commit, commit_output, name_hash, update_message};
+        use crate::registry::{Names, Op, Record as Name, commit, commit_output, name_hash, update_message};
         let (mut outputs, mut names) = (Outputs::default(), Names::default());
         let payer_out = Output::to(&key_hash(&key(0)), 100, [1; MEMO]);
         let payer =
@@ -1960,24 +2345,34 @@ mod tests {
         Named { outputs, names, tx, payer, revealed, old: (bob, key(2)), stale, set: Set(entries) }
     }
 
-    /// The run of a named block, as the prover would make it; `change`
-    /// may alter what it is made from.
+    /// The run of a named block, as the prover would make it: the
+    /// payment, which carries the operations, then the operations, then
+    /// the sweep.
     fn named_run(n: &Named, sweep: bool) -> (Run, Record, Record) {
-        use crate::name::{Op, key as place, name_hash};
+        use crate::registry::{Op, key as place, name_hash};
         let (mut outputs, mut names) = (n.outputs.clone(), n.names.clone());
         let start = Record::start(&outputs, EMPTY, EMPTY, HEIGHT).on(&names);
         let mut run = Run::new(&start, closed(), &n.set.root());
+        // What the run spends: the payment's input, the revealed
+        // commitment and the swept one.
+        let reveals = n.tx.ops.iter().filter_map(|op| match op {
+            Op::Reveal { position, .. } => Some(*position),
+            _ => None,
+        });
+        let gone: Vec<u64> = [n.payer.position].into_iter().chain(reveals).chain(sweep.then_some(n.stale.3)).collect();
+        run.frontier(&outputs.frontier_without(gone));
         run.head(&n.tx);
         run.input(&n.payer, &outputs.path(n.payer.position), 1, &n.set.at(1));
         outputs.set(n.payer.position, EMPTY);
-        run.output(&n.tx.outputs[0], &key_hash(&key(0)), &outputs.path(outputs.next));
-        outputs.insert(&n.tx.outputs[0], HEIGHT);
+        // What the run makes is in the root at its end: its paths are
+        // the tree's without.
+        run.output(&n.tx.outputs[0], &key_hash(&key(0)));
+        for op in &n.tx.ops {
+            run.carried(&op.digest());
+        }
         for op in &n.tx.ops {
             match op {
-                Op::Commit { commit, memo } => {
-                    run.commit(commit, memo, &outputs.path(outputs.next));
-                    outputs.insert(&crate::name::commit_output(commit, *memo), HEIGHT);
-                }
+                Op::Commit { commit, memo } => run.commit(commit, memo),
                 Op::Reveal { record, salt, position } => {
                     let (_, memo, made, _) = n.revealed;
                     let at = place(&name_hash(&record.name));
@@ -1996,10 +2391,13 @@ mod tests {
             let (commit, memo, made, position) = n.stale;
             run.sweep(&commit, &memo, made, position, &outputs.path(position));
         }
+        run.settle();
         // The record by the ledger's rules, where they take the block.
         let mut record = start;
         let (mut outputs, mut names) = (n.outputs.clone(), n.names.clone());
-        if record.apply_with(&mut outputs, &mut names, &n.tx).is_ok() && sweep {
+        let done = record.apply(&mut outputs, &n.tx).is_ok()
+            && n.tx.ops.iter().all(|op| record.op(&mut outputs, &mut names, op).is_ok());
+        if done && sweep {
             let _ = record.sweep(&mut outputs, n.stale.3);
         }
         (run, start, record)
@@ -2010,24 +2408,84 @@ mod tests {
     fn names_are_committed_revealed_updated_and_swept() {
         let n = named();
         let (run, start, record) = named_run(&n, true);
-        // A commit, a reveal of 128 levels, an update, a sweep: by rows.
-        assert_eq!(run.len(), 2 + 110 + 87 + 86 + (5 + 82 + 1 + 1 + 257 + 3) + (3 + 24 + 4 + 257 + 3) + 84);
+        println!("{} rows", run.len());
         let counts = [counted([0; 4]), counted([1; 4])];
-        let expect = public(&start, &record, &n.set.root(), [closed(), whole(&n.tx)], counts);
+        let expect = public(&start, &record, &n.set.root(), [closed(), whole(&n.tx)], counts, [[0; 2], [!0; 2]]);
+        // The operations done are those the payment carried.
+        assert_eq!(record.ops[1], record.done[1]);
+        assert_ne!(record.ops[1], EMPTY);
         assert_ne!(record.names[0], record.names[1]);
         assert!(proves(run, Some(&expect)));
-        // Not of another registry after, nor of other counts.
-        for word in [80 + 4 * 14, 80 + 4 * 16 + 1] {
+        // Not of another registry after, nor of other counts, nor of
+        // other operations done.
+        for word in [100 + 4 * 14, 100 + 4 * 16 + 1, 100 + 4 * 19] {
             let mut other = expect.clone();
             other[word] ^= 1;
             assert!(!proves(named_run(&n, true).0, Some(&other)), "word {word}");
         }
     }
 
+    /// Operations on names are done after every transaction, and sweeps
+    /// after them: nothing else is rows that are proven.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn operations_are_done_after_the_transactions() {
+        use crate::registry::Op;
+        let n = named();
+        let Op::Commit { commit, memo } = &n.tx.ops[0] else { unreachable!() };
+        // The payment, its operations carried; `then` goes on from there.
+        let made = |early: bool, swept: bool, then: &dyn Fn(&mut Run, &Outputs)| {
+            let mut outputs = n.outputs.clone();
+            let start = Record::start(&outputs, EMPTY, EMPTY, HEIGHT).on(&n.names);
+            let mut run = Run::new(&start, closed(), &n.set.root());
+            let gone = [n.payer.position].into_iter().chain(swept.then_some(n.stale.3));
+            run.frontier(&outputs.frontier_without(gone));
+            run.head(&n.tx);
+            run.input(&n.payer, &outputs.path(n.payer.position), 1, &n.set.at(1));
+            outputs.set(n.payer.position, EMPTY);
+            if early {
+                // The commitment done while the payment's output is
+                // still to come.
+                run.commit(commit, memo);
+            }
+            run.output(&n.tx.outputs[0], &key_hash(&key(0)));
+            n.tx.ops.iter().for_each(|op| run.carried(&op.digest()));
+            then(&mut run, &outputs);
+            proves(run, None)
+        };
+        let sweep = |run: &mut Run, outputs: &Outputs| {
+            let (stale, memo, made, position) = n.stale;
+            run.sweep(&stale, &memo, made, position, &outputs.path(position));
+        };
+        assert!(made(false, false, &|run, _| run.commit(commit, memo)));
+        assert!(made(false, true, &|run, outputs| {
+            run.commit(commit, memo);
+            sweep(run, outputs);
+        }));
+        // In the middle of a transaction.
+        assert!(!made(true, false, &|_, _| {}));
+        // A transaction after an operation is done; after a sweep.
+        let empty = Transaction::default();
+        assert!(made(false, false, &|run, _| run.head(&empty)));
+        assert!(!made(false, false, &|run, _| {
+            run.commit(commit, memo);
+            run.head(&empty);
+        }));
+        assert!(!made(false, true, &|run, outputs| {
+            sweep(run, outputs);
+            run.head(&empty);
+        }));
+        // An operation after a sweep.
+        assert!(!made(false, true, &|run, outputs| {
+            sweep(run, outputs);
+            run.commit(commit, memo);
+        }));
+    }
+
     #[test]
     #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn names_rules_are_the_rows_too() {
-        use crate::name::{Op, commit};
+        use crate::registry::{Op, commit};
         let made = |revealed_at: u32, stale_at: u32, change: &dyn Fn(&mut Named), sweep: bool| {
             let mut n = named_made(revealed_at, stale_at);
             change(&mut n);
@@ -2058,7 +2516,7 @@ mod tests {
         assert!(!run(
             &|n| {
                 let Op::Reveal { record, .. } = &n.tx.ops[1] else { unreachable!() };
-                n.names.set(crate::name::Record { owner: [1; 32], ..record.clone() });
+                n.names.set(crate::registry::Record { owner: [1; 32], ..record.clone() });
             },
             false
         ));
@@ -2091,8 +2549,8 @@ mod tests {
         height: u32,
     }
 
-    fn guarded(change: &dyn Fn(&mut crate::policy::PolicyInput, &mut Vec<Digest>, &mut u32)) -> Guarded {
-        use crate::policy::{Cond, Policy, PolicyInput, Shown, hash_lock};
+    fn guarded(change: &dyn Fn(&mut crate::conditions::PolicyInput, &mut Vec<Digest>, &mut u32)) -> Guarded {
+        use crate::conditions::{Cond, Policy, PolicyInput, Shown, hash_lock};
         let keys: Vec<PublicKey> = (0..3).map(key).collect();
         let hashes: Vec<Digest> = keys.iter().map(key_hash).collect();
         let secret = [9u8; 32];
@@ -2147,9 +2605,11 @@ mod tests {
         let mut run = Run::new(&start, closed(), &g.set.root());
         run.head(&g.tx);
         let input = &g.tx.policy[0];
+        run.frontier(&outputs.frontier_without([input.position]));
         run.policy_input(input, &outputs.path(input.position), &[g.set.at(1), g.set.at(2)]);
         outputs.set(input.position, EMPTY);
-        run.output(&g.tx.outputs[0], &key_hash(&key(0)), &outputs.path(outputs.next));
+        run.output(&g.tx.outputs[0], &key_hash(&key(0)));
+        run.settle();
         let mut record = start;
         let applied = record.apply(&mut g.outputs.clone(), &g.tx).is_ok();
         (run, start, applied.then_some(record))
@@ -2158,14 +2618,15 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_policy_s_output_is_spent_by_its_conditions() {
-        use crate::policy::{Cond, Shown};
+        use crate::conditions::{Cond, Shown};
         let g = guarded(&|_, _, _| {});
         let (run, start, record) = guarded_run(&g);
         let record = record.expect("the rules take it");
-        let expect = public(&start, &record, &g.set.root(), [closed(), whole(&g.tx)], [counted([0; 4]); 2]);
+        let expect =
+            public(&start, &record, &g.set.root(), [closed(), whole(&g.tx)], [counted([0; 4]); 2], [[0; 2]; 2]);
         assert!(proves(run, Some(&expect)));
         // Each condition, not met: by the rows as by the rules.
-        let refused = |change: &dyn Fn(&mut crate::policy::PolicyInput, &mut Vec<Digest>, &mut u32)| {
+        let refused = |change: &dyn Fn(&mut crate::conditions::PolicyInput, &mut Vec<Digest>, &mut u32)| {
             let g = guarded(change);
             let (run, _, record) = guarded_run(&g);
             // The rules know nothing of signatures: where only those fail
@@ -2194,14 +2655,14 @@ mod tests {
     /// when it was made.
     struct Channel {
         outputs: Outputs,
-        policy: crate::policy::Policy,
+        policy: crate::conditions::Policy,
         channel: Digest,
         settle: Output,
         position: u64,
     }
 
     fn channel() -> Channel {
-        use crate::policy::{Cond, Policy, covered};
+        use crate::conditions::{Cond, Policy, covered};
         let keys = vec![key_hash(&key(0)), key_hash(&key(1))];
         let channel = [0xC4; 32];
         let settle = Output::to(&key_hash(&key(0)), 60, [1; MEMO]);
@@ -2228,7 +2689,7 @@ mod tests {
         covered: u32,
         signs: Option<([u64; 2], Option<Digest>)>,
     ) -> (bool, bool) {
-        use crate::policy::{PolicyInput, Shown, rebind_message};
+        use crate::conditions::{PolicyInput, Shown, rebind_message};
         let conds = c.policy.0[leaf].clone();
         let owners: Vec<Digest> = outs.iter().map(|o| o.1).collect();
         let outs: Vec<Output> = outs.into_iter().map(|o| o.0).collect();
@@ -2265,12 +2726,14 @@ mod tests {
         let mut run = Run::new(&start, closed(), &set.root());
         run.head(&tx);
         let places: Vec<Signed> = (1..set.0.len()).map(|i| set.at(i as u64)).collect();
+        run.frontier(&outputs.frontier_without([c.position]));
         run.policy_input(&input, &outputs.path(c.position), &places);
         outputs.set(c.position, EMPTY);
         for (output, owner) in tx.outputs.iter().zip(&owners) {
-            run.output(output, owner, &outputs.path(outputs.next));
+            run.output(output, owner);
             outputs.insert(output, 100);
         }
+        run.settle();
         let mut record = start;
         (proves(run, None), record.apply(&mut c.outputs.clone(), &tx).is_ok())
     }
@@ -2295,7 +2758,7 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_channel_s_keys_sign_a_state_not_a_transaction() {
-        use crate::policy::{covered, rebind_message};
+        use crate::conditions::{covered, rebind_message};
         let c = channel();
         let root = c.policy.root();
         let next = (Output::to(&root, 60, [7; MEMO]), root);
@@ -2348,29 +2811,35 @@ mod tests {
         let mut run = Run::new(&start, closed(), &scene.set.root());
         let mut runs = Vec::new();
         let mut entry = 3;
+        // The tree as a run has it: without the outputs it makes.
+        let mut tree = state.clone();
         for (t, tx) in scene.txs.iter().enumerate() {
             run.head(tx);
             for input in &tx.inputs {
-                run.input(input, &state.path(input.position), 1, &scene.set.at(entry));
+                run.input(input, &tree.path(input.position), 1, &scene.set.at(entry));
+                tree.set(input.position, EMPTY);
                 state.set(input.position, EMPTY);
                 entry += 1;
             }
             if t == 0 {
-                let next = Run::after(&run);
+                // The second run spends the second payment's input.
+                let mut next = Run::after(&run);
+                next.frontier(&state.frontier_without(spent(&scene.txs[1..])));
                 runs.push(std::mem::replace(&mut run, next));
             }
             for output in &tx.outputs {
-                run.output(output, &key_hash(&key(9)), &state.path(state.next));
+                run.output(output, &key_hash(&key(9)));
                 state.insert(output, scene.height);
             }
         }
+        run.settle();
         runs.push(run);
         let params = |m: usize| Params::plain(m, 1, 4, 4);
         let proved: Vec<Proved> = runs.into_iter().map(|r| prove(r, 512, params)).collect();
         assert!(proved.iter().all(Proved::verifies));
         assert_eq!(proved[0].program, proved[1].program);
         // The first run leaves a transaction in hand: outputs left.
-        assert_eq!(proved[0].public[80 + 4 * 10 + 1], 2);
+        assert_eq!(proved[0].public[100 + 4 * 10 + 1], 2);
         let c = circuit();
         let proved: [Proved; 2] = proved.try_into().ok().unwrap();
         let node = crate::proof::prove(joined(&proved, &c), vec![], params);
@@ -2379,7 +2848,8 @@ mod tests {
         let mut record = start;
         let mut applied = scene.state.clone();
         scene.txs.iter().for_each(|tx| record.apply(&mut applied, tx).unwrap());
-        let all = public(&start, &record, &scene.set.root(), [closed(), whole(&scene.txs[1])], [counted([0; 4]); 2]);
+        let last = whole(&scene.txs[1]);
+        let all = public(&start, &record, &scene.set.root(), [closed(), last], [counted([0; 4]); 2], [[0; 2]; 2]);
         let expect = [crate::alg::halves(&proved[0].program).to_vec(), elements(&all)].concat();
         assert_eq!(node.statement(), crate::alg::statement(&expect));
         // The runs the other way round do not join.
@@ -2445,22 +2915,30 @@ mod tests {
         let set = Set(entries.collect());
         let record = Record::start(&state, EMPTY, EMPTY, 2);
         let mut run = Run::new(&record, closed(), &set.root());
+        run.frontier(&state.frontier_without(spent(&txs[..n])));
+        // The tree as a run has it: without the outputs it makes.
+        let mut tree = state.clone();
         let mut done = Vec::new();
         for (t, tx) in txs.iter().enumerate() {
             if t == n {
-                let next = Run::after(&run);
+                run.settle();
+                let mut next = Run::after(&run);
+                next.frontier(&state.frontier_without(spent(&txs[n..])));
                 done.push(std::mem::replace(&mut run, next));
+                tree = state.clone();
             }
             run.head(tx);
             for (i, input) in tx.inputs.iter().enumerate() {
-                run.input(input, &state.path(input.position), 1, &set.at((2 * t + i) as u64));
+                run.input(input, &tree.path(input.position), 1, &set.at((2 * t + i) as u64));
+                tree.set(input.position, EMPTY);
                 state.set(input.position, EMPTY);
             }
             for output in &tx.outputs {
-                run.output(output, &key_hash(&keys[if output.amount == 120 { 0 } else { 1 }]), &state.path(state.next));
+                run.output(output, &key_hash(&keys[if output.amount == 120 { 0 } else { 1 }]));
                 state.insert(output, 2);
             }
         }
+        run.settle();
         match done.pop() {
             Some(first) => (first, run),
             None => {

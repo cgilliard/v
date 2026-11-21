@@ -307,11 +307,27 @@ path from nothing, a level a pair, by the position's bits) · `ISP`
 (the old path reached the root, the root is now the new path's; the
 position goes into the inputs' hash; the sum grows).
 
-**An output**, 87 rows: `OUTC` (commitment of a key hash and the
-amount) · `OLEAF` (with the block's height) · `OITEM` (the same block
-without the height: the item) · `BODYOUT` · 41 × (`OLD`, `NEW`) (from
-nothing, and from the leaf, at the next position) · `OSP` (root, next
+**An output**, 8 rows and 2 for each node it is joined with: `OUTC`
+(commitment of a key hash and the amount) · `OLEAF` (with the block's
+height) · `OITEM` (the same block without the height: the item) ·
+`BODYOUT` · the leaf joins the nodes held (below) · `OSP` (next
 position, the outputs' hash, the sum, one output fewer left).
+
+**The outputs a run makes.** Outputs are made at one position after
+another, so making them needs only the tree's nodes to the left of the
+next position's path, one at each level the position has a bit at. A
+run holds them as a chain of hashes (a register of 8 words), the
+lowest last. A leaf is joined with the node held at each level its
+position has a bit at (`POP` opens the chain, `MRG` hashes the pair)
+and what that leaves is held in its turn (`PUSH`). At the run's end
+two walks up the tree, each from an empty leaf with the nodes held to
+its left and nothing to its right, bring the outputs into the root:
+the first from the position the run began at, with the chain it began
+with, must reach the root as the run's spending left it (so the nodes
+the prover gave are the tree's); the second, from the next position
+with the chain as it is, gives the new root. About 170 rows a run,
+whatever it made. What a run spends is therefore the tree's without
+the run's own outputs.
 
 **A transaction**: `HEAD` (its counts: the body hash's start, the
 counters, the id it claims), allowed only when the one before is
@@ -329,12 +345,11 @@ root.
 carry word a 32-bit addition, the carry out of a word a bit for the
 next).
 
-**Cost**: a payment of two inputs and two outputs is 394 rows of 1,024
-words; 2^16 rows (a proof of 2^24 elements) hold about 166 of them.
-Later: the reference's stack of outputs, which sets down a whole
-subtree with one path, makes an output about 20 rows.
+**Cost**: a payment of two inputs and two outputs is about 238 rows of
+1,024 words; 2^16 rows (a proof of 2^24 elements) hold about 275 of
+them, 2^15 rows 128.
 
-## Names (`src/name.rs`; their rows are kinds of the transaction table)
+## Names (`src/registry.rs`; their rows are kinds of the transaction table)
 
 Rules as the reference's, restated over Blake3: commit, reveal (1 to
 288 blocks later), update (signed by the owner's key over the new
@@ -343,16 +358,17 @@ the place its hash's first 128 bits say (the reference's is a
 compressed trie; a plain tree is two walks of 128 rows and nothing
 else to prove). `state_root = H(outputs' root, registry's root)`.
 
-**Decided while planning: name operations are more kinds of row in the
-transaction table, not a table and a proof of their own.** A
-transaction's operations are applied where the transaction has them,
-so nothing has to tie a list of operations in one proof to the same
-list in another. With that:
+Name operations are more kinds of row in the transaction table, not a
+table and a proof of their own. A transaction carries its operations
+by their hashes (`OPBODY` into its id, `OPSGN` into a running hash of
+what the block's transactions carry) and nothing is done there. They
+are done after the block's last transaction, each taken into a second
+running hash, of what is done, and the block's root finds the two the
+same. So a block lists its operations apart from its outputs, a
+commitment's output comes after every payment's and a reveal's
+spending after every input's: nothing says which transaction an
+operation came with.
 
-- What a block spends is one ordered list of positions (payments'
-  inputs, revealed commitments, sweeps), the running hash a run
-  already keeps; what it makes is one ordered list of outputs and
-  operations, the other. No third and fourth running hash.
 - A name's characters are for the node to check (the block lists the
   record); the rows take the name's hash as given. So is "the new
   owner is another": the node has the old record.
@@ -362,31 +378,29 @@ list in another. With that:
 - The windows (`height - made` in 1..288, or above 288 for a sweep)
   are full adders in the row, as the sums are.
 
-Rows, each one compression (kinds to add to `segment.rs`):
+Rows, each one compression:
 
 - **Commit**: `OPC` (the operation's hash) · `CLEAF` (the
-  commitment's output leaf, at the block's height) · `OPBODY` (the
-  body takes the operation) · the outputs' walk · `OPSP` (as `OSP`,
-  in the operations' domain).
+  commitment's output leaf, at the block's height) · the leaf joins
+  the nodes held · `OPSP` (as `OSP`, into the hash of what is done).
 - **Reveal**: `REC1`, `REC2` (the record's hash) · `COM1`, `COM2` (the
   commitment, of the same name's hash and owner) · `RLEAF` (the
   commitment's leaf; the window) · the outputs' walk · `ISP` · `NLEAFR`
   (the name's leaf; nothing there before) · the registry's walk, 128
   of (`NOLD`, `NNEW`) · `NEND` · `OPX` (the operation's hash, its tag
-  the flow's) · `OPBODY` · `OPABS`.
+  the flow's) · `OPABS`.
 - **Update**: `REC1`, `REC2` · `UMSG` (what the owner signs) · `KEY`,
   `ENT1`, `ENT2U`, 21 × `SN` (the owner's entry in the signed set) ·
   `OREC1`, `OREC2` (the old record's hash, its owner the key's hash) ·
-  `NLEAFO`, `NLEAFN` · the registry's walk · `NEND` · `OPX` · `OPBODY`
-  · `OPABS`.
-- **Sweep** (between transactions): `SLEAF` (the window) · the
+  `NLEAFO`, `NLEAFN` · the registry's walk · `NEND` · `OPX` · `OPABS`.
+- **Sweep** (after the operations): `SLEAF` (the window) · the
   outputs' walk · `ISP`.
 
-More than 32 kinds: the kind is two words with one bit between them.
+More than 64 kinds: the kind is three words with one bit between them.
 New registers: the registry's root, the name's hash, the owner, the
 record's hash, the name's place being walked (four words), the flow's
-tag, the caps. The row stays within 1,024 words but needs 2,048
-constraints (about 1,400): to trim later.
+tag, the caps, the two running hashes of operations, and how far the
+block is. The row is 829 of 1,024 words and 1,830 of 2,048 constraints.
 
 Also built on the way: `src/arith.rs`, a table of 64-bit additions and
 subtractions for compiled computations (`Shared::number`), since the
@@ -401,7 +415,7 @@ this header's block in, everything else a node keeps in a header hashed
 the first three; the id is of that hash, the nonce and the mix.
 
 **The work.** A block's root verifies a proof of the work of the header
-*before* the block's (`block::Worked`), and states that header's work's
+*before* the block's (`block_proof::Worked`), and states that header's work's
 hash, nonce and mix. A header's own work cannot be in the proof the
 header names. The chain's step then computes the work's hash of the
 header that names the id the chain was at and states what the chain's

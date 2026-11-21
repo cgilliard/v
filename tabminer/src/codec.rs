@@ -7,10 +7,60 @@
 use crate::field::F;
 use crate::hash::Digest;
 
+/// Serialized size of a digest.
+pub const DIGEST_BYTES: usize = 32;
+
+/// Serialized size of an output's position where blocks carry one: six
+/// bytes, for positions below `2^48`. The chain holds `2^41` outputs at
+/// most ([`crate::output::OUTPUT_CAPACITY`]), which five bytes fall short of.
+pub const POSITION_BYTES: usize = 6;
+
+/// Reads a position of [`POSITION_BYTES`] from the front of `bytes`.
+pub fn read_position(bytes: &[u8]) -> Option<(u64, &[u8])> {
+    let (head, rest) = bytes.split_at_checked(POSITION_BYTES)?;
+    let mut buf = [0u8; 8];
+    buf[..POSITION_BYTES].copy_from_slice(head);
+    Some((u64::from_le_bytes(buf), rest))
+}
+
+/// Writes `position` to `out`, which must be [`POSITION_BYTES`] long.
+/// Panics for a position that does not fit: none is cut short silently.
+pub fn write_position(out: &mut [u8], position: u64) {
+    assert!(position >> (8 * POSITION_BYTES) == 0, "position {position} does not fit {POSITION_BYTES} bytes");
+    out.copy_from_slice(&position.to_le_bytes()[..POSITION_BYTES]);
+}
+
+pub fn read_u32(bytes: &[u8]) -> Option<(u32, &[u8])> {
+    let (head, rest) = bytes.split_at_checked(4)?;
+    Some((u32::from_le_bytes(head.try_into().unwrap()), rest))
+}
+
+pub fn read_u64(bytes: &[u8]) -> Option<(u64, &[u8])> {
+    let (head, rest) = bytes.split_at_checked(8)?;
+    Some((u64::from_le_bytes(head.try_into().unwrap()), rest))
+}
+
+pub fn read_digest(bytes: &[u8]) -> Option<(Digest, &[u8])> {
+    let (head, rest) = bytes.split_at_checked(DIGEST_BYTES)?;
+    Some((head.try_into().unwrap(), rest))
+}
+
 #[derive(Default)]
 pub struct Writer(pub Vec<u8>);
 
 impl Writer {
+    pub fn with_capacity(n: usize) -> Writer {
+        Writer(Vec::with_capacity(n))
+    }
+
+    pub fn finish(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn digest_vec(&mut self, ds: &[Digest]) {
+        self.digests(ds);
+    }
+
     pub fn u32(&mut self, x: u32) {
         self.0.extend_from_slice(&x.to_le_bytes());
     }
@@ -46,7 +96,7 @@ impl Writer {
 pub struct Reader<'a>(pub &'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         if self.0.len() < n {
             return None;
         }
@@ -56,7 +106,22 @@ impl<'a> Reader<'a> {
     }
 
     pub fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        let b = self.take(4)?;
+        #[cfg(test)]
+        READS.with(|r| {
+            if let Some(v) = r.borrow_mut().as_mut() {
+                v.push(b.as_ptr() as usize);
+            }
+        });
+        Some(u32::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    pub fn digest_vec(&mut self) -> Option<Vec<Digest>> {
+        self.digests()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     pub fn u64(&mut self) -> Option<u64> {
@@ -93,6 +158,68 @@ impl<'a> Reader<'a> {
     pub fn end(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: where each `u32` read came from, while [`u32_fields`] records.
+    static READS: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: the offsets in `bytes` of every `u32` that `decode` reads from
+/// them, in order. Every count, length, height, index and flag of the
+/// formats here is one, so this finds a format's structural fields without
+/// describing the format. Reads from copies of `bytes` are not seen.
+#[cfg(test)]
+pub(crate) fn u32_fields(bytes: &[u8], decode: impl FnOnce(&[u8])) -> Vec<usize> {
+    READS.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    decode(bytes);
+    let reads = READS.with(|r| r.borrow_mut().take()).unwrap_or_default();
+    let base = bytes.as_ptr() as usize;
+    let mut out: Vec<usize> =
+        reads.into_iter().filter(|&a| a >= base && a + 4 <= base + bytes.len()).map(|a| a - base).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Tests: every structural field of `bytes` (see [`u32_fields`]) set in
+/// turn to each boundary value (0, 1, 2, 31, 32, 33, 63, 64, 255, 256,
+/// 2^31, `u32::MAX`, and one either side of its own), and `check` run on
+/// the result: `None` if it does not decode, `Some(accepted)` if it does.
+/// Returns the mutants that panicked and those that were accepted; both
+/// should be empty. Deterministic, unlike random mutation, which rarely
+/// lands a chosen value on a chosen field of a large proof.
+#[cfg(test)]
+pub(crate) fn sweep_fields(bytes: &[u8], check: impl Fn(&[u8]) -> Option<bool>) -> (usize, Vec<String>, Vec<String>) {
+    let fields = u32_fields(bytes, |b| {
+        check(b);
+    });
+    let (mut panicked, mut accepted) = (Vec::new(), Vec::new());
+    let quiet = crate::test_util::Quiet::new();
+    for &at in &fields {
+        let own = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let values =
+            [0, 1, 2, 31, 32, 33, 63, 64, 255, 256, 1 << 31, u32::MAX, own.wrapping_add(1), own.wrapping_sub(1)];
+        for v in values {
+            if v == own {
+                continue;
+            }
+            let mut b = bytes.to_vec();
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&b))) {
+                Err(e) => {
+                    let msg =
+                        e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()));
+                    panicked.push(format!("u32 at {at} ({own}) set to {v}: {}", msg.unwrap_or_default()));
+                }
+                Ok(Some(true)) => accepted.push(format!("u32 at {at} ({own}) set to {v}")),
+                Ok(_) => {}
+            }
+        }
+    }
+    drop(quiet);
+    (fields.len(), panicked, accepted)
 }
 
 #[cfg(test)]

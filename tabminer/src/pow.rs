@@ -55,7 +55,11 @@
 //! of the table; the hashes are Blake3, each a call any Blake3 library
 //! makes.
 
+use std::io::{Read as _, Write as _};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
 use crate::blake3;
+use crate::difficulty::Target;
 use crate::hash::{DOM_POW_ITEM, DOM_POW_MIX, DOM_POW_RESULT, DOM_POW_SEED, Digest, hash_domain};
 
 /// One dataset item: 16 words, 64 bytes.
@@ -64,7 +68,7 @@ pub type Item = [u32; 16];
 pub type Nonce = [u8; 32];
 
 /// The seed file: the text gzipped, in the binary and used as it is.
-pub const SEED_TEXT_GZ: &[u8] = include_bytes!("../resources/akjv.txt.gz");
+pub const SEED_TEXT_GZ: &[u8] = include_bytes!("../../resources/akjv.txt.gz");
 /// Its size, checked when it is first used.
 pub const SEED_TEXT_LEN: usize = 1_291_059;
 /// Bytes of a window: a Blake3 block.
@@ -182,7 +186,7 @@ pub trait ItemSource {
 }
 
 /// The seed text, with the parameters items are made by.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SeedText<'a> {
     params: PowParams,
     text: &'a [u8],
@@ -278,7 +282,8 @@ impl ItemSource for SeedItems<'_> {
 }
 
 /// A table made whole, in memory: for the small ones of tests and the
-/// dev networks.
+/// dev networks. A miner's is a [`LazyDataset`].
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dataset<'a> {
     seed: SeedText<'a>,
     log_items: u32,
@@ -310,6 +315,314 @@ impl ItemSource for Dataset<'_> {
     fn seed(&self) -> &SeedText<'_> {
         &self.seed
     }
+}
+
+// ---------------------------------------------------------------------------
+// A miner's table, filled as it is read
+// ---------------------------------------------------------------------------
+
+/// What begins a table's file.
+const FILE_MAGIC: &[u8; 8] = b"tabtable";
+/// Bytes of a table file before its bitmap: the magic, `log2` of its
+/// items, and the parents of an item.
+const FILE_HEADER: usize = 8 + 4 + 4;
+/// Bytes of the checksum that ends a table's file.
+const CHECKSUM_BYTES: usize = 8;
+
+/// A checksum of a table's file against corruption (not forgery: the
+/// sampled items guard the contents, the chain's blocks the rest): 64-bit
+/// FNV-1a, taken a part of the file at a time, the same whatever compiler
+/// built the node.
+struct Checksum(u64);
+
+impl Checksum {
+    fn new() -> Checksum {
+        Checksum(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> [u8; CHECKSUM_BYTES] {
+        self.0.to_le_bytes()
+    }
+}
+
+/// A table as a miner holds it: all of its memory taken when it is made,
+/// and its items computed from the seed file as they are first read, a
+/// pair at a time, and kept. Threads share one by reference: reading and
+/// filling need no lock, and two threads that fill the same pair write
+/// the same values.
+pub struct LazyDataset<'a> {
+    seed: SeedText<'a>,
+    log_items: u32,
+    /// The items' words, 16 an item.
+    words: Vec<AtomicU32>,
+    /// A bit for each pair of items that is there: set after its elements
+    /// are written.
+    present: Vec<AtomicU64>,
+    /// How many pairs are there.
+    filled: AtomicUsize,
+}
+
+impl<'a> LazyDataset<'a> {
+    /// Pairs of adjacent items in the table: what a hash reads.
+    pub fn pairs(&self) -> usize {
+        1 << (self.log_items - 1)
+    }
+
+    /// An empty table of `2^log_items` items: its whole memory
+    /// ([`table_bytes`]) is allocated and written to now, so that a machine
+    /// without room for it fails here and not while mining.
+    pub fn new(seed: &SeedText<'a>, log_items: u32) -> std::io::Result<LazyDataset<'a>> {
+        assert!(seed.params.has_table(log_items), "no epoch has a table of 2^{log_items} items");
+        let no_room = |_| std::io::Error::new(std::io::ErrorKind::OutOfMemory, "no memory for the dataset");
+        let (n, pairs) = (16usize << log_items, 1usize << (log_items - 1));
+        let mut words = Vec::new();
+        words.try_reserve_exact(n).map_err(no_room)?;
+        // Every word is written: the memory is the process's from here on,
+        // not a promise of it. (The value is hidden from the compiler, or a
+        // zero written to zeroed memory could be left out.)
+        words.extend((0..n).map(|_| AtomicU32::new(std::hint::black_box(0))));
+        let mut present = Vec::new();
+        present.try_reserve_exact(pairs / 64).map_err(no_room)?;
+        present.extend((0..pairs / 64).map(|_| AtomicU64::new(0)));
+        Ok(LazyDataset { seed: *seed, log_items, words, present, filled: AtomicUsize::new(0) })
+    }
+
+    /// A table of `2^log_items` items with what the file at `path` holds
+    /// of it ([`LazyDataset::save`]): a file of a smaller table, of an
+    /// earlier epoch, holds its first items. Empty if there is no file.
+    pub fn open(seed: &SeedText<'a>, log_items: u32, path: &std::path::Path) -> std::io::Result<LazyDataset<'a>> {
+        let table = Self::new(seed, log_items)?;
+        // A file that is not a table's leaves it empty: no pair is
+        // marked as there until the whole file is known to be good.
+        table.load(path);
+        Ok(table)
+    }
+
+    /// Makes the table one of `2^log_items` items, for a later epoch: the
+    /// items it has stay where they are, and room for the rest is taken
+    /// and written to now, to be filled as it is read.
+    pub fn grow(&mut self, log_items: u32) -> std::io::Result<()> {
+        assert!(self.seed.params.has_table(log_items), "no epoch has a table of 2^{log_items} items");
+        assert!(log_items >= self.log_items, "a table does not shrink");
+        let no_room = |_| std::io::Error::new(std::io::ErrorKind::OutOfMemory, "no memory for the dataset");
+        let (n, pairs) = (16usize << log_items, 1usize << (log_items - 1));
+        self.words.try_reserve_exact(n - self.words.len()).map_err(no_room)?;
+        self.present.try_reserve_exact(pairs / 64 - self.present.len()).map_err(no_room)?;
+        let have = self.words.len();
+        self.words.extend((have..n).map(|_| AtomicU32::new(std::hint::black_box(0))));
+        let have = self.present.len();
+        self.present.extend((have..pairs / 64).map(|_| AtomicU64::new(0)));
+        self.log_items = log_items;
+        Ok(())
+    }
+
+    /// Pairs of items that are there.
+    pub fn filled(&self) -> usize {
+        self.filled.load(Ordering::Acquire)
+    }
+
+    /// Whether every item is there: the table is as fast as it gets.
+    pub fn is_complete(&self) -> bool {
+        self.filled() == self.pairs()
+    }
+
+    fn has(&self, pair: usize) -> bool {
+        self.present[pair / 64].load(Ordering::Acquire) >> (pair % 64) & 1 == 1
+    }
+
+    /// Records that `pair`'s elements are written.
+    fn mark(&self, pair: usize) {
+        let bit = 1u64 << (pair % 64);
+        if self.present[pair / 64].fetch_or(bit, Ordering::AcqRel) & bit == 0 {
+            self.filled.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn write(&self, index: usize, item: &Item) {
+        for (w, x) in self.words[index * 16..(index + 1) * 16].iter().zip(item) {
+            w.store(*x, Ordering::Relaxed);
+        }
+    }
+
+    fn read(&self, index: usize) -> Item {
+        let words = &self.words[index * 16..(index + 1) * 16];
+        core::array::from_fn(|k| words[k].load(Ordering::Relaxed))
+    }
+
+    /// Computes `pair`'s two items from the file and keeps them, if they
+    /// are not there.
+    fn ensure(&self, pair: usize) {
+        if !self.has(pair) {
+            for index in [2 * pair, 2 * pair + 1] {
+                self.write(index, &self.seed.calc_dataset_item(index));
+            }
+            self.mark(pair);
+        }
+    }
+
+    /// Computes every item not yet there, using all available threads.
+    pub fn fill(&self) {
+        crate::parallel::par_map_min(self.pairs(), 1, |pair| self.ensure(pair));
+    }
+
+    /// Writes the table to `path`, by way of a file beside it: its size,
+    /// which pairs are there, every item, and a checksum. A table can be
+    /// saved while it is mined with; pairs filled meanwhile may be left
+    /// for next time.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        let mut file = std::io::BufWriter::with_capacity(1 << 16, std::fs::File::create(&tmp)?);
+        let mut sum = Checksum::new();
+        let mut put = |file: &mut std::io::BufWriter<std::fs::File>, bytes: &[u8]| {
+            sum.update(bytes);
+            file.write_all(bytes)
+        };
+        put(&mut file, &file_header(self.log_items, self.seed.params.parents))?;
+        // The bitmap first: a pair it says is there was whole before it was
+        // read, and stays whole.
+        for w in &self.present {
+            put(&mut file, &w.load(Ordering::Acquire).to_le_bytes())?;
+        }
+        for index in 0..1usize << self.log_items {
+            put(&mut file, &item_to_bytes(&self.read(index)))?;
+        }
+        file.write_all(&sum.finish())?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Takes in the pairs the file at `path` holds, if it is a table's of
+    /// this size or a smaller one of the schedule's: with a table's
+    /// header, of the size that says, the checksum
+    /// right, and a few of its pairs as the seed file makes them. Returns
+    /// whether it was. Pairs are marked as there only at the end, so a
+    /// file refused part way leaves the table as it was.
+    fn load(&self, path: &std::path::Path) -> bool {
+        let params = &self.seed.params;
+        let read = || -> Option<()> {
+            let file = std::fs::File::open(path).ok()?;
+            let size = file.metadata().ok()?.len();
+            let mut file = std::io::BufReader::with_capacity(1 << 16, file);
+            let mut sum = Checksum::new();
+            let mut header = [0u8; FILE_HEADER];
+            file.read_exact(&mut header).ok()?;
+            sum.update(&header);
+            // The file's table: one of the schedule's, no larger than this.
+            let log_items = u32::from_le_bytes(header[8..12].try_into().unwrap());
+            if !params.has_table(log_items) || log_items > self.log_items {
+                return None;
+            }
+            let pairs = 1usize << (log_items - 1);
+            if header != file_header(log_items, params.parents)
+                || size != (FILE_HEADER + pairs / 8 + CHECKSUM_BYTES) as u64 + table_bytes(log_items)
+            {
+                return None;
+            }
+            // Which pairs the file has: marked here only once the whole
+            // file is known to be good.
+            let mut there = vec![0u64; pairs / 64];
+            for w in there.iter_mut() {
+                let mut b = [0u8; 8];
+                file.read_exact(&mut b).ok()?;
+                sum.update(&b);
+                *w = u64::from_le_bytes(b);
+            }
+            let mut buf = [0u8; ITEM_BYTES];
+            for index in 0..2 * pairs {
+                file.read_exact(&mut buf).ok()?;
+                sum.update(&buf);
+                self.write(index, &item_from_bytes(&buf));
+            }
+            let mut stored = [0u8; CHECKSUM_BYTES];
+            file.read_exact(&mut stored).ok()?;
+            if stored != sum.finish() {
+                return None;
+            }
+            // Up to eight of the pairs it has, spread through them.
+            let has = |pair: usize| there[pair / 64] >> (pair % 64) & 1 == 1;
+            let held = (0..pairs).filter(|p| has(*p)).count();
+            let mut seen = 0;
+            for pair in (0..pairs).filter(|p| has(*p)) {
+                if held <= 8 || seen % (held / 8) == 0 || seen == held - 1 {
+                    for index in [2 * pair, 2 * pair + 1] {
+                        if self.read(index) != self.seed.calc_dataset_item(index) {
+                            return None;
+                        }
+                    }
+                }
+                seen += 1;
+            }
+            for pair in (0..pairs).filter(|p| has(*p)) {
+                self.mark(pair);
+            }
+            Some(())
+        };
+        read().is_some()
+    }
+}
+
+/// What begins the file of a table of `2^log_items` items of `parents`
+/// steps each.
+fn file_header(log_items: u32, parents: usize) -> [u8; FILE_HEADER] {
+    let mut h = [0u8; FILE_HEADER];
+    h[..8].copy_from_slice(FILE_MAGIC);
+    h[8..12].copy_from_slice(&log_items.to_le_bytes());
+    h[12..].copy_from_slice(&(parents as u32).to_le_bytes());
+    h
+}
+
+impl core::fmt::Debug for LazyDataset<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LazyDataset")
+            .field("log_items", &self.log_items)
+            .field("filled", &self.filled())
+            .field("pairs", &self.pairs())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ItemSource for LazyDataset<'_> {
+    fn params(&self) -> &PowParams {
+        &self.seed.params
+    }
+
+    fn log_items(&self) -> u32 {
+        self.log_items
+    }
+
+    /// Item `index`: read if its pair is there, computed with its pair and
+    /// kept if not.
+    #[inline]
+    fn item(&self, index: usize) -> Item {
+        self.ensure(index / 2);
+        self.read(index)
+    }
+
+    fn seed(&self) -> &SeedText<'_> {
+        &self.seed
+    }
+}
+
+/// Bytes of one item in a file.
+const ITEM_BYTES: usize = 64;
+
+fn item_from_bytes(bytes: &[u8; ITEM_BYTES]) -> Item {
+    core::array::from_fn(|k| u32::from_le_bytes(bytes[4 * k..4 * k + 4].try_into().unwrap()))
+}
+
+fn item_to_bytes(item: &Item) -> [u8; ITEM_BYTES] {
+    let mut out = [0u8; ITEM_BYTES];
+    for (b, x) in out.chunks_exact_mut(4).zip(item) {
+        b.copy_from_slice(&x.to_le_bytes());
+    }
+    out
 }
 
 /// The seed of a header's work: a hash of the header's hash and the
@@ -384,17 +697,21 @@ pub fn hashimoto<S: ItemSource>(source: &S, header_hash: &Digest, nonce: &Nonce)
     hashimoto_reading(source, header_hash, nonce, |_| {})
 }
 
-/// Whether `mix` is the true mix of the header's work and `meets` takes
-/// its result: by a table with the seed file, or by the file alone.
-pub fn verify<S: ItemSource>(
+/// Whether `mix` is the true mix of the header's work and its result
+/// meets `target`: by a table with the seed file, or by the file alone.
+pub fn verify<S: ItemSource>(source: &S, header_hash: &Digest, nonce: &Nonce, mix: &Digest, target: &Target) -> bool {
+    let out = hashimoto(source, header_hash, nonce);
+    out.mix == *mix && target.is_met_by(&out.result)
+}
+
+/// Tries nonces in `nonces` until one meets `target`.
+pub fn mine<S: ItemSource>(
     source: &S,
     header_hash: &Digest,
-    nonce: &Nonce,
-    mix: &Digest,
-    meets: impl Fn(&Digest) -> bool,
-) -> bool {
-    let out = hashimoto(source, header_hash, nonce);
-    out.mix == *mix && meets(&out.result)
+    target: &Target,
+    nonces: impl IntoIterator<Item = Nonce>,
+) -> Option<(Nonce, PowOutput)> {
+    nonces.into_iter().map(|n| (n, hashimoto(source, header_hash, &n))).find(|(_, o)| target.is_met_by(&o.result))
 }
 
 #[cfg(test)]
@@ -435,9 +752,9 @@ mod tests {
         let out = hashimoto(&table, &hash, &nonce);
         assert_eq!(out, hashimoto(&seed.table(10), &hash, &nonce));
         assert_eq!(out.result, result_from_mix(&hash, &nonce, &out.mix));
-        assert!(verify(&seed.table(10), &hash, &nonce, &out.mix, |_| true));
-        assert!(!verify(&seed.table(10), &hash, &nonce, &[0; 32], |_| true));
-        assert!(!verify(&seed.table(10), &hash, &nonce, &out.mix, |_| false));
+        assert!(verify(&seed.table(10), &hash, &nonce, &out.mix, &Target::MAX));
+        assert!(!verify(&seed.table(10), &hash, &nonce, &[0; 32], &Target::MAX));
+        assert!(!verify(&seed.table(10), &hash, &nonce, &out.mix, &Target::from_leading_zero_bits(248)));
         assert_ne!(out, hashimoto(&table, &hash, &nonce_from_u64(4)));
         assert_ne!(out, hashimoto(&table, &[8u8; 32], &nonce));
     }
@@ -506,5 +823,310 @@ mod tests {
         );
         assert!(least > 0.7, "{least}");
         assert!((1..=30).contains(&blocks_to_all), "{blocks_to_all}");
+    }
+
+    /// A table that does not grow, as small as the dev networks'.
+    const SMALL: PowParams = PowParams::DEV;
+    /// One that grows: 16 KB doubling to 64 KB, in epochs of 100 blocks.
+    const GROWING: PowParams =
+        PowParams { log_dataset_items: 8, max_log_dataset_items: 10, epoch_blocks: 100, ..SMALL };
+
+    fn small_seed() -> &'static SeedText<'static> {
+        static SEED: std::sync::OnceLock<SeedText<'static>> = std::sync::OnceLock::new();
+        SEED.get_or_init(|| SeedText::new(SMALL))
+    }
+
+    /// The table's items from the file alone: a verifier's source.
+    fn small_items() -> SeedItems<'static> {
+        small_seed().at(0)
+    }
+
+    fn small_dataset() -> &'static Dataset<'static> {
+        static DATASET: std::sync::OnceLock<Dataset<'static>> = std::sync::OnceLock::new();
+        DATASET.get_or_init(|| Dataset::generate(small_seed(), 10))
+    }
+
+    fn d(n: u32) -> Digest {
+        core::array::from_fn(|i| (n as u8).wrapping_add(i as u8) ^ (n >> 8) as u8)
+    }
+
+    /// 64-bit FNV-1a, as a table's file is summed.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tabminer-pow-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A miner's table starts empty and fills as it is read: every hash is
+    /// the one a whole table gives, the pairs a hash read are there after
+    /// it, and several threads mining with one table fill it between them.
+    #[test]
+    fn a_lazy_table_fills_as_it_is_read() {
+        let seed = small_seed();
+        let whole = small_dataset();
+        let table = LazyDataset::new(seed, 10).unwrap();
+        assert_eq!((table.pairs(), table.filled(), table.is_complete()), (512, 0, false));
+        assert_eq!((table.log_items(), table.params(), table.seed()), (10, &SMALL, seed));
+        assert!(format!("{table:?}").contains("filled: 0"));
+        // One item asked for brings its pair.
+        assert_eq!(table.item(77), whole.item(77));
+        assert_eq!(table.filled(), 1);
+        assert!(table.has(38) && !table.has(39));
+        assert_eq!((table.item(76), table.filled()), (whole.item(76), 1));
+        // A hash reads at most 64 pairs, and gives what the whole table gives.
+        let h = d(700);
+        let out = hashimoto(&table, &h, &nonce_from_u64(5));
+        assert_eq!(out, hashimoto(whole, &h, &nonce_from_u64(5)));
+        let after_one = table.filled();
+        assert!((2..=65).contains(&after_one), "{after_one} pairs after one hash");
+        // The same hash again reads only what is there.
+        assert_eq!(hashimoto(&table, &h, &nonce_from_u64(5)), out);
+        assert_eq!(table.filled(), after_one);
+        // Threads mining together: each hash right, the table filling.
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let table = &table;
+                s.spawn(move || {
+                    for n in 0..60 {
+                        let nonce = nonce_from_u64(t << 32 | n);
+                        assert_eq!(hashimoto(table, &h, &nonce), hashimoto(whole, &h, &nonce));
+                    }
+                });
+            }
+        });
+        assert!(table.filled() > 500, "{} of 512 pairs after 240 hashes", table.filled());
+        // What is left is computed outright, and nothing is counted twice.
+        table.fill();
+        assert!(table.is_complete());
+        assert_eq!(table.filled(), 512);
+        for i in 0..1024 {
+            assert_eq!(table.item(i), whole.item(i), "item {i}");
+        }
+        table.fill();
+        assert_eq!(table.filled(), 512);
+        // Mining with it finds what mining with a whole table finds.
+        let target = Target::from_leading_zero_bits(6);
+        assert_eq!(
+            mine(&table, &h, &target, (0..10_000).map(nonce_from_u64)),
+            mine(whole, &h, &target, (0..10_000).map(nonce_from_u64))
+        );
+    }
+
+    /// At the next epoch a table is grown where it is: the items it had
+    /// are still there, the new half is empty and fills as it is read, and
+    /// a hash is the larger table's.
+    #[test]
+    fn a_table_grows_where_it_is() {
+        let seed = SeedText::new(GROWING);
+        let whole = Dataset::generate(&seed, 10);
+        let h = d(55);
+        let mut table = LazyDataset::new(&seed, 8).unwrap();
+        table.fill();
+        assert_eq!((table.pairs(), table.filled()), (128, 128));
+        let nonce = nonce_from_u64(3);
+        let small = hashimoto(&table, &h, &nonce);
+        assert_eq!(small, hashimoto(&seed.table(8), &h, &nonce));
+        // Grown for the next epoch: the first half as it was, the second to come.
+        table.grow(9).unwrap();
+        assert_eq!((table.log_items(), table.pairs(), table.filled(), table.is_complete()), (9, 256, 128, false));
+        assert!((0..128).all(|p| table.has(p)) && (128..256).all(|p| !table.has(p)));
+        for i in 0..256 {
+            assert_eq!(table.read(i), whole.item(i), "item {i}");
+        }
+        // Mined with: the new epoch's hashes, the new half filling.
+        let large = hashimoto(&table, &h, &nonce);
+        assert_eq!(large, hashimoto(&seed.table(9), &h, &nonce));
+        assert_ne!(large, small);
+        assert!(table.filled() > 128 && table.filled() < 256, "{} pairs", table.filled());
+        for n in 0..20 {
+            let nonce = nonce_from_u64(n);
+            assert_eq!(hashimoto(&table, &h, &nonce), hashimoto(&seed.table(9), &h, &nonce));
+        }
+        // And again from a table part filled; growing to the size it is changes nothing.
+        let part = table.filled();
+        table.grow(10).unwrap();
+        table.grow(10).unwrap();
+        assert_eq!((table.pairs(), table.filled()), (512, part));
+        assert_eq!(hashimoto(&table, &h, &nonce), hashimoto(&seed.table(10), &h, &nonce));
+        table.fill();
+        assert!(table.is_complete());
+        for i in 0..1024 {
+            assert_eq!(table.item(i), whole.item(i), "item {i}");
+        }
+        // A table does not shrink, nor grow past the last epoch's.
+        let quiet = crate::test_util::Quiet::new();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LazyDataset::new(&seed, 9).unwrap().grow(8)))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LazyDataset::new(&seed, 9).unwrap().grow(11)))
+                .is_err()
+        );
+        drop(quiet);
+    }
+
+    /// A table is saved as far as it is filled and taken up again from its
+    /// file, by a table of its size or by the larger one of a later epoch;
+    /// a file of a larger table, of other work, with a byte changed or
+    /// with an item that is not the text's is not taken, and the table
+    /// starts empty.
+    #[test]
+    fn lazy_tables_are_saved_and_loaded() {
+        // Sizes no build has built in: 32 KB growing to 128 KB.
+        const SAVED: PowParams = PowParams { log_dataset_items: 9, max_log_dataset_items: 11, parents: 16, ..SMALL };
+        let seed = SeedText::new(SAVED);
+        let whole = Dataset::generate(&seed, 11);
+        let dir = temp_dir("tables");
+        let path = dir.join("table.bin");
+        // No file: an empty table.
+        let table = LazyDataset::open(&seed, 9, &path).unwrap();
+        assert_eq!(table.filled(), 0);
+        // Part filled, saved, and taken up again.
+        let h = d(1);
+        for n in 0..3 {
+            hashimoto(&table, &h, &nonce_from_u64(n));
+        }
+        let part = table.filled();
+        assert!(part > 60 && part < 256, "{part} pairs");
+        table.save(&path).unwrap();
+        assert!(!dir.join("table.tmp").exists());
+        let size = FILE_HEADER + 256 / 8 + 512 * ITEM_BYTES + CHECKSUM_BYTES;
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size as u64);
+        let again = LazyDataset::open(&seed, 9, &path).unwrap();
+        assert_eq!(again.filled(), part);
+        for pair in 0..256 {
+            assert_eq!(again.has(pair), table.has(pair), "pair {pair}");
+        }
+        for i in 0..512 {
+            assert_eq!(again.item(i), whole.item(i), "item {i}");
+        }
+        assert!(again.is_complete());
+        // Whole, saved, and loaded whole.
+        again.save(&path).unwrap();
+        let good = std::fs::read(&path).unwrap();
+        assert_eq!(good.len(), size);
+        assert_eq!(&good[..8], FILE_MAGIC);
+        assert_eq!(good[FILE_HEADER + 32..size - CHECKSUM_BYTES], whole.items[..512].iter().flat_map(item_to_bytes).collect::<Vec<u8>>());
+        assert_eq!(good[size - CHECKSUM_BYTES..], fnv1a64(&good[..size - CHECKSUM_BYTES]).to_le_bytes());
+        let loaded = LazyDataset::open(&seed, 9, &path).unwrap();
+        assert!(loaded.is_complete());
+        assert_eq!(hashimoto(&loaded, &h, &nonce_from_u64(9)), hashimoto(&seed.table(9), &h, &nonce_from_u64(9)));
+        // The next epoch's table, twice the size, starts from that file:
+        // the items it had are there and the new half is to come.
+        let grown = LazyDataset::open(&seed, 10, &path).unwrap();
+        assert_eq!((grown.pairs(), grown.filled()), (512, 256));
+        assert!(grown.has(0) && grown.has(255) && !grown.has(256));
+        assert_eq!(hashimoto(&grown, &h, &nonce_from_u64(9)), hashimoto(&seed.table(10), &h, &nonce_from_u64(9)));
+        grown.fill();
+        for i in 0..1024 {
+            assert_eq!(grown.item(i), whole.item(i), "item {i}");
+        }
+        // And the one after that, from the first epoch's file or the second's.
+        assert_eq!(LazyDataset::open(&seed, 11, &path).unwrap().filled(), 256);
+        let second = dir.join("second.bin");
+        grown.save(&second).unwrap();
+        assert_eq!(LazyDataset::open(&seed, 11, &second).unwrap().filled(), 512);
+        // A larger table's file is of no use to a smaller table.
+        assert_eq!(LazyDataset::open(&seed, 9, &second).unwrap().filled(), 0);
+        // A file that is not this table's: nothing is taken from it.
+        let refused = |change: &dyn Fn(&mut Vec<u8>)| {
+            let mut bytes = good.clone();
+            change(&mut bytes);
+            std::fs::write(&path, &bytes).unwrap();
+            let t = LazyDataset::open(&seed, 9, &path).unwrap();
+            let empty = t.filled() == 0;
+            // It works all the same, from the seed file.
+            assert_eq!(t.item(3), whole.item(3));
+            empty
+        };
+        // With the checksum made to fit, so that it is what was changed that is refused.
+        let refit = |b: &mut Vec<u8>| {
+            let n = b.len() - CHECKSUM_BYTES;
+            let sum = fnv1a64(&b[..n]).to_le_bytes();
+            b[n..].copy_from_slice(&sum);
+        };
+        assert!(refused(&|b| b.truncate(b.len() - 1)), "a byte short");
+        assert!(refused(&|b| b.push(0)), "a byte long");
+        assert!(refused(&|b| b[FILE_HEADER + 32 + 1000] ^= 1), "an item changed");
+        assert!(refused(&|b| *b.last_mut().unwrap() ^= 1), "the checksum changed");
+        assert!(
+            refused(&|b| {
+                b[0] ^= 1;
+                refit(b)
+            }),
+            "not a table's file"
+        );
+        assert!(
+            refused(&|b| {
+                b[8] = 8;
+                refit(b)
+            }),
+            "a size no epoch has"
+        );
+        assert!(
+            refused(&|b| {
+                b[8] = 10;
+                refit(b)
+            }),
+            "a size the file is not"
+        );
+        assert!(
+            refused(&|b| {
+                b[12] ^= 1;
+                refit(b)
+            }),
+            "other parents"
+        );
+        assert!(
+            refused(&|b| {
+                b[FILE_HEADER + 32] ^= 1;
+                refit(b)
+            }),
+            "the first item is not the text's"
+        );
+        assert!(
+            refused(&|b| {
+                let at = b.len() - CHECKSUM_BYTES - 4;
+                b[at] ^= 1;
+                refit(b)
+            }),
+            "the last item is not the text's"
+        );
+        // Another network's table of that size is of other work.
+        std::fs::write(&path, &good).unwrap();
+        let other = SeedText::new(PowParams { log_dataset_items: 9, ..SMALL });
+        assert_eq!(LazyDataset::open(&other, 9, &path).unwrap().filled(), 0);
+        assert_eq!(LazyDataset::open(&seed, 9, &path).unwrap().filled(), 256);
+        // A pair the bitmap does not have is not taken, whatever its bytes.
+        let mut holed = good.clone();
+        holed[FILE_HEADER] &= !1;
+        refit(&mut holed);
+        std::fs::write(&path, &holed).unwrap();
+        let t = LazyDataset::open(&seed, 9, &path).unwrap();
+        assert_eq!((t.filled(), t.has(0), t.has(1)), (255, false, true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mine_and_verify() {
+        let seed = small_items();
+        let dataset = small_dataset();
+        let h: Digest = core::array::from_fn(|i| 7 * i as u8 + 1);
+        let target = Target::from_leading_zero_bits(6);
+        let (nonce, out) = mine(dataset, &h, &target, (0..10_000).map(nonce_from_u64)).expect("a nonce within range");
+        assert!(target.is_met_by(&out.result));
+        assert!(verify(&seed, &h, &nonce, &out.mix, &target));
+        let mut other = nonce;
+        other[9] ^= 1;
+        assert!(!verify(&seed, &h, &other, &out.mix, &target));
+        let mut bad_mix = out.mix;
+        bad_mix[0] ^= 1;
+        assert!(!verify(&seed, &h, &nonce, &bad_mix, &target));
+        assert!(!verify(&seed, &h, &nonce, &out.mix, &Target::from_leading_zero_bits(200)));
     }
 }

@@ -57,6 +57,7 @@
 //! signature and never restore an older copy.
 
 use crate::blake3::{self, OUT_LEN};
+use crate::error::Error;
 use crate::hash::{DOM_XMSS_LEAF, DOM_XMSS_MSG, DOM_XMSS_TREE, Digest, hash_domain};
 
 /// Winternitz parameter.
@@ -81,6 +82,8 @@ pub const MAX_HEIGHT: usize = 20;
 /// Bytes of a public seed.
 pub const PUB_SEED_LEN: usize = 16;
 pub type PubSeed = [u8; PUB_SEED_LEN];
+/// Bytes of a stored secret key.
+pub const SECRET_KEY_SIZE: usize = SecretKey::SIZE;
 
 /// Chain ends hashed in each of the leaf's first two parts: a chunk,
 /// with the head.
@@ -201,7 +204,7 @@ pub(crate) fn tree_node(left: &Digest, right: &Digest) -> Digest {
 // ---------------------------------------------------------------------------
 
 /// A public key: the tree's root, the public seed and the tree's height.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PublicKey {
     pub root: Digest,
     pub pub_seed: PubSeed,
@@ -219,10 +222,7 @@ pub struct Signature {
     pub auth_path: Vec<Digest>,
 }
 
-/// A key has no leaf left to sign with.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Exhausted;
-
+#[derive(Clone)]
 pub struct SecretKey {
     height: u8,
     sk_seed: Digest,
@@ -244,7 +244,12 @@ impl PublicKey {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<PublicKey> {
+    /// A key of the bytes: its height must be 1 to [`MAX_HEIGHT`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<PublicKey, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("public key"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<PublicKey> {
         let height = *bytes.last()?;
         if bytes.len() != Self::SIZE || height == 0 || height as usize > MAX_HEIGHT {
             return None;
@@ -298,18 +303,29 @@ impl Signature {
         self.auth_path.len()
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::size(self.height()));
-        out.extend_from_slice(&self.index.to_le_bytes());
-        out.extend_from_slice(&self.randomizer);
-        for d in self.wots.iter().chain(&self.auth_path) {
-            out.extend_from_slice(d);
+    /// Writes the signature to `out`, which must be [`Signature::size`]
+    /// of its height long.
+    pub fn write_bytes(&self, out: &mut [u8]) {
+        assert_eq!(out.len(), Self::size(self.height()), "buffer is not the signature's size");
+        out[..8].copy_from_slice(&self.index.to_le_bytes());
+        let digests = std::iter::once(&self.randomizer).chain(&self.wots).chain(&self.auth_path);
+        for (to, d) in out[8..].chunks_exact_mut(OUT_LEN).zip(digests) {
+            to.copy_from_slice(d);
         }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0u8; Self::size(self.height())];
+        self.write_bytes(&mut out);
         out
     }
 
     /// A signature of a tree of `height`, which the signer's key says.
-    pub fn from_bytes(bytes: &[u8], height: usize) -> Option<Signature> {
+    pub fn from_bytes(bytes: &[u8], height: usize) -> Result<Signature, Error> {
+        Self::decode(bytes, height).ok_or(Error::Malformed("signature"))
+    }
+
+    fn decode(bytes: &[u8], height: usize) -> Option<Signature> {
         if height == 0 || height > MAX_HEIGHT || bytes.len() != Self::size(height) {
             return None;
         }
@@ -388,9 +404,9 @@ impl SecretKey {
     }
 
     /// Signs `msg` with the next unused leaf, and moves past it.
-    pub fn sign(&mut self, msg: &[u8]) -> Result<Signature, Exhausted> {
+    pub fn sign(&mut self, msg: &[u8]) -> Result<Signature, Error> {
         if self.next_index >= self.leaves() {
-            return Err(Exhausted);
+            return Err(Error::KeyExhausted);
         }
         let index = self.next_index;
         self.next_index += 1;
@@ -423,7 +439,11 @@ impl SecretKey {
     }
 
     /// The key [`SecretKey::to_bytes`] stored, its tree made again.
-    pub fn from_bytes(bytes: &[u8]) -> Option<SecretKey> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<SecretKey, Error> {
+        Self::decode(bytes).ok_or(Error::Malformed("secret key"))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<SecretKey> {
         if bytes.len() != Self::SIZE {
             return None;
         }
@@ -505,7 +525,7 @@ mod tests {
                 assert!(pk.verify(&msg, &sig));
                 assert!(!pk.verify(&[i as u8 + 1; 32], &sig));
             }
-            assert_eq!(sk.sign(b"one more"), Err(Exhausted));
+            assert_eq!(sk.sign(b"one more"), Err(Error::KeyExhausted));
         }
     }
 
@@ -572,29 +592,29 @@ mod tests {
     fn keys_and_signatures_are_stored_and_read() {
         let mut sk = key(5, 3);
         let pk = sk.public_key();
-        assert_eq!(PublicKey::from_bytes(&pk.to_bytes()), Some(pk));
+        assert_eq!(PublicKey::from_bytes(&pk.to_bytes()), Ok(pk));
         assert_eq!((PublicKey::SIZE, Signature::size(PLAIN_HEIGHT)), (49, 2312));
         let sig = sk.sign(b"first").unwrap();
         let bytes = sig.to_bytes();
         assert_eq!(bytes.len(), Signature::size(3));
-        assert_eq!(Signature::from_bytes(&bytes, 3), Some(sig));
-        assert_eq!(Signature::from_bytes(&bytes, 4), None);
-        assert_eq!(Signature::from_bytes(&bytes[1..], 3), None);
+        assert_eq!(Signature::from_bytes(&bytes, 3), Ok(sig));
+        assert!(Signature::from_bytes(&bytes, 4).is_err());
+        assert!(Signature::from_bytes(&bytes[1..], 3).is_err());
         // A stored key goes on from the leaf it was at.
         let mut again = SecretKey::from_bytes(&sk.to_bytes()).unwrap();
         assert_eq!((again.next_index(), again.public_key()), (1, pk));
         assert_eq!(again.sign(b"second"), sk.sign(b"second"));
         // Not a key: another length, no height, a leaf past the tree.
         let stored = sk.to_bytes();
-        assert!(SecretKey::from_bytes(&stored[1..]).is_none());
+        assert!(SecretKey::from_bytes(&stored[1..]).is_err());
         for (at, value) in [(SecretKey::SIZE - 1, 0), (SecretKey::SIZE - 1, 21), (OUT_LEN + PUB_SEED_LEN, 9)] {
             let mut bad = stored;
             bad[at] = value;
-            assert!(SecretKey::from_bytes(&bad).is_none());
+            assert!(SecretKey::from_bytes(&bad).is_err());
         }
         let mut bad = pk.to_bytes();
         bad[PublicKey::SIZE - 1] = 0;
-        assert!(PublicKey::from_bytes(&bad).is_none());
+        assert!(PublicKey::from_bytes(&bad).is_err());
     }
 
     #[test]

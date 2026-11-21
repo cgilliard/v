@@ -11,10 +11,10 @@
 //!   header names.
 //!
 //! A block's proof shows the work of the header *before* it
-//! ([`crate::block::root_into`]): a header's own work cannot be in the
+//! ([`crate::block_proof::root_into`]): a header's own work cannot be in the
 //! proof the header names. The chain's step finds that header to be the
 //! chain's: naming the id the chain was at, and stating what the
-//! chain's proof stated ([`crate::chain::step_into`]). Whether the
+//! chain's proof stated ([`crate::chain_proof::step_into`]). Whether the
 //! work's result meets a target is a node's to check, from the header
 //! and two hashes ([`crate::pow::result_from_mix`]).
 

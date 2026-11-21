@@ -1,6 +1,6 @@
 //! The chain's proof: one proof that every block so far was proven.
 //!
-//! A **step** verifies two proofs: a block's ([`crate::block`]) and the
+//! A **step** verifies two proofs: a block's ([`crate::block_proof`]) and the
 //! chain's as it was before that block, and states where the chain now
 //! is ([`Statement`]). The proof before a chain's first block is of a
 //! computation that states where a chain begins ([`genesis_into`]),
@@ -30,14 +30,14 @@
 //! # The emission
 //!
 //! A block's inputs and its subsidy come to its outputs
-//! ([`crate::block`]); the step finds the subsidy to be what the
+//! ([`crate::block_proof`]); the step finds the subsidy to be what the
 //! emission pays at the block's height. Its arithmetic has no numbers
 //! to count blocks with, so where the emission stands is carried as an
 //! era and a count of the blocks left in it, the count a power of a
 //! fixed element: a block fewer is a division by it.
 
 use crate::alg::{Alg, Shared, Sym, halves};
-use crate::block::{PROGRAMS, Tables};
+use crate::block_proof::{PROGRAMS, Tables};
 use crate::field::{F, as_bytes};
 use crate::hash::{DOM_PLAN_LEAF, DOM_PLAN_NODE, Digest, EMPTY, hash_domain};
 use crate::ledger::{self, Emission};
@@ -70,10 +70,12 @@ pub struct Statement {
     /// The id of the header before the last block's: the last header
     /// whose work a block's proof has shown. Zeros before the first.
     pub tip: Digest,
+    /// The last block's running hash of its operations on names.
+    pub ops: Digest,
 }
 
 /// Elements of a [`Statement`].
-pub const STATEMENT: usize = 18;
+pub const STATEMENT: usize = 20;
 
 /// What counts blocks down: a block fewer is this many times less.
 const COUNT: F = F(2);
@@ -158,8 +160,9 @@ impl Statement {
             sum_out: 0,
             era: 0,
             left: 0,
-            names: crate::name::empty_roots()[crate::name::HEIGHT],
+            names: crate::registry::empty_roots()[crate::registry::HEIGHT],
             tip: [0; 32],
+            ops: [0; 32],
         }
     }
 
@@ -174,21 +177,34 @@ impl Statement {
         out.push(if self.left == u32::MAX { F::ZERO } else { power(COUNT, self.left as u128) });
         out.extend(halves(&self.names));
         out.extend(halves(&self.tip));
+        out.extend(halves(&self.ops));
         out
+    }
+
+    /// The digest a proof of the statement has as its public value, and
+    /// a block's header names ([`crate::block::Header`]).
+    pub fn digest(&self) -> Digest {
+        crate::alg::statement(&self.elements())
+    }
+
+    /// The era of the emission a block at `height` is in (one past the
+    /// last once nothing is paid), and the blocks left in it after that
+    /// block.
+    pub fn era_at(emission: &Emission, height: u32) -> (u32, u32) {
+        let mut end = 0u64;
+        for (i, (blocks, _)) in emission.0.iter().enumerate() {
+            end += *blocks as u64;
+            if height as u64 <= end {
+                return (i as u32 + 1, (end - height as u64) as u32);
+            }
+        }
+        (emission.0.len() as u32 + 1, u32::MAX)
     }
 
     /// The statement after `block`, by the step of program `program`,
     /// under `emission`.
-    pub fn after(program: &Digest, block: &crate::block::Statement, emission: &Emission) -> Statement {
-        // The era of the block's height, and the blocks left in it.
-        let (mut era, mut left, mut end) = (emission.0.len() as u32 + 1, u32::MAX, 0u64);
-        for (i, (blocks, _)) in emission.0.iter().enumerate() {
-            end += *blocks as u64;
-            if block.height as u64 <= end {
-                (era, left) = (i as u32 + 1, (end - block.height as u64) as u32);
-                break;
-            }
-        }
+    pub fn after(program: &Digest, block: &crate::block_proof::Statement, emission: &Emission) -> Statement {
+        let (era, left) = Statement::era_at(emission, block.height);
         Statement {
             program: *program,
             height: block.height,
@@ -202,6 +218,7 @@ impl Statement {
             left,
             names: block.names[1],
             tip: crate::header::id_of(&block.work[0], &block.work[1], &block.work[2]),
+            ops: block.ops,
         }
     }
 }
@@ -364,9 +381,10 @@ pub fn step_into(
     let rest = halves(rest).map(|x| cx.input(x));
     let header = [p[16].clone(), p[17].clone(), of[2].clone(), of[3].clone(), rest[0].clone(), rest[1].clone()];
     let work_hash = cx.hashed(crate::hash::DOM_HEADER, &header);
-    assert!(work_hash[0].is(&st[21]) && work_hash[1].is(&st[22]));
-    let named: Vec<Sym> = work_hash.iter().chain(&st[23..27]).cloned().collect();
+    assert!(work_hash[0].is(&st[23]) && work_hash[1].is(&st[24]));
+    let named: Vec<Sym> = work_hash.iter().chain(&st[25..29]).cloned().collect();
     stated.extend(cx.hashed(crate::hash::DOM_BLOCK, &named));
+    stated.extend([st[21].clone(), st[22].clone()]);
     cx.state(&stated);
     Some(stated.iter().map(Sym::value).collect())
 }
@@ -375,7 +393,7 @@ pub fn step_into(
 mod tests {
     use super::*;
     use crate::alg::statement;
-    use crate::block::{Runs, Worked, root_into};
+    use crate::block_proof::{Runs, Worked, root_into};
     use crate::header::Header;
     use crate::ledger::{MAINNET_EMISSION, MEMO, Output, Outputs, Record, Transaction, key_hash};
     use crate::pcs::Params;
@@ -410,7 +428,7 @@ mod tests {
         state: &mut Outputs,
         height: u32,
         work: &(Proved, Vec<F>, Digest),
-    ) -> (Proved, Vec<F>, crate::block::Statement) {
+    ) -> (Proved, Vec<F>, crate::block_proof::Statement) {
         let pays = EMISSION.subsidy(height);
         let to = key_hash(&SecretKey::generate_with_height(&[7; 32], 1).public_key());
         let tx = Transaction {
@@ -423,8 +441,9 @@ mod tests {
         let set = crate::signed::empty_roots()[crate::signed::DEPTH];
         let start = Record::block(state, height, pays);
         let mut run = Run::new(&start, closed(), &set);
+        run.frontier(&state.frontier());
         run.head(&tx);
-        run.output(&tx.outputs[0], &to, &state.path(state.next));
+        run.output(&tx.outputs[0], &to);
         let mut record = start;
         record.apply(state, &tx).unwrap();
         let run = segment::prove(run, 512, params);
@@ -435,7 +454,7 @@ mod tests {
         assert!(proof.holds && proof.verifies());
         let digest = |x: &[F]| -> Digest { [x[0].0.to_le_bytes(), x[1].0.to_le_bytes()].concat().try_into().unwrap() };
         let work = [digest(&work.1[0..]), digest(&work.1[2..]), digest(&work.1[4..])];
-        (proof, stated, crate::block::Statement { work, ..crate::block::Statement::of(&record, pays, &set) })
+        (proof, stated, crate::block_proof::Statement { work, ..crate::block_proof::Statement::of(&record, pays, &set) })
     }
 
     #[test]
@@ -601,8 +620,9 @@ mod tests {
             let start = Record::block(state, height, pays);
             let t = Instant::now();
             let mut run = Run::new(&start, closed(), &set);
+            run.frontier(&state.frontier());
             run.head(&tx);
-            run.output(&tx.outputs[0], &to, &state.path(state.next));
+            run.output(&tx.outputs[0], &to);
             let run = segment::prove(run, 512, params);
             let (run_time, run_peak) = (t.elapsed(), peak());
             let mut record = start;
@@ -720,7 +740,7 @@ mod tests {
     #[test]
     #[ignore = "timing; run with --release --nocapture"]
     fn full_small_block_timing() {
-        use crate::block::{Beside, beside_into, root_with};
+        use crate::block_proof::{Beside, beside_into, root_with};
         use crate::ledger::Input;
         use crate::signature::{Signed, node_into, segment_into};
         use crate::signed;
@@ -768,7 +788,7 @@ mod tests {
         run.head(&made);
         let mut owned = Vec::new();
         for (i, output) in made.outputs.iter().enumerate() {
-            run.output(output, &hashes[i], &state.path(state.next));
+            run.output(output, &hashes[i]);
             let position = state.insert(output, 1);
             owned.push(Input {
                 key: keys[i].public_key(),
@@ -874,6 +894,8 @@ mod tests {
             let start = Record::block(&state, 2, subsidy);
             let mut local = state.clone();
             let mut run = Run::new(&start, closed(), &set);
+            let spent = txs.iter().flat_map(|tx| tx.inputs.iter().map(|i| i.position));
+            run.frontier(&state.frontier_without(spent));
             let mut record = start;
             let mut applied = state.clone();
             for (n, tx) in txs.iter().enumerate() {
@@ -886,10 +908,11 @@ mod tests {
                     run.input(input, &local.path(input.position), signatures[i].2.index, &(place as u64, siblings));
                     local.set(input.position, crate::hash::EMPTY);
                 }
+                // (What the run makes is in the root at its end: its
+                // paths are the tree's without.)
                 for output in &tx.outputs {
                     let to = if output.amount == 50 { &hashes[1] } else { &hashes[0] };
-                    run.output(output, to, &local.path(local.next));
-                    local.insert(output, 2);
+                    run.output(output, to);
                 }
                 record.apply(&mut applied, tx).unwrap();
             }
@@ -1029,8 +1052,9 @@ mod tests {
             };
             let start = Record::block(&state, 3, says);
             let mut run = Run::new(&start, closed(), &set);
+            run.frontier(&state.frontier());
             run.head(&tx);
-            run.output(&tx.outputs[0], &to, &state.path(state.next));
+            run.output(&tx.outputs[0], &to);
             let run = segment::prove(run, 512, params);
             let cx = Shared::new();
             root_into(&cx, &tables, &mut Direct, &Runs::One(&run), None, None, 3).unwrap();
@@ -1038,6 +1062,36 @@ mod tests {
         };
         assert!(root_holds(20, 20) && root_holds(50, 50));
         assert!(!root_holds(20, 50) && !root_holds(20, 19));
+        // Nor has one whose transactions carry an operation on a name
+        // that is not done, or that does one none carried: done after
+        // the transactions, they are the ones carried.
+        let named = |carried: bool, done: bool| {
+            let (commit, memo) = ([3; 32], [4; MEMO]);
+            let op = crate::registry::Op::Commit { commit, memo };
+            let tx = Transaction {
+                inputs: vec![],
+                outputs: vec![Output::to(&to, 20, [0; MEMO])],
+                ops: if carried { vec![op.clone()] } else { vec![] },
+                policy: vec![],
+                covered: 0,
+            };
+            let start = Record::block(&state, 3, 20);
+            let mut run = Run::new(&start, closed(), &set);
+            run.head(&tx);
+            run.output(&tx.outputs[0], &to);
+            if carried {
+                run.carried(&op.digest());
+            }
+            if done {
+                run.commit(&commit, &memo);
+            }
+            let run = segment::prove(run, 512, params);
+            let cx = Shared::new();
+            root_into(&cx, &tables, &mut Direct, &Runs::One(&run), None, None, 3).unwrap();
+            cx.finish().asm.finish(128).holds
+        };
+        assert!(named(true, true));
+        assert!(!named(true, false) && !named(false, true));
         // The schedule, as the step's arithmetic has it.
         let eras = Eras::of(&EMISSION);
         let pays: Vec<F> = (0..4).map(|e| at(&eras.pays, &F(e))).collect();

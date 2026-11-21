@@ -26,10 +26,12 @@
 //!
 //! # What ties a proof to a block
 //!
-//! A block lists the positions it spends and the outputs it makes, not
-//! its transactions. Two running hashes, of the positions and of the
-//! outputs in the block's order, are what a proof says it applied
-//! ([`Record`]), and a node computes the same from the block.
+//! A block lists the positions it spends, the outputs it makes and its
+//! operations on names, not its transactions. Running hashes of each,
+//! in the block's order, are what a proof says it applied ([`Record`]),
+//! and a node computes the same from the block. The operations are done
+//! after every transaction, so that nothing says which transaction one
+//! came with.
 //!
 //! Every hash here is one block of Blake3 in a domain of its own
 //! ([`crate::hash`]), so that a circuit pays one row for it.
@@ -38,7 +40,7 @@ use crate::hash::{
     DOM_BODY, DOM_BODY_IN, DOM_BODY_OP, DOM_BODY_OUT, DOM_COMMITMENT, DOM_INPUTS, DOM_OPS, DOM_OUT_ITEM, DOM_OUTPUTS,
     DOM_PUBKEY, DOM_STATE_LEAF, DOM_STATE_NODE, Digest, EMPTY, hash_domain,
 };
-use crate::name::{self, Names, Op};
+use crate::registry::{self, Names, Op};
 use crate::xmss::PublicKey;
 use std::collections::HashMap;
 
@@ -119,7 +121,7 @@ pub struct Transaction {
     pub outputs: Vec<Output>,
     pub ops: Vec<Op>,
     /// Inputs that spend policies' outputs, after the keys'.
-    pub policy: Vec<crate::policy::PolicyInput>,
+    pub policy: Vec<crate::conditions::PolicyInput>,
     /// How many of the outputs, from the first, policies' conditions
     /// are on ([`Transaction::cover`]).
     pub covered: u32,
@@ -144,7 +146,7 @@ impl Transaction {
     /// there are none.
     pub fn cover(&self) -> Option<(u32, Digest)> {
         let outputs = self.outputs.get(..self.covered as usize).filter(|o| !o.is_empty())?;
-        Some((self.covered, crate::policy::covered(outputs)))
+        Some((self.covered, crate::conditions::covered(outputs)))
     }
 
     /// The id: the hash every input's key signs.
@@ -179,14 +181,15 @@ pub fn inputs_next(so_far: &Digest, position: u64) -> Digest {
     absorb(DOM_INPUTS, so_far, &position_digest(position))
 }
 
-/// The running hash of what a block makes, an output more taken in.
+/// The running hash of the outputs a block makes, one more taken in.
 pub fn outputs_next(so_far: &Digest, output: &Output) -> Digest {
     absorb(DOM_OUTPUTS, so_far, &output.item())
 }
 
-/// The same running hash, an operation on names more taken in.
-pub fn ops_next(so_far: &Digest, op: &Op) -> Digest {
-    absorb(DOM_OPS, so_far, &op.digest())
+/// The running hash of a block's operations on names, one more taken
+/// in: by its hash.
+pub fn ops_next(so_far: &Digest, op: &Digest) -> Digest {
+    absorb(DOM_OPS, so_far, op)
 }
 
 /// A node of the state's tree.
@@ -235,6 +238,26 @@ impl Outputs {
     /// still there.
     pub fn made(&self, position: u64) -> Option<&(Output, u32)> {
         self.made.get(&position).filter(|(output, height)| self.leaf(position) == output.leaf(*height))
+    }
+
+    /// The nodes to the left of the next position's path, the lowest
+    /// first: the roots of the whole subtrees before it, which are all
+    /// that making outputs needs of the tree.
+    pub fn frontier(&self) -> Vec<Digest> {
+        (0..OUTPUTS_HEIGHT)
+            .filter(|level| self.next >> level & 1 == 1)
+            .map(|level| self.node(level, (self.next >> level) ^ 1))
+            .collect()
+    }
+
+    /// [`Outputs::frontier`] as it is once the outputs at `spent` are
+    /// gone.
+    pub fn frontier_without(&self, spent: impl IntoIterator<Item = u64>) -> Vec<Digest> {
+        let mut state = self.clone();
+        for position in spent {
+            state.set(position, EMPTY);
+        }
+        state.frontier()
     }
 
     /// The siblings of `position`'s path, the lowest first.
@@ -294,6 +317,11 @@ pub struct Record {
     pub height: u32,
     /// The registry's root before and after.
     pub names: [Digest; 2],
+    /// The running hash of the operations on names the transactions
+    /// carry, and of those done ([`Record::op`]): the same once a block
+    /// is whole.
+    pub ops: [Digest; 2],
+    pub done: [Digest; 2],
 }
 
 /// Why a transaction cannot be applied.
@@ -304,7 +332,7 @@ pub enum Refused {
     /// The state has no room for another output.
     Full,
     /// An operation on names that the names' rules refuse.
-    Name(name::Refused),
+    Name(registry::Refused),
     /// A policy's conditions do not hold (but for the signatures, which
     /// are not this module's to say).
     Policy,
@@ -362,7 +390,9 @@ impl Record {
             sum_in: 0,
             sum_out: 0,
             height,
-            names: [name::empty_roots()[name::HEIGHT]; 2],
+            names: [registry::empty_roots()[registry::HEIGHT]; 2],
+            ops: [EMPTY; 2],
+            done: [EMPTY; 2],
         }
     }
 
@@ -371,18 +401,12 @@ impl Record {
         Record { names: [names.root(); 2], ..self }
     }
 
-    /// Applies a transaction with no operation on names to `state` and
-    /// to the record.
+    /// Applies `tx` to the outputs and the record: its inputs emptied in
+    /// order, its outputs made. Its operations on names are taken into
+    /// the record's hash of them and no more: they are done after every
+    /// transaction of the block ([`Record::op`]). Whether the inputs'
+    /// keys signed is not this function's to say.
     pub fn apply(&mut self, state: &mut Outputs, tx: &Transaction) -> Result<(), Refused> {
-        assert!(tx.ops.is_empty(), "operations on names need the registry");
-        self.apply_with(state, &mut Names::default(), tx)
-    }
-
-    /// Applies `tx` to the outputs, the registry and the record: its
-    /// inputs emptied in order, its outputs made, then its operations.
-    /// Whether the inputs' keys signed, and an updated name's owner, is
-    /// not this function's to say.
-    pub fn apply_with(&mut self, state: &mut Outputs, names: &mut Names, tx: &Transaction) -> Result<(), Refused> {
         // Nothing is changed unless all of it can be: an output made in
         // this block is not there to spend.
         for (i, input) in tx.inputs.iter().enumerate() {
@@ -407,33 +431,8 @@ impl Record {
                 return Err(Refused::Policy);
             }
         }
-        let commits = tx.ops.iter().filter(|op| matches!(op, Op::Commit { .. })).count();
-        if (state.next + (tx.outputs.len() + commits) as u64) >> OUTPUTS_HEIGHT != 0 {
+        if (state.next + tx.outputs.len() as u64) >> OUTPUTS_HEIGHT != 0 {
             return Err(Refused::Full);
-        }
-        // The operations, each against the registry as the ones before
-        // leave it.
-        let mut trial = names.clone();
-        for op in &tx.ops {
-            match op {
-                Op::Commit { .. } => {}
-                Op::Reveal { record, salt, position } => {
-                    trial.can_reveal(record).map_err(Refused::Name)?;
-                    let commit = name::commit(&name::name_hash(&record.name), salt, &record.owner);
-                    let found =
-                        state.made(*position).filter(|(output, _)| output.commitment == commit && output.amount == 0);
-                    let (_, made) =
-                        found.filter(|_| *position < self.next[0]).ok_or(Refused::Name(name::Refused::NoCommitment))?;
-                    if !name::in_window(*made, self.height) {
-                        return Err(Refused::Name(name::Refused::Window));
-                    }
-                    trial.set(record.clone());
-                }
-                Op::Update { record } => {
-                    trial.can_update(record).map_err(Refused::Name)?;
-                    trial.set(record.clone());
-                }
-            }
         }
         for input in &tx.inputs {
             state.set(input.position, EMPTY);
@@ -451,30 +450,57 @@ impl Record {
             self.sum_out += output.amount as u128;
         }
         for op in &tx.ops {
-            match op {
-                Op::Commit { commit, memo } => {
-                    state.insert(&name::commit_output(commit, *memo), self.height);
-                }
-                Op::Reveal { position, .. } => {
-                    state.set(*position, EMPTY);
-                    self.inputs[1] = inputs_next(&self.inputs[1], *position);
-                }
-                Op::Update { .. } => {}
-            }
-            self.outputs[1] = ops_next(&self.outputs[1], op);
+            self.ops[1] = ops_next(&self.ops[1], &op.digest());
         }
-        *names = trial;
+        (self.root[1], self.next[1]) = (state.root(), state.next);
+        Ok(())
+    }
+
+    /// Does an operation on names, after the block's transactions and in
+    /// the order they carried them. A commitment becomes an output of
+    /// no amount at the next position; a reveal empties its
+    /// commitment's output and registers the name; an update replaces a
+    /// record. An updated name's owner having signed is not this
+    /// function's to say.
+    pub fn op(&mut self, state: &mut Outputs, names: &mut Names, op: &Op) -> Result<(), Refused> {
+        match op {
+            Op::Commit { commit, memo } => {
+                if (state.next + 1) >> OUTPUTS_HEIGHT != 0 {
+                    return Err(Refused::Full);
+                }
+                state.insert(&registry::commit_output(commit, *memo), self.height);
+            }
+            Op::Reveal { record, salt, position } => {
+                names.can_reveal(record).map_err(Refused::Name)?;
+                let commit = registry::commit(&registry::name_hash(&record.name), salt, &record.owner);
+                let found =
+                    state.made(*position).filter(|(output, _)| output.commitment == commit && output.amount == 0);
+                let (_, made) =
+                    found.filter(|_| *position < self.next[0]).ok_or(Refused::Name(registry::Refused::NoCommitment))?;
+                if !registry::in_window(*made, self.height) {
+                    return Err(Refused::Name(registry::Refused::Window));
+                }
+                names.set(record.clone());
+                state.set(*position, EMPTY);
+                self.inputs[1] = inputs_next(&self.inputs[1], *position);
+            }
+            Op::Update { record } => {
+                names.can_update(record).map_err(Refused::Name)?;
+                names.set(record.clone());
+            }
+        }
+        self.done[1] = ops_next(&self.done[1], &op.digest());
         (self.root[1], self.next[1], self.names[1]) = (state.root(), state.next, names.root());
         Ok(())
     }
 
     /// Sweeps the commitment at `position`: an output of no amount, made
-    /// more than [`name::MAX_REVEAL`] blocks ago and not revealed.
+    /// more than [`registry::MAX_REVEAL`] blocks ago and not revealed.
     pub fn sweep(&mut self, state: &mut Outputs, position: u64) -> Result<(), Refused> {
         let found = state.made(position).filter(|(output, _)| output.amount == 0 && position < self.next[0]);
         let (_, made) = found.ok_or(Refused::NotThere)?;
-        if self.height <= *made || self.height - *made <= name::MAX_REVEAL {
-            return Err(Refused::Name(name::Refused::Window));
+        if self.height <= *made || self.height - *made <= registry::MAX_REVEAL {
+            return Err(Refused::Name(registry::Refused::Window));
         }
         state.set(position, EMPTY);
         self.inputs[1] = inputs_next(&self.inputs[1], position);
