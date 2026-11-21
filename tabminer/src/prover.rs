@@ -1247,7 +1247,7 @@ pub(crate) mod tests {
         static SETUP: std::sync::OnceLock<Setup> = std::sync::OnceLock::new();
         let setup = SETUP.get_or_init(|| Setup::new(Level::SMALL, Emission(easy().emission), &*table()));
         let params = ChainParams { program: setup.own, ..easy() };
-        (setup, ChainParams { genesis_mix: params.genesis_work(&seed()), ..params })
+        (setup, ChainParams { genesis_mix: None, ..params })
     }
 
     /// The header of a block of `body` on the chain's last, its work
@@ -1504,7 +1504,7 @@ pub(crate) mod tests {
             program: parts.own,
             ..easy()
         };
-        let params = ChainParams { genesis_mix: params.genesis_work(&text), ..params };
+        let params = ChainParams { genesis_mix: None, ..params };
         let began = Instant::now();
         let setup = Setup::from_parts(Level::MAINNET, Emission(params.emission), &parts).unwrap();
         println!("the setup, from its file: {:.1?}", began.elapsed());

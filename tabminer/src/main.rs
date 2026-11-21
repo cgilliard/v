@@ -634,6 +634,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         }
     };
     params.program = parts.own;
+    // The network's first block: what every node of it must agree on.
+    let first = tabminer::hash::digest_to_bytes(&params.genesis().header.hash());
+    main.log(&format!("Genesis: {}", first.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let mut verifier = ChainVerifier::of(&proofs, &parts);
     if let Some(proving) = proving
         && SETUP.set(proving).is_err()

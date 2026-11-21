@@ -810,7 +810,7 @@ pub(crate) mod tests {
             pow: PowParams::DEV,
             genesis_timestamp: T0,
             genesis_nonce: [7; 32],
-            genesis_mix: EASY_MIX,
+            genesis_mix: Some(EASY_MIX),
             genesis_target: ChainParams::MAINNET.max_target,
             ..ChainParams::MAINNET
         }

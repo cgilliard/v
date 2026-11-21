@@ -29,6 +29,7 @@ use std::ops::{Add, AddAssign, Mul, MulAssign};
 pub struct F(pub u128);
 
 /// The modulus without its leading term: `x^7 + x^2 + x + 1`.
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
 const LOW: u128 = 0x87;
 
 impl F {

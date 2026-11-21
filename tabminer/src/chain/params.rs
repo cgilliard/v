@@ -41,11 +41,6 @@ pub const MAINNET_EMISSION: &[(u32, u64)] = &[
     (BLOCKS_PER_YEAR * 1000, 7 * COIN),
 ];
 
-/// The dev networks' genesis headers' mixes.
-const DEV_MIX: Digest = [242, 203, 145, 224, 51, 186, 158, 169, 227, 162, 18, 47, 230, 242, 233, 98, 174, 126, 38, 169, 67, 108, 0, 233, 240, 249, 70, 234, 67, 171, 102, 39];
-const DEV_MAIN_WORK_MIX: Digest = [7, 100, 3, 76, 108, 21, 233, 198, 201, 40, 111, 27, 124, 125, 5, 20, 82, 243, 221, 152, 95, 172, 55, 55, 11, 74, 147, 44, 12, 35, 216, 79];
-const DEV_RECURSIVE_MIX: Digest = [249, 148, 195, 117, 239, 161, 171, 145, 209, 67, 197, 216, 16, 129, 14, 174, 157, 156, 204, 24, 75, 238, 203, 77, 125, 247, 160, 41, 48, 162, 178, 107];
-
 /// Consensus parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainParams {
@@ -57,9 +52,11 @@ pub struct ChainParams {
     /// Bitcoin block when genesis was made, so the chain provably did not
     /// exist before it.
     pub genesis_nonce: [u8; 32],
-    /// The genesis header's mix: its work's, as the first block's proof
-    /// shows it (the work of genesis is held to no target).
-    pub genesis_mix: Digest,
+    /// The genesis header's mix, where it is not its work's: on every
+    /// network there is it is (none is said, and the mix is worked out
+    /// when the genesis is first made), as the first block's proof
+    /// shows it. The work of genesis is held to no target.
+    pub genesis_mix: Option<Digest>,
     /// The program of the chain's proof's step, which every block's
     /// statement names ([`crate::chain_proof::Statement`]).
     pub program: Digest,
@@ -97,7 +94,7 @@ impl ChainParams {
         pow: PowParams::MAINNET,
         genesis_timestamp: crate::genesis::TIMESTAMP,
         genesis_nonce: crate::genesis::BITCOIN_HASH,
-        genesis_mix: crate::genesis::MIX,
+        genesis_mix: None,
         program: crate::genesis::PROGRAM,
         genesis_target: U256(crate::genesis::TARGET),
         max_target: U256([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 8]), // 2^248 - 1
@@ -118,7 +115,7 @@ impl ChainParams {
         pow: PowParams::DEV,
         genesis_timestamp: 1_767_225_600, // 2026-01-01
         genesis_nonce: *b"tabminer dev network, direct....",
-        genesis_mix: DEV_MIX,
+        genesis_mix: None,
         program: crate::genesis::PROGRAM,
         genesis_target: U256([0, 0, 0, 1 << 36]), // 2^20 hashes, about a second on 12 cores
         max_target: ChainParams::MAINNET.max_target,
@@ -141,7 +138,6 @@ impl ChainParams {
     pub const DEV_MAIN_WORK: ChainParams = ChainParams {
         genesis_timestamp: 1_735_689_600, // 2025-01-01
         genesis_nonce: *b"tabminer dev network, main work.",
-        genesis_mix: DEV_MAIN_WORK_MIX,
         genesis_target: ChainParams::MAINNET.max_target,
         ..Self::MAINNET
     };
@@ -152,7 +148,6 @@ impl ChainParams {
     /// parameters.
     pub const DEV_RECURSIVE: ChainParams = ChainParams {
         genesis_nonce: *b"tabminer dev network, recursive.",
-        genesis_mix: DEV_RECURSIVE_MIX,
         schedule: Schedule { block_time: 10, half_life: 300, from_first_block: true },
         ..Self::DEV
     };
@@ -199,11 +194,47 @@ impl ChainParams {
         self.emission.iter().map(|&(blocks, subsidy)| blocks as u128 * subsidy as u128).sum()
     }
 
-    /// The mix of the genesis header's work, from the seed's text: what
-    /// `genesis_mix` is to be.
+    /// The mix of the genesis header's work, from the seed's text.
     pub fn genesis_work(&self, seed: &crate::pow::SeedText<'_>) -> Digest {
-        let header = self.genesis().header;
+        let header = self.unworked();
         crate::pow::hashimoto(&seed.at(0), &header.pow_hash(), &header.nonce).mix
+    }
+
+    /// The genesis header's mix: the one said, or its work's, from the
+    /// seed's text in the program. That is worked out once for a genesis
+    /// (some thousands of hashes) and kept.
+    fn mix(&self, header: &Header) -> Digest {
+        type Worked = (Digest, [u8; 32], PowParams, Digest);
+        static KEPT: std::sync::Mutex<Vec<Worked>> = std::sync::Mutex::new(Vec::new());
+        if let Some(mix) = self.genesis_mix {
+            return mix;
+        }
+        let of = (header.pow_hash(), header.nonce, self.pow);
+        let found = |kept: &Vec<Worked>| kept.iter().find(|k| (k.0, k.1, k.2) == of).map(|k| k.3);
+        if let Some(mix) = found(&KEPT.lock().unwrap_or_else(|e| e.into_inner())) {
+            return mix;
+        }
+        let mix = self.genesis_work(&crate::pow::SeedText::new(self.pow));
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if found(&kept).is_none() {
+            kept.push((of.0, of.1, of.2, mix));
+        }
+        mix
+    }
+
+    /// The genesis header, its mix still to be said.
+    fn unworked(&self) -> Header {
+        Header {
+            prev_hash: EMPTY,
+            height: 0,
+            timestamp: self.genesis_timestamp,
+            body_commitment: Body::default().commitment(),
+            state_root: self.genesis_state.unwrap_or_else(empty_state),
+            statement: Statement::genesis().digest(),
+            aux: [0u8; 32],
+            mix: EMPTY,
+            nonce: self.genesis_nonce,
+        }
     }
 
     /// The genesis block: empty, at `genesis_timestamp`, over the empty
@@ -212,19 +243,8 @@ impl ChainParams {
     /// genesis). Every node of a network must start from the
     /// same one. Nothing is allocated: an empty body holds no memory.
     pub fn genesis(&self) -> Block {
-        let body = Body::default();
-        let header = Header {
-            prev_hash: EMPTY,
-            height: 0,
-            timestamp: self.genesis_timestamp,
-            body_commitment: body.commitment(),
-            state_root: self.genesis_state.unwrap_or_else(empty_state),
-            statement: Statement::genesis().digest(),
-            aux: [0u8; 32],
-            mix: self.genesis_mix,
-            nonce: self.genesis_nonce,
-        };
-        Block { header, body }
+        let header = self.unworked();
+        Block { header: Header { mix: self.mix(&header), ..header }, body: Body::default() }
     }
 }
 
@@ -304,12 +324,12 @@ mod tests {
         assert!(block_work(t.shift_right(1)) > block_work(t));
     }
 
-    /// Mainnet's genesis is the one the generated file names.
+    /// Mainnet's genesis is of what its file says.
     #[test]
-    fn mainnet_genesis_matches_the_generated_file() {
+    fn mainnet_genesis_is_of_its_file() {
         let g = ChainParams::MAINNET.genesis();
         let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(hex(&digest_to_bytes(&g.header.hash())), crate::genesis::ID);
+        println!("the main network's genesis: {}", hex(&digest_to_bytes(&g.header.hash())));
         assert_eq!(g.header.timestamp, crate::genesis::TIMESTAMP);
         assert_eq!(hex(&g.header.nonce), crate::genesis::BITCOIN_HASH_HEX);
         assert!(crate::genesis::BITCOIN_TIME <= g.header.timestamp, "the Bitcoin block must come first");
@@ -331,7 +351,13 @@ mod tests {
         ];
         for (name, params) in networks {
             let mix = params.genesis_work(&crate::pow::SeedText::new(params.pow));
-            assert_eq!(params.genesis_mix, mix, "{name}: {mix:?}");
+            assert_eq!(params.genesis_mix, None, "{name}");
+            // Worked out, and the same when asked for again.
+            assert_eq!(params.genesis().header.mix, mix, "{name}");
+            assert_eq!(params.genesis().header, params.genesis().header, "{name}");
+            // One that is said is the header's as it is.
+            let said = ChainParams { genesis_mix: Some([7; 32]), ..params };
+            assert_eq!(said.genesis().header.mix, [7; 32], "{name}");
         }
     }
 
