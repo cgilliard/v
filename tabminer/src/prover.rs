@@ -373,10 +373,22 @@ pub const MAINNET_PROGRAM: Digest = {
     own
 };
 
+/// The dev networks' (`--network dev`, `dev-recursive`: those of the
+/// dev table), as the test that makes that setup writes them
+/// (`write_the_dev_networks_setup`).
+#[cfg(feature = "dev")]
+const DEV_PARTS: &[u8] = include_bytes!("../../resources/setup-dev.bin");
+
 impl Parts {
     /// The main network's: a node of it makes no setup.
     pub fn mainnet() -> Parts {
         Parts::from_bytes(MAINNET_PARTS).expect("the setup built in is whole")
+    }
+
+    /// The dev networks': at [`Level::SMALL`].
+    #[cfg(feature = "dev")]
+    pub fn dev() -> Parts {
+        Parts::from_bytes(DEV_PARTS).expect("the setup built in is whole")
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1655,5 +1667,20 @@ pub(crate) mod tests {
         assert_eq!(parts.own, ChainParams::MAINNET.program);
         assert_eq!(parts.shapes.len(), 1 + (level.trees + 1) * (level.runs.len() + level.joins));
         assert_eq!((parts.nodes.len(), parts.joins.len()), (level.trees, level.joins));
+    }
+
+    /// Makes the dev networks' setup and writes its numbers down: what
+    /// a program built with the dev feature has built in. A change to a
+    /// circuit changes the file, and the file kept is to be the one
+    /// this writes.
+    #[test]
+    #[ignore = "makes the dev networks' setup; run with --release"]
+    fn write_the_dev_networks_setup() {
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::DEV);
+        let setup = Setup::new(Level::SMALL, Emission(ChainParams::DEV.emission), &text.at(0));
+        assert_eq!(ChainParams::DEV.emission, ChainParams::DEV_RECURSIVE.emission);
+        let parts = setup.parts();
+        std::fs::write("../resources/setup-dev.bin", parts.to_bytes()).unwrap();
+        assert!(Parts::from_bytes(&parts.to_bytes()).as_ref() == Some(&parts));
     }
 }

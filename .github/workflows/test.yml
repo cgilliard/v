@@ -111,10 +111,12 @@ jobs:
         run: ./tools/ignored.sh
 
   # The slow tests: those marked #[ignore] that are not benchmarks, a job
-  # each, in a release build. The one there is makes two blocks with the
-  # main network's setup as the program has it built in, and has a chain
-  # take them: a change to a circuit fails it until the setup is made
-  # again (setup.yml).
+  # each, in a release build. One makes two blocks with the main
+  # network's setup as the program has it built in, and has a chain take
+  # them: a change to a circuit fails it until the setup is made again
+  # (setup.yml). The other makes the dev networks' setup, which is a
+  # file of the repository (resources/setup-dev.bin): the file kept must
+  # be the one it writes.
   slow:
     name: slow (${{ matrix.test }})
     runs-on: ubuntu-latest
@@ -125,6 +127,7 @@ jobs:
         test:
           # slow-tests:begin
           - prover::tests::main_network_block_timing
+          - prover::tests::write_the_dev_networks_setup
           # slow-tests:end
     defaults:
       run:

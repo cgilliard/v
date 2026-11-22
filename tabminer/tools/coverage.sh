@@ -60,14 +60,18 @@ export TABMINER_FUZZ_ITERS="${TABMINER_FUZZ_ITERS:-500}"
 # there are cores, each running its share one at a time with the crate's
 # own worker threads held to one: a process has its own counters.
 #
-# The tests that prove whole blocks (the prover's and the miner's) share
-# one setup, minutes of proving, where they are one process: they are
-# one, apart from the rest, with the crate's threads its own.
+# The tests that prove whole blocks on a chain (the prover's and the
+# miner's) are left out: they begin with a setup, minutes of proving on
+# every core, and instrumented, with threads that take the counters
+# from each other or with one thread, they are hours. The release job
+# runs them; the lines they alone reach (in prover.rs and miner.rs)
+# are counted as missed here.
 #
 # The second build differs from the first only in the files that have two
 # paths (field.rs and blake3.rs), so it runs only the tests that reach
 # those: the whole suite twice is twice the time for the same lines.
-cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+# (COVERAGE_PROCESSES: fewer, where the machine has other work.)
+cores=${COVERAGE_PROCESSES:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 # The tests that are ignored in every build.
 never=$( { sed -n '/^BENCHES=(/,/^)/p' tools/bench.sh | sed -n 's/^ \+\([a-z0-9_:]\+\)$/\1/p'
            sed -n 's/^AFTER=\([a-z0-9_:]\+\)$/\1/p' tools/bench.sh
@@ -85,31 +89,25 @@ for cpu in $variants; do
     # does not know, and fail).
     built=$(cargo test --locked --target-dir "$out/$cpu" --no-run --message-format=json \
         | grep '"executable":"[^"]')
-    for binary in $(echo "$built" | grep -v '"profile":{[^}]*"test":true' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4); do
+    others=$(echo "$built" | grep -v '"profile":{[^}]*"test":true' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 || true)
+    for binary in $others; do
         objects="$objects --object=$binary"
     done
     binaries=$(echo "$built" | grep '"profile":{[^}]*"test":true' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4)
     for binary in $binaries; do
         objects="$objects --object=$binary"
         # Every test, the ignored among them, but those never run here.
-        "$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p' | grep -vxF "$never" > "$out/all.txt"
+        # (A binary may have no test at all: the node's own has none.)
+        "$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p' | grep -vxF "$never" > "$out/all.txt" || true
         if [ "$cpu" = native ]; then
             grep -vE "$heavy" "$out/all.txt" > "$out/tests.txt" || true
-            grep -E "$heavy" "$out/all.txt" > "$out/heavy.txt" || true
         else
             grep -E '^(field|blake3|merkle|hash)::' "$out/all.txt" > "$out/tests.txt" || true
-            : > "$out/heavy.txt"
         fi
         total=$(wc -l < "$out/tests.txt")
         [ "$total" -gt 0 ] || continue
         echo "$binary: $total tests in $cores processes"
         pids=""
-        if [ -s "$out/heavy.txt" ]; then
-            echo "$binary: $(wc -l < "$out/heavy.txt") tests that prove blocks, in one process"
-            # shellcheck disable=SC2046
-            "$binary" --include-ignored --test-threads=1 --exact $(cat "$out/heavy.txt") > "$out/shard.heavy.log" 2>&1 &
-            pids="$pids $!"
-        fi
         for k in $(seq 0 $((cores - 1))); do
             # Every cores-th test from the k-th: neighbours, which are of
             # one module and cost alike, go to different processes.

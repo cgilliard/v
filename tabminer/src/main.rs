@@ -615,6 +615,8 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // (The main network's are built in.)
     let read = match c.network {
         Network::Mainnet => Some(tabminer::prover::Parts::mainnet()),
+        #[cfg(feature = "dev")]
+        Network::Dev | Network::DevRecursive => Some(tabminer::prover::Parts::dev()),
         _ => std::fs::read(&kept).ok().and_then(|bytes| tabminer::prover::Parts::from_bytes(&bytes)),
     };
     let again = read.as_ref().filter(|_| c.mine).and_then(|parts| Setup::from_parts(proofs, emission, parts));
@@ -634,9 +636,6 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         }
     };
     params.program = parts.own;
-    // The network's first block: what every node of it must agree on.
-    let first = tabminer::hash::digest_to_bytes(&params.genesis().header.hash());
-    main.log(&format!("Genesis: {}", first.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let mut verifier = ChainVerifier::of(&proofs, &parts);
     if let Some(proving) = proving
         && SETUP.set(proving).is_err()
@@ -779,7 +778,10 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
 
     // Everything is open: from here the node can do what it is for.
     let _stats_log = StatsLog::start(stat_log, Arc::clone(&stats), c.stats).map_err(threads)?;
-    c.announce(&main);
+    // (With the network's first block: what every node of it must
+    // agree on.)
+    let first = tabminer::hash::digest_to_bytes(&params.genesis().header.hash());
+    c.announce_with(&main, &[("Genesis", tabminer::configuration::hex(&first))]);
     Configuration::ready(&main);
     // A wallet just made: its words, said here, after everything else
     // the node says as it starts, where whoever is at the terminal

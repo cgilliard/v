@@ -1097,7 +1097,16 @@ impl Configuration {
     /// -----------------------------------------------------------------
     /// ```
     pub fn announce(&self, main: &Logger) {
-        let lines = self.lines();
+        self.announce_with(main, &[])
+    }
+
+    /// [`Configuration::announce`], with `more` said after the network:
+    /// what is not configured but follows from it (the id of the
+    /// network's first block).
+    pub fn announce_with(&self, main: &Logger, more: &[(&str, String)]) {
+        let mut lines = self.lines();
+        let after = lines.iter().position(|(name, _)| name == "Network").map_or(lines.len(), |i| i + 1);
+        lines.splice(after..after, more.iter().map(|(name, value)| (name.to_string(), value.clone())));
         let wide = lines.iter().map(|(name, _)| name.chars().count()).max().unwrap_or(0) + 2;
         main.log_all(&format!("Server started {}", crate::logger::Moment::of(main.now()).started()));
         main.log_all_no_header(&RULE);
