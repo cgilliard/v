@@ -46,6 +46,9 @@ export LLVM_PROFILE_FILE="$PWD/$out/prof/%p-%m.profraw"
 # of their iterations: they reach their lines in the first few hundred,
 # and the test jobs run them in full.
 #
+# (Built with the dev feature: the dev networks, where the program's
+# tests run nodes whose blocks are unproven, in moments.)
+#
 # What is measured is the tests of a debug build: the unit tests. The
 # tests that prove blocks, which a debug build leaves to the release
 # job, are not run here: they are minutes each, and what only they
@@ -75,7 +78,7 @@ for cpu in $variants; do
     # (its lines are counted too, but it is no test binary, and is not
     # asked for a list of tests: it would take that for an option it
     # does not know, and fail).
-    built=$(cargo test --locked --target-dir "$out/$cpu" --no-run --message-format=json \
+    built=$(cargo test --locked --features dev --target-dir "$out/$cpu" --no-run --message-format=json \
         | grep '"executable":"[^"]')
     others=$(echo "$built" | grep -v '"profile":{[^}]*"test":true' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4 || true)
     for binary in $others; do

@@ -1196,3 +1196,132 @@ fn a_wallet_is_paid_by_a_name_under_a_name() {
     drop(relay);
     dirs.iter().for_each(|d| drop(std::fs::remove_dir_all(d)));
 }
+
+/// A node whose blocks' proofs go unchecked, and are not made
+/// (`--debug-no-validate-proofs`): for what a node does with blocks,
+/// tried in moments. Ended with the test, and its directory removed.
+#[cfg(all(unix, feature = "dev"))]
+struct Unchecked {
+    node: Running,
+    dir: PathBuf,
+    listen: String,
+}
+
+#[cfg(all(unix, feature = "dev"))]
+impl Drop for Unchecked {
+    fn drop(&mut self) {
+        let _ = self.node.0.kill();
+        let _ = self.node.0.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(all(unix, feature = "dev"))]
+impl Unchecked {
+    fn start(network: &str, name: &str, port: u32, args: &[&str]) -> Unchecked {
+        let dir = scratch(name);
+        let listen = format!("127.0.0.1:{port}");
+        let node = Command::new(TABMINER)
+            .args(["--network", network, "--debug-no-validate-proofs", "--no-prompt"])
+            .args(["--stat-interval-seconds", "1", "--stat-summary-seconds", "2"])
+            .args(["--data-dir", &dir.display().to_string(), "--listen", &listen])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Unchecked { node: Running(node), dir, listen }
+    }
+
+    /// The lines of its main log that have `text` in them.
+    fn lines(&self, text: &str) -> Vec<String> {
+        let log = std::fs::read_to_string(self.dir.join("tabernacle.log")).unwrap_or_default();
+        log.lines().filter(|l| l.contains(text)).map(str::to_string).collect()
+    }
+
+    /// Waits until its log has `count` lines with `text` in them, and
+    /// gives them: the test fails if ten minutes pass first, or the
+    /// node ends, or says of anything that it is an error.
+    fn wait(&mut self, text: &str, count: usize) -> Vec<String> {
+        let began = std::time::Instant::now();
+        loop {
+            let lines = self.lines(text);
+            if lines.len() >= count {
+                return lines;
+            }
+            let wrong: Vec<String> = self.lines("Error: ").into_iter().chain(self.lines("Refused block")).collect();
+            assert!(wrong.is_empty(), "{wrong:?}");
+            if let Some(ended) = self.node.0.try_wait().unwrap() {
+                panic!("the node ended ({ended}) before its log said '{text}' {count} times");
+            }
+            let all = std::fs::read_to_string(self.dir.join("tabernacle.log")).unwrap_or_default();
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(600),
+                "'{text}' {} of {count}: {all}",
+                lines.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// A node begun with a state nobody made fills its blocks with what
+/// nobody sent, and a new node takes the state from it and the blocks
+/// after: the blocks unproven, so in moments. What a node does with a
+/// block and with a state is the same whoever proved the block.
+#[cfg(all(unix, feature = "dev"))]
+#[test]
+fn blocks_filled_and_unproven_are_made_and_taken() {
+    let port = 23_000 + std::process::id() % 9_000;
+    // (Blocks kept for two back, and a state taken as of the block
+    // under the last: with five blocks made the first can no longer be
+    // had, and a new node must take the state.)
+    let kept = ["--max-undo-blocks", "2", "--sync-point", "1", "--no-seeds"];
+    let fill = ["--debug-fill-outputs", "2000,5", "--debug-fill", "200,200", "--blocks", "5"];
+    let mut server = Unchecked::start("dev", "filled-server", port, &[&kept[..], &fill[..]].concat());
+    server.wait("Server is ready!", 1);
+    let built = server.wait("debug fill: block ", 5);
+    assert!(built[0].contains("block 1: 200 outputs, 200 spends, "), "{built:?}");
+    server.wait("applied in ", 5);
+    let last = server.wait("Won block 5 (", 1).pop().unwrap();
+    let id = &last[last.find('(').unwrap()..last.find(')').unwrap()];
+    // A new node of that chain, with its first block and none of its
+    // outputs.
+    let join = ["--no-mine", "--no-wallet", "--debug-genesis-outputs", "2000,5", "--peer", &server.listen];
+    let mut new = Unchecked::start("dev", "filled-new", port + 1, &[&kept[..], &join[..]].concat());
+    new.wait("Server is ready!", 1);
+    new.wait("Taking the state as of block 4 ", 1);
+    new.wait("State taken as of block 4", 1);
+    new.wait("Synced at block 5", 1);
+    assert_eq!(new.lines(&format!("Received block 5 {id}")).len(), 1, "the two are on one block");
+    // It makes no block above the height it was told, and says how it
+    // stands as it goes.
+    assert_eq!(server.lines("Won block ").len(), 5);
+    let stats = std::fs::read_to_string(server.dir.join("stat.log")).unwrap();
+    assert!(stats.contains("AvgLatency(us)"), "{stats}");
+}
+
+/// A chain of empty blocks made beforehand, some hundreds long, on the
+/// network with the main network's work: a new node takes its headers,
+/// then its state as of a block under its last, then the blocks after.
+#[cfg(all(unix, feature = "dev"))]
+#[test]
+fn a_chain_made_beforehand_is_taken_by_its_headers() {
+    let port = 32_100 + std::process::id() % 2_800;
+    let kept = ["--max-undo-blocks", "8", "--sync-point", "4", "--no-seeds"];
+    let made = ["--no-mine", "--debug-blocks", "300"];
+    let mut server = Unchecked::start("dev-main-work", "headers-server", port, &[&kept[..], &made[..]].concat());
+    server.wait("debug: a chain of 300 blocks ready in ", 1);
+    server.wait("Server is ready!", 1);
+    let join = ["--no-mine", "--no-wallet", "--peer", &server.listen];
+    let mut new = Unchecked::start("dev-main-work", "headers-new", port + 1, &[&kept[..], &join[..]].concat());
+    new.wait("Server is ready!", 1);
+    new.wait("Headers synced to 300", 1);
+    let taking = new.wait("Taking the state as of block 296 ", 1);
+    assert_eq!(taking.len(), 1, "{taking:?}");
+    new.wait("State taken as of block 296", 1);
+    new.wait("Synced at block 300", 1);
+    // (The data directory of blocks nobody checked says so, for good.)
+    assert!(new.dir.join("unchecked").exists());
+}
