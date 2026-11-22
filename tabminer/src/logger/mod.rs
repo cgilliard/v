@@ -230,9 +230,29 @@ impl Logger {
             terminal: AtomicBool::new(true),
             on_rotate: None,
         };
+        logger.recover();
         let now = (logger.clock)();
         logger.begin(&mut logger.lock(), now)?;
         Ok(logger)
+    }
+
+    /// What a run that stopped between the two steps of putting a
+    /// file aside left: the lines under the name they were held by,
+    /// and beside them a file of the name they were to have, empty or
+    /// part written. The lines are given that name, without their
+    /// first line.
+    fn recover(&self) {
+        let Some(name) = self.path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { return };
+        let Ok(entries) = self.path.parent().map_or_else(|| std::fs::read_dir("."), std::fs::read_dir) else { return };
+        for entry in entries.flatten() {
+            let held = entry.path();
+            let Some(file) = held.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+            if let Some(aside) = file.strip_suffix(".moving").filter(|aside| aside.starts_with(&name)) {
+                let aside = held.with_file_name(aside);
+                let _ = std::fs::remove_file(&aside);
+                let _ = std::fs::rename(&held, &aside);
+            }
+        }
     }
 
     /// Opens the file to be written to, at `now`: added to if it is
@@ -735,6 +755,28 @@ mod tests {
         let aside = main.rotate().unwrap();
         assert_eq!(dir.read("main.log"), "");
         assert!(std::fs::read_to_string(aside).unwrap().starts_with("main.log_10_17_2026_19_49_31\n["));
+    }
+
+    /// A run that stopped while a file was being put aside left its
+    /// lines under the name they were held by: the next run gives them
+    /// the name they were to have, and that name is not avoided for
+    /// ever. Another log's are left alone.
+    #[test]
+    fn what_was_left_half_put_aside_is_finished() {
+        let dir = Dir::new("left");
+        let write = |name: &str, lines: &str| std::fs::write(dir.0.join(name), lines).unwrap();
+        write("request.log", "three\n");
+        write("request_R_10_17_2026_19_49.log", "request.log_10_17");
+        write("request_R_10_17_2026_19_49.log.moving", "one\ntwo\n");
+        write("stat_R_10_17_2026_19_49.log.moving", "theirs\n");
+        let (_, clock) = clock(T);
+        let log = Logger::with_clock(dir.0.join("request.log"), Rotation::default(), clock).unwrap();
+        let theirs = "stat_R_10_17_2026_19_49.log.moving";
+        assert_eq!(dir.files(), ["request.log", "request_R_10_17_2026_19_49.log", theirs]);
+        assert_eq!(dir.read("request_R_10_17_2026_19_49.log"), "one\ntwo\n");
+        // (And what is put aside in the same minute has the next name.)
+        assert!(log.rotate().is_some());
+        assert_eq!(dir.read("request_R_10_17_2026_19_49_02.log"), "request.log_10_17_2026_19_49_31\nthree\n");
     }
 
     #[test]

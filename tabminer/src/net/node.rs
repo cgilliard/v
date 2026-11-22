@@ -162,6 +162,10 @@ const SERVED_MOST: usize = 256;
 /// made in a second: for one host, and for all. Each is made by reading
 /// back through every block since; whoever takes a state asks for one,
 /// and for thousands of its parts.
+/// Rounds of asking every peer that says it has a state, and getting
+/// it from none, after which a node that could take blocks instead
+/// does ([`Worker::sync_state`]).
+const FAR_ROUNDS: u32 = 3;
 const PASTS_EACH: usize = 2;
 const PASTS: usize = 8;
 /// Chunks sent in one go before the node looks to what else there is.
@@ -605,6 +609,9 @@ pub(crate) struct List {
     /// the chain cannot undo so far ([`Chain::cut_off`]): looked into
     /// before blocks are asked for, until it is so no longer.
     cut: bool,
+    /// The best header whose work was last confirmed while its block
+    /// was waited for ([`Worker::begin_join`]).
+    waited: Option<Digest>,
 }
 
 impl List {
@@ -625,6 +632,7 @@ impl List {
             syncing: false,
             confirming: false,
             cut: false,
+            waited: None,
         }
     }
 }
@@ -689,6 +697,16 @@ enum Notice {
 }
 
 /// What the workers of a node share besides the list.
+/// The states as of blocks before the last that were lately asked for
+/// ([`Shared::pasts`]).
+#[derive(Default)]
+struct Pasts {
+    /// The blocks, the latest asked for first.
+    of: VecDeque<Digest>,
+    /// Who asked for the state as of another, and when.
+    asked: VecDeque<(std::net::Ipv4Addr, Micros)>,
+}
+
 pub(crate) struct Shared {
     /// What is left for each worker by the others.
     mail: Vec<Mutex<Vec<Notice>>>,
@@ -778,6 +796,10 @@ pub(crate) struct Shared {
     /// Told whenever the chain has a new last block (`blocks` counts
     /// them): for whoever waits for that.
     moved: (Mutex<()>, std::sync::Condvar),
+    /// The blocks whose states were last asked for, and who asked for
+    /// the state as of another, when ([`PASTS`]). Of all the workers:
+    /// the states kept made are the chain's, a few for all of them.
+    pasts: Mutex<Pasts>,
     /// The transactions waiting to be mined. (Taken after the chain's
     /// state, by whoever takes both.)
     pool: Mutex<Mempool>,
@@ -1083,10 +1105,6 @@ pub struct Worker<B: Backend + 'static, V> {
     serve: Serve,
     /// Objects lately made to be served, the latest first.
     served: VecDeque<(Object, Arc<Vec<u8>>)>,
-    /// The blocks whose states were last asked for, and who asked for
-    /// the state as of another, when ([`PASTS`]).
-    past_of: VecDeque<Digest>,
-    pasts: VecDeque<(std::net::Ipv4Addr, Micros)>,
     /// The object last asked for could not be read, which is not to say
     /// there is none.
     unread: std::cell::Cell<bool>,
@@ -1200,8 +1218,6 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             unix: 0,
             due: now,
             served: VecDeque::new(),
-            past_of: VecDeque::new(),
-            pasts: VecDeque::new(),
             unread: std::cell::Cell::new(false),
             fetches: Vec::new(),
             was_live: Vec::new(),
@@ -1317,7 +1333,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     let l = &mut *write(&list);
                     self.fetch_headers(l, now);
                     self.sync_blocks(l, now);
-                    self.sync_state(l, now);
+                    self.advance_join(l, now);
                 }
                 other => self.told(now, other),
             }
@@ -2844,7 +2860,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let l = &mut *write(&list);
         self.sync_headers(l, now, out);
         self.sync_blocks(l, now);
-        self.sync_state(l, now);
+        self.advance_join(l, now);
     }
 
     /// Takes a datagram that arrived from `from`, and says what it was
@@ -3973,6 +3989,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                             l.fetching.retain(|f| !of_state(&f.0));
                             self.join_failed(l, now);
                         }
+                    } else {
+                        // (What was confirmed was not what is being
+                        // taken now, which waited for it to be done.)
+                        self.advance_join(l, now);
                     }
                 }
                 Outcome::Checked { target, result } => self.state_block_checked(l, now, target, result),
@@ -4113,6 +4133,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
             self.shared.moved.1.notify_all();
         }
+        // (A state that waited for this block to be done with before
+        // it began to be received goes on.)
+        if l.join.is_some() && l.applying.is_empty() {
+            self.advance_join(l, now);
+        }
         self.sync_blocks(l, now);
     }
 
@@ -4194,6 +4219,18 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     join.again = None;
                     join.rounds += 1;
                 }
+            }
+            // A state taken though blocks could be had, which those
+            // that say they have it do not give, round after round: it
+            // is let be for a while, and blocks are taken meanwhile.
+            // (Not once the state here is given up for it; nor where
+            // the chain cannot go on by blocks at all.)
+            if join.far && !join.begun && !join.beginning && join.rounds >= FAR_ROUNDS && !l.cut {
+                l.join = None;
+                self.fetches.retain(|f| !of_state(&f.object));
+                l.fetching.retain(|f| !of_state(&f.0));
+                l.rejoin = (now.saturating_add(self.cfg.sync.pass_over), l.rejoin.1.saturating_add(1));
+                return;
             }
         }
         // What is wanted now, in order of need.
@@ -4366,8 +4403,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // (And the work of what it waits for is checked in full, if
             // any of it was left to a proof: headers that are nobody's
             // work are the best no longer.)
-            if !l.confirming {
-                l.confirming = true;
+            // (Once for a header: asked again at every turn and by
+            // every worker told of the answer, it would be all the
+            // node did while the block is not to be had.)
+            if !l.confirming && l.waited != Some(best.hash()) {
+                (l.confirming, l.waited) = (true, Some(best.hash()));
                 self.work(l, Job::Confirm { best, from: height.saturating_add(1), target: None });
             }
             return false;
@@ -4466,7 +4506,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         self.advance_join(l, now);
     }
 
-    /// The steps of taking a state that follow from what is in hand.
+    /// The next step of the state being taken that waits for nothing,
+    /// given to whoever does what takes time; and what is still wanted
+    /// of it asked for ([`Worker::sync_state`]). Asked at every turn,
+    /// and whenever something it waited for is done: each step is
+    /// begun once, and none is left for an arrival that may never come.
     fn advance_join(&mut self, l: &mut List, now: Micros) {
         // The work of the headers from its block on, in full: no proof
         // to come vouches for it.
@@ -4477,7 +4521,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             self.work(l, Job::Confirm { best, from, target: Some(id) });
         }
         let Some(join) = l.join.as_mut() else {
-            return;
+            return self.sync_state(l, now);
         };
         // The block and the top of its state: the block's proof, held to
         // where the manifest says its outputs end.
@@ -4781,12 +4825,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut wake = Micros::MAX;
         let mut ranges = Ranges::new();
         let mut name = [0u8; MAX_NAME];
+        // (How fast everything comes together, and the fastest of it:
+        // many fetches at once over a slow way in are each slow, and
+        // no peer's fault.)
+        let rates = self.fetches.iter().map(|f| f.fetch.rate(now));
+        let (together, fastest) = rates.fold((0u64, 0u64), |(sum, most), r| (sum.saturating_add(r), most.max(r)));
         let mut i = 0;
         while i < self.fetches.len() {
             let (object, from) = (self.fetches[i].object, self.fetches[i].from);
             // What is fetched for the chain, and comes too slowly, is
             // given up as if nothing had come: asked of another, and
-            // this peer passed over.
+            // this peer passed over. Too slowly for the way in: under
+            // the least asked, and either another comes four times as
+            // fast or all of them together come under that least.
             let slow = {
                 let (rate, grace) = (self.cfg.sync.fetch_rate, self.cfg.sync.fetch_grace);
                 let fetch = &self.fetches[i].fetch;
@@ -4799,7 +4850,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         | Object::Part { .. }
                         | Object::Names { .. }
                 );
-                of_chain && rate > 0 && fetch.age(now) >= grace && fetch.rate(now) < rate
+                let own = fetch.rate(now);
+                let behind = own.saturating_mul(4) < fastest || together < rate;
+                of_chain && rate > 0 && fetch.age(now) >= grace && own < rate && behind
             };
             if slow {
                 let l = &mut **held.get_or_insert_with(|| write(&list));
@@ -4880,21 +4933,26 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         | Object::Names { block, .. },
                     ) = object
                     {
-                        match self.past_of.iter().position(|b| *b == block) {
-                            Some(at) => self.past_of.swap(0, at),
+                        let mut pasts = self.shared.pasts.lock().unwrap_or_else(|e| e.into_inner());
+                        let Pasts { of, asked } = &mut *pasts;
+                        match of.iter().position(|b| *b == block) {
+                            Some(at) => of.swap(0, at),
                             None => {
-                                self.pasts.retain(|p| now.saturating_sub(p.1) < crate::transport::SECOND);
-                                let own = self.pasts.iter().filter(|p| p.0 == *to.ip()).count();
-                                if !to.ip().is_loopback() && (own >= PASTS_EACH || self.pasts.len() >= PASTS) {
+                                asked.retain(|p| now.saturating_sub(p.1) < crate::transport::SECOND);
+                                let own = asked.iter().filter(|p| p.0 == *to.ip()).count();
+                                if !to.ip().is_loopback() && (own >= PASTS_EACH || asked.len() >= PASTS) {
+                                    drop(pasts);
                                     self.serve.cancel(x.to, x.transfer);
                                     continue;
                                 }
-                                self.pasts.push_back((*to.ip(), now));
-                                self.past_of.push_front(block);
-                                self.past_of.truncate(crate::store::state::PASTS_KEPT);
+                                asked.push_back((*to.ip(), now));
+                                of.push_front(block);
+                                of.truncate(crate::store::state::PASTS_KEPT);
                             }
                         }
                     }
+                    // (A name that is no object's was not looked for.)
+                    self.unread.set(false);
                     let bytes = object.and_then(|o| self.object(&o));
                     if bytes.is_none() && self.unread.get() {
                         self.serve.cancel(x.to, x.transfer);
@@ -5114,6 +5172,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
             moved: (Mutex::new(()), std::sync::Condvar::new()),
+            pasts: Mutex::default(),
             pool: Mutex::new(Mempool::with_policy(cfg.pool, cfg.policy)),
             told: RwLock::new(None),
             #[cfg(test)]

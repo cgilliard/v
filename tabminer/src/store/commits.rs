@@ -98,13 +98,21 @@ impl Tree for ByPosition {
     }
 }
 
-/// By the first bits of a commit's hash: the hash, to tell it from
-/// another with the same, and the position.
+/// By the first bits of a commit's hash and then its position: the
+/// hash, to tell it from another with the same bits, and the position.
+/// A commit made more than once is as many entries, one after another,
+/// and each is put and taken out by itself.
 struct ByHash;
 
-/// Set in the position a hash leads to: the commit was made more than
-/// once. (No position is so high: [`crate::output::OUTPUT_CAPACITY`].)
-const TWICE: u64 = 1 << 63;
+/// Bits of a position: no output is at one so high
+/// ([`crate::output::OUTPUT_CAPACITY`]).
+const POSITION_BITS: u32 = 41;
+const _: () = assert!(crate::output::OUTPUT_CAPACITY <= 1 << POSITION_BITS);
+
+/// Where the commit of `hash` at `position` is by its hash.
+fn place(hash: &Digest, position: u64) -> u128 {
+    key_of(hash) >> POSITION_BITS << POSITION_BITS | position as u128
+}
 
 impl Tree for ByHash {
     const HEIGHT: u32 = 128;
@@ -190,10 +198,21 @@ impl Commits {
         Ok(trie::get::<ByPosition>(pages, self.by_position, position as u128)?.map(|c| c.0))
     }
 
-    /// The position of the commit of hash `hash`.
+    /// The position of the commit of hash `hash`: the lowest, of one
+    /// made more than once.
     pub fn position_of(&self, pages: &impl ReadPages, hash: &Digest) -> io::Result<Option<u64>> {
-        let found = trie::get::<ByHash>(pages, self.by_hash, key_of(hash))?;
-        Ok(found.filter(|(r, _)| r.0 == *hash).map(|(r, _)| r.1 & !TWICE))
+        let mut at = place(hash, 0);
+        // (Past those of other hashes with the same first bits, which
+        // nobody finds two of without the work of a chain.)
+        while let Some(key) = trie::next_key::<ByHash>(pages, self.by_hash, at)?
+            && key >> POSITION_BITS == at >> POSITION_BITS
+        {
+            match trie::get::<ByHash>(pages, self.by_hash, key)? {
+                Some((found, _)) if found.0 == *hash => return Ok(Some(found.1)),
+                _ => at = key + 1,
+            }
+        }
+        Ok(None)
     }
 
     /// The commits at the positions `from..to`, ascending: found one
@@ -228,28 +247,16 @@ impl Commits {
     /// Notes that the output at `position` is `commit`. A commit there
     /// already is a fault of the caller's (`AlreadyExists`). The same
     /// commit made twice is two outputs, and nothing forbids it: both
-    /// are found by position, the first by its hash.
+    /// are found by position, the lower by its hash.
     pub fn add<B: Backend>(&mut self, txn: &Txn<'_, B>, position: u64, commit: Commit) -> Result<(), Error> {
         if self.at(txn, position)?.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a commit is at the position").into());
         }
         let edits: Edits<'_, ByPosition> = Edits { puts: &[(position, commit, false)], ..Edits::none() };
         self.by_position = trie::update_on(txn, self.by_position, 0, edits, 1)?.0;
-        let key = key_of(&commit.hash);
-        // (Made already: its hash goes on leading to the first, which
-        // is marked as not the only one, so that the hash is led to
-        // another when the first goes.)
-        let put = match trie::get::<ByHash>(txn, self.by_hash, key)? {
-            None => Some(((commit.hash, position), false)),
-            Some((first, _)) if first.0 == commit.hash && first.1 & TWICE == 0 => {
-                Some(((first.0, first.1 | TWICE), true))
-            }
-            Some(_) => None,
-        };
-        if let Some((record, there)) = put {
-            let edits: Edits<'_, ByHash> = Edits { puts: &[(key, record, there)], ..Edits::none() };
-            self.by_hash = trie::update_on(txn, self.by_hash, 0, edits, 1)?.0;
-        }
+        let edits: Edits<'_, ByHash> =
+            Edits { puts: &[(place(&commit.hash, position), (commit.hash, position), false)], ..Edits::none() };
+        self.by_hash = trie::update_on(txn, self.by_hash, 0, edits, 1)?.0;
         self.count += 1;
         Ok(())
     }
@@ -260,24 +267,8 @@ impl Commits {
         let Some(commit) = self.at(txn, position)? else { return Ok(None) };
         let edits: Edits<'_, ByPosition> = Edits { removes: &[position], ..Edits::none() };
         self.by_position = trie::update_on(txn, self.by_position, 0, edits, 1)?.0;
-        // Its hash leads here unless another commit of the same came
-        // first. If it does, and the commit was made more than once,
-        // the hash leads to the first of those left: looked for among
-        // them all, which is done only for a commit made twice.
-        let key = key_of(&commit.hash);
-        if let Some((led, _)) = trie::get::<ByHash>(txn, self.by_hash, key)?
-            && led.1 & !TWICE == position
-        {
-            let other = match led.1 & TWICE != 0 {
-                true => self.between(txn, 0, u64::MAX)?.into_iter().find(|(_, c)| c.hash == commit.hash),
-                false => None,
-            };
-            let edits: Edits<'_, ByHash> = match &other {
-                Some((at, _)) => Edits { puts: &[(key, (commit.hash, *at | TWICE), true)], ..Edits::none() },
-                None => Edits { removes: &[key], ..Edits::none() },
-            };
-            self.by_hash = trie::update_on(txn, self.by_hash, 0, edits, 1)?.0;
-        }
+        let edits: Edits<'_, ByHash> = Edits { removes: &[place(&commit.hash, position)], ..Edits::none() };
+        self.by_hash = trie::update_on(txn, self.by_hash, 0, edits, 1)?.0;
         self.count -= 1;
         Ok(Some(commit))
     }
@@ -330,23 +321,41 @@ mod tests {
         assert_eq!(commits.between(&file, all[10].0, all[20].0).unwrap(), all[10..20]);
         assert_eq!(commits.between(&file, 0, 1).unwrap(), vec![]);
         // A position is one commit's. A commit made twice is at both
-        // positions, and its hash leads to the first while that stands.
+        // positions, and its hash leads to the lower while that stands.
         let txn = file.begin().unwrap();
         let taken = Err(Error::Io(io::ErrorKind::AlreadyExists));
         assert_eq!(commits.add(&txn, all[5].0, Commit { hash: twin, height: 9 }), taken);
         let mut twice = commits;
+        let (first, hash) = (all[5].0, all[5].1.hash);
+        let (lower, higher) = (first.min(7), first.max(7));
         twice.add(&txn, 7, all[5].1).unwrap();
         assert_eq!((twice.at(&txn, 7).unwrap(), twice.count), (Some(all[5].1), 401));
-        assert_eq!(twice.position_of(&txn, &all[5].1.hash).unwrap(), Some(all[5].0));
+        assert_eq!(twice.position_of(&txn, &hash).unwrap(), Some(lower));
         assert_eq!(twice.remove(&txn, 7).unwrap(), Some(all[5].1));
-        assert_eq!(twice.position_of(&txn, &all[5].1.hash).unwrap(), Some(all[5].0));
+        assert_eq!(twice.position_of(&txn, &hash).unwrap(), Some(first));
         twice.add(&txn, 7, all[5].1).unwrap();
-        // And to the other when the first is gone; to none when both are.
-        twice.remove(&txn, all[5].0).unwrap();
-        assert_eq!(twice.position_of(&txn, &all[5].1.hash).unwrap(), Some(7));
+        // And to the other when that one is gone, whichever was made
+        // first, and when it is back; to none when both are gone.
+        let gone = twice.remove(&txn, lower).unwrap().unwrap();
+        assert_eq!(twice.position_of(&txn, &hash).unwrap(), Some(higher));
+        twice.add(&txn, lower, gone).unwrap();
+        assert_eq!(twice.position_of(&txn, &hash).unwrap(), Some(lower));
+        twice.remove(&txn, first).unwrap();
+        assert_eq!(twice.position_of(&txn, &hash).unwrap(), Some(7));
         assert_eq!(twice.at(&txn, 7).unwrap(), Some(all[5].1));
         twice.remove(&txn, 7).unwrap();
-        assert_eq!(twice.position_of(&txn, &all[5].1.hash).unwrap(), None);
+        assert_eq!(twice.position_of(&txn, &hash).unwrap(), None);
+        // (Many of one hash, taken out in their order: each by itself,
+        // with no looking among the rest.)
+        for position in 1000..1040 {
+            twice.add(&txn, position << 20, all[5].1).unwrap();
+        }
+        for position in 1000..1040 {
+            assert_eq!(twice.position_of(&txn, &hash).unwrap(), Some(position << 20));
+            twice.remove(&txn, position << 20).unwrap();
+        }
+        assert_eq!((twice.position_of(&txn, &hash).unwrap(), twice.count), (None, 399));
+        twice.add(&txn, first, all[5].1).unwrap();
         twice.add(&txn, 7, all[5].1).unwrap();
         drop(txn);
 

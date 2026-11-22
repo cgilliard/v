@@ -190,8 +190,9 @@ pub struct Serve {
     jobs: usize,
     /// The address served last: the turn passes to the next after it.
     last: Option<SocketAddr>,
-    /// Chunks sent in all: whose turn it is among a host's addresses.
-    turns: u64,
+    /// The address of each host served last, by the host's first:
+    /// whose turn it is among a host's addresses.
+    ports: BTreeMap<SocketAddr, SocketAddr>,
     /// Microseconds a chunk.
     cost: Micros,
     /// The time the next chunk may go, were there no burst: it runs
@@ -218,7 +219,7 @@ impl Serve {
             queues: BTreeMap::new(),
             jobs: 0,
             last: None,
-            turns: 0,
+            ports: BTreeMap::new(),
             cost: (SECOND / limits.rate as u64).max(1),
             due: Default::default(),
         }
@@ -307,9 +308,14 @@ impl Serve {
         let after =
             self.last.and_then(|last| self.queues.range((Bound::Excluded(host(&last).1), Bound::Unbounded)).next());
         let to = after.or_else(|| self.queues.iter().next()).map(|(to, _)| *to)?;
+        // (The port after the one of that host served last: counted
+        // by the turns of all hosts together, a port could be passed
+        // over for ever.)
         let (first, last) = host(&to);
-        let ports = self.queues.range(first..=last).count();
-        self.queues.range(first..=last).nth(self.turns as usize % ports).map(|(to, _)| *to)
+        let after = self.ports.get(&first).and_then(|served| {
+            self.queues.range((Bound::Excluded(*served), Bound::Included(last))).next().map(|(to, _)| *to)
+        });
+        Some(after.unwrap_or(to))
     }
 
     /// What to send at `now`.
@@ -352,7 +358,13 @@ impl Serve {
             }
         }
         self.last = Some(to);
-        self.turns = self.turns.wrapping_add(1);
+        // (Hosts that ask no more are forgotten when they are most of
+        // those remembered.)
+        if self.ports.len() > 2 * self.queues.len() + 16 {
+            let queues = &self.queues;
+            self.ports.retain(|first, _| queues.range(*first..=host(first).1).next().is_some());
+        }
+        self.ports.insert(host(&to).0, to);
         Next::Send(send)
     }
 }
@@ -508,9 +520,14 @@ mod tests {
             s.get(&tokens, from, &get(&tokens, from, p as u64, b"x", ranges(0..5))).unwrap();
         }
         s.get(&tokens, addr(9), &get(&tokens, addr(9), 1, b"x", ranges(0..10))).unwrap();
-        let who: Vec<u8> = drain(&mut s).iter().map(|x| x.0).collect();
+        let sent = drain(&mut s);
+        let who: Vec<u8> = sent.iter().map(|x| x.0).collect();
         assert_eq!(who[..20].iter().filter(|a| **a == 9).count(), 10, "{who:?}");
         assert_eq!(who.len(), 30);
+        // And its ports take that turn one after another, none of
+        // them passed over while another has it twice.
+        let ports: Vec<u64> = sent.iter().filter(|x| x.0 == 7).map(|x| x.1).collect();
+        assert_eq!(ports[..8], [0, 1, 2, 3, 0, 1, 2, 3], "{ports:?}");
     }
 
     #[test]

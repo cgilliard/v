@@ -84,14 +84,16 @@ pub fn empty_state() -> Digest {
     compress(super::sparse::empty(super::sparse::HEIGHT), &super::names::empty_root())
 }
 
-/// How a root record of this making begins. (1 was of blocks and their records kept
-/// as chains of pages, each naming the next: [`super::blob`].)
-const VERSION: u8 = 3;
+/// How a root record of this making begins. (1 was of blocks and
+/// their records kept as chains of pages, each naming the next
+/// ([`super::blob`]); 2 of a state being received, with blocks kept
+/// so; 3 of blocks kept as they are and their records as chains.)
+const VERSION: u8 = 4;
 /// What records of makings before this one began with.
-const OLDER: [u8; 1] = [1];
+const OLDER: [u8; 3] = [1, 2, 3];
 /// What a root record begins with while its state is still being
 /// received from other nodes ([`super::receive`]): not a state to open.
-pub(super) const RECEIVING: u8 = 2;
+pub(super) const RECEIVING: u8 = 5;
 const RECORD: usize = COMMITS_AT + Commits::BYTES;
 const COMMITS_AT: usize = BLOCKS_AT + Blocks::BYTES;
 const NAMES_AT: usize = 37 + Outputs::BYTES;
