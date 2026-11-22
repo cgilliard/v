@@ -114,14 +114,14 @@ impl Job {
 
     /// Adds a request's runs, all or none.
     fn extend(&mut self, get: &Get<'_>) -> bool {
-        let before = (self.runs, self.n, self.left);
+        let before = (self.runs, self.n, self.left, self.run);
         // Sent runs make room for new ones.
         self.runs.copy_within(self.run..self.n, 0);
         (self.n, self.run) = (self.n - self.run, 0);
         let mut seq = get.seq;
         for r in get.ranges.as_slice() {
             if !self.push(*r, seq) {
-                (self.runs, self.n, self.left) = before;
+                (self.runs, self.n, self.left, self.run) = before;
                 return false;
             }
             seq = seq.wrapping_add(r.count as u32);
@@ -441,6 +441,19 @@ mod tests {
         }
         assert_eq!(s.waiting(), 2);
         assert_eq!(drain(&mut s).len(), MAX_RANGES + 1);
+        // More of a fetch that does not all fit what is left of its
+        // request, some of it sent already: the request is as it was,
+        // and goes on from where it was.
+        s.get(&tokens, addr(4), &get(&tokens, addr(4), 1, b"x", ranges((0..MAX_RANGES as u32).map(|k| 2 * k))))
+            .unwrap();
+        let Next::Send(first) = s.next(1 << 42) else { panic!() };
+        assert_eq!(first.index, 0);
+        s.get(&tokens, addr(4), &get(&tokens, addr(4), 1, b"x", ranges([1000, 2000]))).unwrap();
+        assert_eq!(s.waiting(), 2);
+        let sent: Vec<u32> = drain(&mut s).iter().map(|x| x.2).collect();
+        let mut want: Vec<u32> = (1..MAX_RANGES as u32).map(|k| 2 * k).collect();
+        want.extend([1000, 2000]);
+        assert_eq!(sent, want);
     }
 
     #[test]

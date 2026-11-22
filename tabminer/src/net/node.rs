@@ -380,7 +380,14 @@ const SUSPECT_FOR: Micros = 60 * crate::transport::SECOND;
 /// How long a wallet has to say that a message sent down its way came,
 /// before whoever gave the message is told it did not.
 const DELIVERED_WITHIN: Micros = 3 * crate::transport::SECOND;
-const SEND_WAY_SLOW: Micros = 5 * crate::transport::SECOND;
+/// How long a way to one of a wallet's nodes may take to open before
+/// another of its nodes is tried meanwhile: less than the time a way
+/// that is not answered is given up after
+/// ([`super::circuits::ANSWERED_WITHIN`]), with the second between two
+/// looks at the ways to spare. (At that or more, a message whose turn
+/// came to a node that does not answer never left it: each way there
+/// was given up before it was slow, and the next begun to the same.)
+const SEND_WAY_SLOW: Micros = 2 * crate::transport::SECOND;
 /// The most that is kept on its way to neighbours on ways, that is
 /// being asked of them at once by one worker, and that a worker
 /// remembers having taken.
@@ -1615,7 +1622,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 drop(ways);
                 self.said_by_point(now, link.1, purpose, point, said);
             }
-            Came::Ready => {}
+            Came::Ready | Came::Late => {}
             // (A way being opened that is answered wrongly is no way.
             // One that is open stays so: what does not open on it is
             // nothing.)

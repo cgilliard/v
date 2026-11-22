@@ -861,8 +861,15 @@ impl<B: Backend + 'static> Past<'_, B> {
     /// it has now, less those registered since, the records replaced
     /// since as they were.
     pub fn names_part(&self, index: u32) -> io::Result<Vec<NameRecord>> {
-        let (from, to) = ((index as Key) << self.name_level, (index as Key + 1) << self.name_level);
-        let mut then = self.names_then.range(from..to).peekable();
+        // (An index is whatever a peer asks for: one past the last part
+        // there can be is of no names. And the last part's keys end
+        // where keys do, which is not a key to say "below" of.)
+        if (index as Key) >> (Key::BITS - self.name_level) != 0 {
+            return Ok(Vec::new());
+        }
+        let from = (index as Key) << self.name_level;
+        let to = from | (((1 as Key) << self.name_level) - 1);
+        let mut then = self.names_then.range(from..=to).peekable();
         let mut out = Vec::new();
         for now in self.names.part(&self.pin, self.name_level, index)? {
             match then.next_if(|t| *t.0 == now.key()) {
@@ -886,6 +893,11 @@ impl<B: Backend + 'static> Past<'_, B> {
     /// position: those unspent now, and those spent since, less those
     /// made since.
     pub fn part(&self, index: u64) -> io::Result<Vec<(u64, Record)>> {
+        // (An index is whatever a peer asks for: no output is in a part
+        // past where the outputs ended.)
+        if index >= self.next.div_ceil(1 << self.level) {
+            return Ok(Vec::new());
+        }
         let since = self.spent.get(&index).map_or(&[][..], |s| &s[..]);
         let offset = |p: u64| (p & ((1 << self.level) - 1)) as u32;
         Ok(self
@@ -1550,6 +1562,10 @@ mod tests {
         // A part with no root holds nothing.
         let absent = past.parts().last().map_or(0, |p| p.0 + 1);
         assert!(past.part(absent).unwrap().is_empty());
+        // Nor does one that no state could have, which a peer may ask for.
+        for index in [1 << 28, (1 << 28) + 1, 1 << 40, u64::MAX] {
+            assert!(past.part(index).unwrap().is_empty());
+        }
         all
     }
 
@@ -1693,6 +1709,13 @@ mod tests {
                     let absent = (0..1u32 << (120 - level)).find(|i| past.name_parts().iter().all(|p| p.0 != *i));
                     if let Some(index) = absent {
                         assert!(past.names_part(index).unwrap().is_empty());
+                    }
+                    // The last part there can be, and those past it,
+                    // which a peer may ask for.
+                    let last = ((1u64 << (Key::BITS - level)) - 1) as u32;
+                    past.names_part(last).unwrap();
+                    for index in [last.saturating_add(1), u32::MAX] {
+                        assert!(index == last || past.names_part(index).unwrap().is_empty());
                     }
                 }
             };

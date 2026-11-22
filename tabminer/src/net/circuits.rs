@@ -423,6 +423,10 @@ pub enum Came {
     Ready,
     /// Its last relay says this.
     Said(Vec<u8>),
+    /// Something its last relay but one said, to what the way asked of
+    /// it before it went on from there (a ping's answer, say): nothing
+    /// to the way as it is now, which waits as it did.
+    Late,
     /// Not what this way was waiting for: the way is to be given up.
     Bad,
 }
@@ -616,12 +620,20 @@ impl Way {
     /// Something has come back along the way, the `count`-th of
     /// whichever relay said it.
     pub fn back(&mut self, count: u64, bytes: &[u8], chance: &[u8; 96], now: Micros) -> Came {
+        let waited = self.waiting;
         (self.seen, self.waiting) = (now, None);
         let Some(said) = circuit::unwrap(&self.hops, count, bytes) else { return Came::Bad };
         let Some(said) = emptied(&said) else { return Came::Bad };
         match said.split_first() {
             Some((&SAID_EXTENDED, answer)) if !self.ready() => self.grown(answer, chance),
             Some((&SAID, rest)) if self.ready() => Came::Said(rest.to_vec()),
+            // (An answer to what was asked before the way went on: it
+            // is not the relay it goes on to that answered, and the way
+            // still waits for that one.)
+            Some((&SAID, _)) => {
+                self.waiting = waited;
+                Came::Late
+            }
             _ => Came::Bad,
         }
     }
