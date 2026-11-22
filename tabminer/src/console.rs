@@ -2045,7 +2045,7 @@ mod tests {
             });
             let height = self.chain.tip().unwrap().height + 1;
             let due = self.chain.params().subsidy(height) + fees;
-            let reward = to.wallet.as_ref().unwrap().lock().unwrap().receive(due, NOW).unwrap();
+            let reward = to.wallet.as_ref().unwrap().lock().unwrap().reward(due, height, NOW).unwrap();
             let outputs = [&reward].into_iter().chain(pooled.iter().flat_map(|tx| &tx.outputs));
             let body = crate::block::Body {
                 inputs: pooled.iter().flat_map(|tx| tx.spent_positions()).collect(),
@@ -2054,6 +2054,10 @@ mod tests {
                 ..Default::default()
             };
             extend(&self.chain, &body);
+            // (Its maker's wallet is told which block its reward is of,
+            // as the node tells it.)
+            let won = digest_to_bytes(&self.chain.tip().unwrap().hash());
+            to.wallet.as_ref().unwrap().lock().unwrap().reward_found(&reward.commitment, &won).unwrap();
             self.node.pool_follows(1);
             for console in all {
                 follow(&self.chain, &mut console.wallet.as_ref().unwrap().lock().unwrap(), NOW).unwrap();
@@ -2132,6 +2136,22 @@ mod tests {
         let (desk, payer, paid) = funded("pays");
         assert_eq!(said(&payer, "balance"), "spendable   3,000");
         assert_eq!(said(&payer, "outputs").matches("1,500  confirmed").count(), 2);
+        // The blocks its wallet was paid by: both in the chain. And one
+        // that another chain went further without.
+        let won = said(&payer, "mining");
+        assert!(won.starts_with("blocks won in the last 64: 2 in the chain, which paid 3,000\n  block"), "{won}");
+        assert_eq!(won.matches("in the chain").count(), 3);
+        {
+            let mut wallet = payer.wallet.as_ref().unwrap().lock().unwrap();
+            let lost = wallet.reward(1_500 * COIN, 2, NOW).unwrap();
+            wallet.reward_found(&lost.commitment, &[7; 32]).unwrap();
+        }
+        let won = said(&payer, "mining");
+        assert!(
+            won.contains("; 1 orphaned, which would have paid ") && won.contains("\norphaned (another chain"),
+            "{won}"
+        );
+        assert!(won.ends_with("  orphaned"), "{won}");
         let slate = desk.file("payment.slate");
         let begun = said(&payer, &format!("send-file 12.5 {slate}"));
         assert!(begun.contains("begun: 12.5 and a fee of"), "{begun}");
