@@ -575,7 +575,7 @@ pub fn open_weighted(
     // never added to it: every polynomial folds to a value of its own.
     let mut beside: Vec<Vec<F>> = Vec::with_capacity(joiners.len());
     let mut pad_beside: Option<Vec<F>> = None;
-    #[allow(unused_assignments, unused_mut, unused_variables)]
+    #[cfg(test)]
     let mut pad_theta = F::ZERO;
     // Before they join, the pads' part of a round: their whole sum,
     // times the squares of one and each challenge so far.
@@ -636,7 +636,10 @@ pub fn open_weighted(
                 }
             });
             pad_beside = Some(code);
-            pad_theta = theta_pads;
+            #[cfg(test)]
+            {
+                pad_theta = theta_pads;
+            }
             blinder = Some((blind.g.to_vec(), e.clone(), theta));
             let both = blind.pads.iter().zip(blind.g_pads).map(|(p, g)| *p + theta_pads * *g).collect();
             padded = Some((both, pad_weights, F::ONE));

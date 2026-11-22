@@ -445,7 +445,7 @@ struct Row<V> {
 }
 
 /// Auxiliary words a row has.
-const AUX: usize = 66;
+const AUX: usize = 67;
 
 fn row<C: Ctx>(c: &mut C) -> Row<C::V> {
     let cv: [C::V; 8] = std::array::from_fn(|_| c.input());
@@ -1031,6 +1031,17 @@ pub fn circuit() -> Circuit {
             let stages = [(&[SETL][..], con(1)), (&[WEND1][..], con(2)), (&[WEND2][..], ones())];
             register(s, one(&r.stage), &stages.map(|(ks, stage)| (ks, to(&[stage]))));
             // A run that made outputs does not end before they are in.
+            // A reveal that has spent its commitment goes on to the
+            // name: the row after a spend made while revealing is the
+            // name's leaf, and no other is. (Stopped there, with the
+            // commitment gone and nothing registered, a reveal would be
+            // anyone's to undo who had seen it: the flows' numbers are
+            // such that only revealing has this bit of those a spend
+            // is made in.)
+            const { assert!(REVEALING == 2 && (PAYING | POLICY) & 2 == 0) };
+            let spent_in = next_aux();
+            s.constrain(p(&f(ISP)), p(&r.flow), spent_in.clone());
+            s.zero_where(&con(2), spent_in.xor(&f(NLEAFR)));
             let open = next_aux();
             s.constrain(last_row.clone(), r.stage.xor(&ones()), open.clone());
             for (now, then) in r.next.iter().zip(&r.next0) {
@@ -1266,6 +1277,8 @@ fn auxiliary(old: &State, to: &State, kind: usize, before: usize, dir: u32, made
     let (c, _) = carries(to.state, !made, 0);
     aux.extend([c, c >> 31]);
     aux.extend([(kind == POP || kind == WPOP) as u32, (kind == PUSH || kind == WNODER) as u32]);
+    // The flow in hand at a spend, on the row after it.
+    aux.push(if before == ISP { old.flow } else { 0 });
     // Whether the run's outputs are still to come in: the last row's to
     // say ([`Run::finish`]).
     aux.push(0);
@@ -1827,6 +1840,26 @@ impl Run {
         path: &[Digest],
         names: &[Digest],
     ) {
+        self.reveal_spend(record, salt, memo, made, position, path);
+        let block = Self::pair(&self.state.name, &self.state.record);
+        self.step(NLEAFR, block, |s, out| {
+            (s.w, s.v, s.cnt, s.place) = ([0; 8], out, 0, s.name[..4].try_into().unwrap())
+        });
+        self.registry(names);
+        self.op_done();
+    }
+
+    /// The first part of a reveal: its record, and its commitment
+    /// spent.
+    fn reveal_spend(
+        &mut self,
+        record: &registry::Record,
+        salt: &Digest,
+        memo: &Memo,
+        made: u32,
+        position: u64,
+        path: &[Digest],
+    ) {
         self.record(record);
         let block = Self::pair(&self.state.name, &words(salt));
         self.step(COM1, block, |s, _| {
@@ -1841,12 +1874,6 @@ impl Run {
             (s.w, s.v, s.cnt, s.pos, s.pos0, s.input, s.amount) = (out, [0; 8], 0, pos, pos, !0, [0; 2])
         });
         self.removal(path, 0);
-        let block = Self::pair(&self.state.name, &self.state.record);
-        self.step(NLEAFR, block, |s, out| {
-            (s.w, s.v, s.cnt, s.place) = ([0; 8], out, 0, s.name[..4].try_into().unwrap())
-        });
-        self.registry(names);
-        self.op_done();
     }
 
     /// An update: `record` takes the place of `old`, whose owner is the
@@ -2610,6 +2637,34 @@ mod tests {
             other[word] ^= 1;
             assert!(!proves(named_run(&n, true).0, Some(&other)), "word {word}");
         }
+    }
+
+    /// A reveal that spends its commitment registers its name: rows
+    /// that stop at the spend, and go on to something else, are not
+    /// rows that hold. (Whoever saw a reveal waiting could else spend
+    /// its commitment in a block and register nothing.)
+    #[test]
+    fn a_reveal_does_not_stop_at_its_spend() {
+        use crate::registry::Op;
+        let n = named();
+        let found = n.tx.ops.iter().find_map(|op| match op {
+            Op::Reveal { record, salt, position } => Some((record, salt, *position)),
+            _ => None,
+        });
+        let (record, salt, position) = found.expect("a reveal among them");
+        let (_, memo, made, _) = n.revealed;
+        let stopped = |then: &dyn Fn(&mut Run)| {
+            let start = Record::start(&n.outputs, EMPTY, EMPTY, HEIGHT).on(&n.names);
+            let mut run = Run::new(&start, closed(), &n.set.root());
+            run.frontier(&n.outputs.frontier_without([position]));
+            run.reveal_spend(record, salt, &memo, made, position, &n.outputs.path(position));
+            then(&mut run);
+            let (rows, program, public) = run.finish(128);
+            holds(&rows, &program, &public)
+        };
+        // Stopped there; and gone on to a transaction's head.
+        assert!(!stopped(&|_| {}));
+        assert!(!stopped(&|run| run.head(&Transaction::default())));
     }
 
     /// Operations on names are done after every transaction, and sweeps
