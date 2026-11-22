@@ -66,6 +66,10 @@ struct World {
     strays: Vec<(SocketAddrV4, SocketAddrV4, Vec<u8>)>,
     /// Nodes of which nothing but pings and pongs gets out.
     mute: Vec<usize>,
+    /// Nodes whose chunks of what they serve come seconds late, each
+    /// later than the one before: a peer that sends a little at a time.
+    slow: Vec<usize>,
+    late: Micros,
     /// Times the nodes were told the time.
     ticks: u64,
     /// What each datagram a node took was, and when.
@@ -91,6 +95,8 @@ impl World {
             rng: Rng::new(5),
             strays: Vec::new(),
             mute: Vec::new(),
+            slow: Vec::new(),
+            late: 0,
             ticks: 0,
             log: Vec::new(),
         }
@@ -144,7 +150,11 @@ impl World {
                 }
                 for (i, to, bytes) in sent {
                     let small_talk = matches!(Message::decode(NET, &bytes), Ok(Message::Ping(_) | Message::Pong(_)));
-                    if small_talk || !self.mute.contains(&i) {
+                    if self.slow.contains(&i) && matches!(Message::decode(NET, &bytes), Ok(Message::Chunk(_))) {
+                        // (One chunk every three seconds.)
+                        self.late = self.late.max(self.now) + 3 * SECOND;
+                        self.flying.push((self.late, at(i), to, bytes.to_vec()));
+                    } else if small_talk || !self.mute.contains(&i) {
                         self.post(at(i), to, &bytes);
                     }
                 }
@@ -1438,6 +1448,88 @@ fn work_is_left_to_a_proof_only_far_above_the_chain() {
     assert_eq!((super::defers(144, true, Some(250)), super::defers(144, true, Some(0))), (Some(394), Some(144)));
     // While a state is being received there is no last block.
     assert_eq!(super::defers(144, true, None), Some(0));
+}
+
+/// Blocks announced from nowhere, as fast as a peer can send them, are
+/// nothing given to the chain to check: each is known for what it is by
+/// the worker that hears of it. And headers that are on the chain but
+/// are nobody's work have their sender refused.
+#[test]
+fn announcements_from_nowhere_cost_the_chain_nothing() {
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    let made = grow(&chains[0], 3, 1);
+    give(&chains[1], &made);
+    let tip = chains[0].tip().unwrap();
+    let mut w = World::with(chains, &small_runs());
+    w.nodes[0].add_peer(at(1), false, 0);
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(2 * SECOND);
+    // Five hundred blocks whose parents nobody has heard of.
+    for k in 0..500u32 {
+        let mut prev = [0x55u8; 32];
+        prev[..4].copy_from_slice(&k.to_le_bytes());
+        let header = Header { prev_hash: prev, height: 900, nonce: [k as u8; 32], ..tip };
+        w.inject(at(1), 0, &Message::Block { header, len: 1000 });
+    }
+    w.run(2 * SECOND);
+    let c = w.nodes[0].counts();
+    assert_eq!((c.checked, c.headers, tip.height), (0, 0, w.best(0).height));
+    assert!(c.forks_asked <= 3, "asked where the chains part {} times", c.forks_asked);
+    let now = w.now;
+    assert!(w.nodes[0].table(&at(1)).get(&at(1)).is_some(), "an orphan is nobody's fault");
+    // Blocks on the chain's last, whose work nobody did: each is
+    // checked, and found out; after a few their sender is refused, and
+    // the rest are not heard.
+    for k in 0..200u32 {
+        let header = Header { prev_hash: tip.hash(), height: tip.height + 1, nonce: [k as u8; 32], ..tip };
+        w.inject(at(1), 0, &Message::Block { header, len: 1000 });
+    }
+    w.run(2 * SECOND);
+    let c = w.nodes[0].counts();
+    assert!((1..=16).contains(&c.checked), "{} checked", c.checked);
+    assert_eq!(w.nodes[0].table(&at(1)).refusal(&at(1), false, now), Some(crate::net::peers::Refused::Banned));
+    assert_eq!(w.best(0), tip);
+}
+
+/// A peer that says its chain is higher than any could be by now is
+/// not gone after: the runs of headers to ask for are counted from
+/// what it says.
+#[test]
+fn a_chain_higher_than_any_could_be_is_not_gone_after() {
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    grow(&chains[1], 3, 1);
+    let mut w = World::with(chains, &small_runs());
+    w.nodes[1].boast = Some(U256::MAX);
+    w.nodes[1].tall = Some(u32::MAX - 7);
+    w.nodes[0].add_peer(at(1), false, 0);
+    w.run(5 * SECOND);
+    let now = w.now;
+    assert!(w.nodes[0].list().aim.is_none());
+    assert_eq!((w.best(0).height, w.nodes[0].counts().forks_asked), (0, 1));
+    assert!(!w.nodes[0].table(&at(1)).may_ask(&at(1), now));
+}
+
+/// A peer that sends what it was asked for a little at a time is given
+/// up, and the rest is had from another: one such is not all a node
+/// hears from for as long as it cares to go on.
+#[test]
+fn a_peer_that_sends_a_little_at_a_time_is_given_up() {
+    let chains: Vec<_> = (0..3).map(|_| chain_of(easy())).collect();
+    let made = grow_wide(&chains[0], 12, 300, 1);
+    give(&chains[1], &made);
+    let mut cfg = small_runs();
+    // (One block of a peer at a time: both are asked.)
+    cfg.sync.blocks_per_peer = 1;
+    let mut w = World::with(chains, &cfg);
+    w.slow = vec![0];
+    w.nodes[2].add_peer(at(0), false, 0);
+    w.nodes[2].add_peer(at(1), false, 0);
+    w.run(150 * SECOND);
+    let c = w.nodes[2].counts();
+    assert_eq!(tip(&w, 2), tip(&w, 1), "{c:?}");
+    assert!(c.fetches_slow >= 1, "{c:?}");
+    let now = w.now;
+    assert!(w.nodes[2].table(&at(1)).may_ask(&at(1), now));
 }
 
 /// A peer that serves pieces of the state that are not the state is

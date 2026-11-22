@@ -122,6 +122,8 @@ pub struct Counts {
     pub blocks_refused: u64,
     /// Announcements of a block sent.
     pub announced: u64,
+    /// Headers announced that were given to the chain to be checked.
+    pub checked: u64,
     /// States taken whole from other nodes, and times the block one was
     /// being taken as of was given up for another.
     pub states: u64,
@@ -138,6 +140,7 @@ impl Counts {
         self.fetched += o.fetched;
         self.fetches_failed += o.fetches_failed;
         self.fetches_slow += o.fetches_slow;
+        self.checked += o.checked;
         self.headers += o.headers;
         self.blocks += o.blocks;
         self.blocks_refused += o.blocks_refused;
@@ -1066,6 +1069,9 @@ pub struct Worker<B: Backend + 'static, V> {
     pub(crate) boast: Option<U256>,
     #[cfg(test)]
     pub(crate) spoil: bool,
+    /// Tests: a height claimed that the chain has not.
+    #[cfg(test)]
+    pub(crate) tall: Option<u32>,
     /// Tests: a block served that is on no chain here.
     #[cfg(test)]
     pub(crate) foist: Option<(Digest, Vec<u8>)>,
@@ -1137,6 +1143,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             counts: Counts::default(),
             #[cfg(test)]
             boast: None,
+            #[cfg(test)]
+            tall: None,
             #[cfg(test)]
             spoil: false,
             #[cfg(test)]
@@ -1294,6 +1302,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             version: VERSION,
             token: self.tokens.issue(&SocketAddr::V4(*to)),
             genesis: self.genesis,
+            #[cfg(test)]
+            height: self.tall.unwrap_or(tip.height),
+            #[cfg(not(test))]
             height: tip.height,
             oldest,
             window,
@@ -3457,6 +3468,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             return;
         }
         self.announcing += 1;
+        self.counts.checked += 1;
         self.work(l, Job::Announced { header, len, from, unix: self.unix });
     }
 
@@ -4915,7 +4927,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     fn hooks(&mut self) {
         let (first, rest) = self.workers.split_first_mut().expect("a worker");
         for w in rest {
-            (w.boast, w.spoil, w.foist) = (first.boast, first.spoil, first.foist.clone());
+            (w.boast, w.spoil, w.foist, w.tall) = (first.boast, first.spoil, first.foist.clone(), first.tall);
             if w.cfg != first.cfg {
                 w.cfg = first.cfg.clone();
             }

@@ -133,6 +133,47 @@ fn shelved_transactions_follow_their_outputs() {
     assert_eq!(pool.get(&id).unwrap().txid(), id);
 }
 
+/// What a transaction pays to take another's place is looked at before
+/// its signatures: one that pays too little is turned away for that,
+/// whatever its signatures are. And what is set aside when its outputs
+/// go is no more, by its size, than a part of what the pool may hold.
+#[test]
+fn a_replacement_s_fee_comes_before_its_signatures_and_the_shelf_is_bounded() {
+    let mut state = Fake::default();
+    state.fund(0, 1, 5_000_000);
+    let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
+    pool.insert(&spend_at(1, &[0], 5_000_000, 50, 100), &state, 1, 0).unwrap();
+    // Another spend of the same output, paying less, its signature
+    // spoiled: refused for what it pays.
+    let mut other = spend_at(1, &[0], 5_000_000, 10, 101);
+    let at = other.len() - 40;
+    other[at] ^= 1;
+    assert!(TransactionRef::from_bytes(&other).is_ok_and(|tx| !tx.verify_signatures()));
+    assert!(matches!(pool.insert(&other, &state, 1, 0), Err(Reject::ReplacementFee { .. })));
+    // (Paying enough, it is refused for its signature.)
+    let mut other = spend_at(1, &[0], 5_000_000, 4_000_000, 101);
+    let at = other.len() - 40;
+    other[at] ^= 1;
+    assert_eq!(pool.insert(&other, &state, 1, 0), Err(Reject::BadSignature));
+
+    // Twelve transactions, in a pool that holds twelve of them and no
+    // more: their outputs go, and a quarter of that is set aside.
+    let mut state = Fake::default();
+    for tag in 1..=12 {
+        state.fund(u64::from(tag) - 1, tag, 100_000);
+    }
+    let size = spend(1, 100_000, 10).len();
+    let mut pool = Mempool::with_policy(12 * size, Policy::NONE);
+    for tag in 1..=12 {
+        pool.insert(&spend(tag, 100_000, 10), &state, 1, 0).unwrap();
+    }
+    state.outputs.clear();
+    let (moved, created) = none();
+    assert_eq!(pool.revalidate(&state, 1, &moved, &created, 0), Ok((12, 0)));
+    assert!(pool.is_empty());
+    assert_eq!(pool.shelf.len(), 3);
+}
+
 /// A transaction that has waited its time is dropped, and its id is
 /// refused for as long again.
 #[test]
