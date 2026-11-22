@@ -10,7 +10,7 @@
 //! testing target.
 
 /// Genesis time, unix seconds; the ASERT anchor.
-pub const TIMESTAMP: u64 = 1793322871;
+pub const TIMESTAMP: u64 = 1795378800;
 /// The Bitcoin block hash, in the byte order block explorers show.
 pub const BITCOIN_HASH_HEX: &str = "00000000000000000000c4750b0959be11adfd86268999ae3ca6b95f667e9737";
 /// Height and time of that Bitcoin block, for reference.
