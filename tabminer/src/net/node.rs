@@ -171,6 +171,9 @@ fn defers(point: u32, attests: bool, tip: Option<u32>) -> Option<u32> {
 
 /// Announcements remembered: who said it had which block.
 const ANNOUNCED: usize = 256;
+/// Headers announced that wait to be checked at once, of one worker's
+/// peers.
+const ANNOUNCING: usize = 16;
 /// Peers remembered to have said they lack a block they were asked for.
 const LACKING: usize = 256;
 /// Transactions being fetched at once by one worker, and of one peer:
@@ -1040,6 +1043,9 @@ pub struct Worker<B: Backend + 'static, V> {
     /// Who said it has not a block it was asked for, having never said
     /// it had: not asked for that block again.
     lacking: Vec<(Digest, SocketAddrV4)>,
+    /// Headers announced that were given to be checked, and are not
+    /// yet heard of.
+    announcing: usize,
     /// What came of the fetches asked for from outside
     /// ([`Node::fetch_object`]).
     inbox: Vec<(Object, SocketAddrV4, Option<Vec<u8>>)>,
@@ -1118,6 +1124,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             list,
             announced: VecDeque::new(),
             lacking: Vec::new(),
+            announcing: 0,
             inbox: Vec::new(),
             tx_wanted: VecDeque::new(),
             counts: Counts::default(),
@@ -1203,6 +1210,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 Notice::Announce { header, len, except } => self.announce(now, header, len, except, out),
                 Notice::Tx { id, len, except } => self.announce_tx(now, id, len, except, out),
                 Notice::Announced { header, len, from, verdict } => {
+                    self.announcing = self.announcing.saturating_sub(1);
                     let list = Arc::clone(&self.list);
                     self.header_checked(&mut write(&list), now, header, len, from, verdict, out);
                 }
@@ -1261,16 +1269,27 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let work = self.chain.tip_work().unwrap_or(U256::ZERO);
         #[cfg(test)]
         let work = self.boast.unwrap_or(work);
+        // Bodies are kept for the blocks that can be undone, and no
+        // further back: below those a node has headers only. And no
+        // further back than they are in fact kept, and can in fact be
+        // undone: a node that took its state whole has nothing from
+        // under that block, and one that said it had would be asked
+        // for it, and those who asked would take it that someone has.
+        let keep = self.chain.keep() as u32;
+        let (bodies, undo) = self.chain.held().unwrap_or((None, None));
+        // (The first block there is a body of is the chain's first: a
+        // node that has that has them all.)
+        let bodies = bodies.map(|lowest| if lowest <= 1 { 0 } else { lowest });
+        let oldest = (tip.height + 1).saturating_sub(keep).max(bodies.unwrap_or(tip.height + 1));
+        let window = tip.height.saturating_sub(keep).max(undo.map_or(tip.height, |first| first.saturating_sub(1)));
         Status {
             nonce,
             version: VERSION,
             token: self.tokens.issue(&SocketAddr::V4(*to)),
             genesis: self.genesis,
             height: tip.height,
-            // Bodies are kept for the blocks that can be undone, and no
-            // further back: below those a node has headers only.
-            oldest: (tip.height + 1).saturating_sub(self.chain.keep() as u32),
-            window: tip.height.saturating_sub(self.chain.keep() as u32),
+            oldest,
+            window,
             tip: tip.hash(),
             work,
         }
@@ -3390,9 +3409,23 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if self.chain.known(&id).ok().flatten().is_some() {
             return self.header_checked(l, now, header, len, from, Verdict::Good, out);
         }
+        // One whose parent is not known is known for that here, with
+        // nothing given to be done: a peer that speaks of blocks from
+        // nowhere, as fast as it can, costs the chain nothing.
+        if self.chain.known(&header.prev_hash).ok().flatten().is_none() {
+            return self.header_checked(l, now, header, len, from, Verdict::Orphan, out);
+        }
         // A new header's work is to be checked, which takes as long as
         // hashing does where there is no table to check it against:
         // given to be done, and heard of later ([`Worker::header_checked`]).
+        // No more at once than a few: what waits to be checked is what
+        // a peer can have a node hold, and holds up the blocks behind
+        // it.
+        if self.announcing >= ANNOUNCING {
+            self.counts.unheard += 1;
+            return;
+        }
+        self.announcing += 1;
         self.work(l, Job::Announced { header, len, from, unix: self.unix });
     }
 
@@ -3720,7 +3753,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 // What follows is of the peer that announced it: its own
                 // worker's to do.
                 Outcome::Announced { header, len, from, verdict } => match self.shared.owner(&from) {
-                    owner if owner == self.me => self.header_checked(l, now, header, len, from, verdict, out),
+                    owner if owner == self.me => {
+                        self.announcing = self.announcing.saturating_sub(1);
+                        self.header_checked(l, now, header, len, from, verdict, out)
+                    }
                     owner => self.shared.post(owner, Notice::Announced { header, len, from, verdict }),
                 },
                 Outcome::Checked { target, result } => self.state_block_checked(l, now, target, result),

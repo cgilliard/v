@@ -141,6 +141,18 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         self.keep
     }
 
+    /// What is held of the chain's blocks, as it is and not as it would
+    /// be had the chain been here all along: the lowest height a body
+    /// is kept at, and the height of the oldest block that can be
+    /// undone. A node that took its state whole has neither from under
+    /// the block it took it as of, however many blocks it keeps.
+    pub fn held(&self) -> Result<(Option<u32>, Option<u32>), Error> {
+        let state = self.whole()?;
+        let undo = state.oldest_undo();
+        let snap = state.snapshot()?;
+        Ok((snap.blocks().oldest_kept(snap.pages())?, undo))
+    }
+
     /// What the chain is kept in, to read.
     pub(crate) fn store(&self) -> Held<'_, B> {
         let once = Once::taking(&self.store as *const RwLock<Store<B>> as usize);
