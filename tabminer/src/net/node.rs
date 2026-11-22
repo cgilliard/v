@@ -2129,10 +2129,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     // is told it was passed on when the wallet says it
                     // came, or that it was not if the wallet does not.)
                     Some(Where::Way(before, circuit)) => {
-                        back.push(((before, circuit), made(TAKE, &[sealed])));
                         let mut delivering = shared.delivering.lock().unwrap_or_else(|e| e.into_inner());
+                        // (No room to keep count of one more: whoever
+                        // gave it is told it did not go, and gives it
+                        // to another of the wallet's nodes; told
+                        // nothing, it would take it for passed on.)
                         if delivering.len() < LEAVING {
                             delivering.push((id, (before, circuit), link, now));
+                            back.push(((before, circuit), made(TAKE, &[sealed])));
+                        } else {
+                            back.push((link, made(NOTICE, &[&id, &[NOTICE_OFFLINE]])));
                         }
                     }
                     // (A wallet that says it is here from an address,
@@ -2737,8 +2743,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut pings = Vec::new();
         let asked = |w: &super::circuits::Way| w.purpose != super::circuits::Purpose::Asked && w.ready();
         for way in ways.open.iter_mut().filter(|w| asked(w)) {
-            let spare = way.purpose == super::circuits::Purpose::Spare;
-            if (spare && now.saturating_sub(way.seen) >= self.cfg.keepalive) || (lost && !way.gone(now)) {
+            // (As is the way a wallet is reached by, and sooner: while
+            // a relay of it is gone and that is not known, what is sent
+            // down it comes to nothing, and whoever sent it is told the
+            // wallet is not there.)
+            let quiet = match way.purpose {
+                super::circuits::Purpose::Spare => self.cfg.keepalive,
+                super::circuits::Purpose::Session => self.cfg.keepalive / 3,
+                _ => Micros::MAX,
+            };
+            if now.saturating_sub(way.seen) >= quiet || (lost && !way.gone(now)) {
                 way.awaits(now);
                 pings.extend(way.say(&[super::circuits::PING]));
             }
@@ -2960,7 +2974,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 // carries that token is gone into.
                 let ours = self.tokens.issue(&SocketAddr::V4(from));
                 if seq == 0 || !self.tokens.check(&SocketAddr::V4(from), token) {
-                    return self.send(from, &Message::SessionState { id, seq: 0, token: ours }, out);
+                    return self.send(from, &Message::SessionState { id, seq: 0, token: ours, echo: grant }, out);
                 }
                 let held = self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).seen(&id, from, seq, now);
                 let object = Object::Announce { id, seq };
@@ -2973,12 +2987,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let other =
                     || self.shared.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&id, now).map(|s| s.seq);
                 let seq = if held { seq } else { other().unwrap_or(0) };
-                self.send(from, &Message::SessionState { id, seq, token: ours }, out);
+                self.send(from, &Message::SessionState { id, seq, token: ours, echo: grant }, out);
             }
             // And a node says what it holds for this node's wallet.
             // (With its token for this node, which the next saying is to
             // carry: told at once, if that is news.)
-            Message::SessionState { id, seq, token } => {
+            Message::SessionState { id, seq, token, echo } => {
+                // (The answer to what this node asked of that address,
+                // or nothing: anyone can write the address of a node
+                // wallets are reached at on a datagram.)
+                if !self.tokens.check(&SocketAddr::V4(from), echo) {
+                    self.counts.unheard += 1;
+                    return;
+                }
                 // (Its token is kept whether or not the wallet is reached
                 // there: it is what the node is asked anything with.)
                 if token != 0 {

@@ -214,11 +214,15 @@ pub enum Message<'a> {
     /// that wallet, zero while it holds none; and the node's token for
     /// whoever asked, which the next asking is to carry. (So a wallet
     /// need be nothing else to the node it is reached at: not its peer,
-    /// nor known to it before.)
+    /// nor known to it before.) And the token the asking gave it
+    /// (`echo`, the asker's `grant`): by which the asker knows the
+    /// answer for one to what it asked, from where it asked it, and not
+    /// the word of whoever writes that address on a datagram.
     SessionState {
         id: Digest,
         seq: u64,
         token: u64,
+        echo: u64,
     },
     /// "Here is a sealed message for this wallet": its id and length,
     /// to be asked for with `grant`, the sender's token for whoever it
@@ -366,10 +370,11 @@ impl<'a> Message<'a> {
                 w.put(&seq.to_le_bytes());
                 SESSION
             }
-            Message::SessionState { id, seq, token } => {
+            Message::SessionState { id, seq, token, echo } => {
                 w.put(&digest_to_bytes(id));
                 w.put(&seq.to_le_bytes());
                 w.put(&token.to_le_bytes());
+                w.put(&echo.to_le_bytes());
                 SESSION_STATE
             }
             Message::Offer { token, grant, to, id, len } => {
@@ -505,6 +510,7 @@ impl<'a> Message<'a> {
                 id: r.digest().ok_or(BAD)?,
                 seq: r.u64().ok_or(BAD)?,
                 token: r.u64().ok_or(BAD)?,
+                echo: r.u64().ok_or(BAD)?,
             },
             OFFER => Message::Offer {
                 token: r.u64().ok_or(BAD)?,
@@ -687,7 +693,7 @@ mod tests {
             Message::Tx { id: digest(rng), len: rng.next_u64() as u32 },
             Message::GetLeaves { token: rng.next_u64(), id: digest(rng) },
             Message::Session { token: rng.next_u64(), grant: rng.next_u64(), id: digest(rng), seq: rng.next_u64() },
-            Message::SessionState { id: digest(rng), seq: rng.next_u64(), token: rng.next_u64() },
+            Message::SessionState { id: digest(rng), seq: rng.next_u64(), token: rng.next_u64(), echo: rng.next_u64() },
             Message::Offer {
                 token: rng.next_u64(),
                 grant: rng.next_u64(),

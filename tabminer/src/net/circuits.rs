@@ -249,11 +249,18 @@ impl Through {
 pub struct Relayed {
     limits: Limits,
     through: Vec<Through>,
+    /// Who opened a way lately, and when: each opening is answered
+    /// with a signature, and one host is answered [`OPENS_EACH`] times
+    /// a second and no more, however often it opens and closes.
+    opened: std::collections::VecDeque<(std::net::Ipv4Addr, Micros)>,
 }
+
+/// How many ways one host, not a relay of the list, opens in a second.
+const OPENS_EACH: usize = 8;
 
 impl Relayed {
     pub fn new(limits: Limits) -> Relayed {
-        Relayed { limits, through: Vec::new() }
+        Relayed { limits, through: Vec::new(), opened: Default::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -291,6 +298,13 @@ impl Relayed {
         if !room || self.of_before(from, circuit).is_some() {
             return None;
         }
+        while self.opened.front().is_some_and(|o| now.saturating_sub(o.1) >= SECOND) {
+            self.opened.pop_front();
+        }
+        if !listed && self.opened.iter().filter(|o| o.0 == *from.ip()).count() >= OPENS_EACH {
+            return None;
+        }
+        self.opened.push_back((*from.ip(), now));
         let (hop, answer) = circuit::answer(identity, hello, chance)?;
         let (before, said) = ((from, circuit), base(hello));
         self.through.push(Through { before, after: None, hop, out: 0, window: 1, said, seen: now });
@@ -504,7 +518,13 @@ pub struct Way {
     pub began: Micros,
     /// When something last came back along it.
     pub seen: Micros,
+    /// What came back along it lately, each by a few of its bytes: what
+    /// comes a second time is not taken a second time.
+    heard: std::collections::VecDeque<u64>,
 }
+
+/// How many of the things that came back along a way are kept count of.
+const HEARD: usize = 128;
 
 impl Way {
     /// Begins a way through `path` (nearest first, not empty), known to
@@ -516,7 +536,8 @@ impl Way {
         let hops = Vec::with_capacity(path.len());
         let purpose = Purpose::Asked;
         let (opening, waiting) = (Some(opening), Some(now));
-        (Way { circuit, path, hops, opening, sent: 0, purpose, waiting, began: now, seen: now }, step)
+        let heard = Default::default();
+        (Way { circuit, path, hops, opening, sent: 0, purpose, waiting, began: now, seen: now, heard }, step)
     }
 
     pub fn circuit(&self) -> u64 {
@@ -610,31 +631,64 @@ impl Way {
 
     /// The first relay has answered the opening.
     pub fn opened(&mut self, answer: &[u8], chance: &[u8; 96], now: Micros) -> Came {
+        // (Only what is the answer counts as one: what is not leaves
+        // the way waiting as it was.)
+        let before = (self.seen, self.waiting);
         (self.seen, self.waiting) = (now, None);
-        match self.hops.is_empty() {
+        let came = match self.hops.is_empty() {
             true => self.grown(answer, chance),
             false => Came::Bad,
+        };
+        if matches!(came, Came::Bad) {
+            (self.seen, self.waiting) = before;
         }
+        came
     }
 
     /// Something has come back along the way, the `count`-th of
     /// whichever relay said it.
     pub fn back(&mut self, count: u64, bytes: &[u8], chance: &[u8; 96], now: Micros) -> Came {
-        let waited = self.waiting;
+        // (Only what a relay of the way said counts as heard: what is
+        // not, or what was heard before and is sent again by whoever
+        // kept it, leaves the way waiting as it was, to be given up in
+        // its time if nothing else comes.)
+        let before = (self.seen, self.waiting);
+        let Some(said) = circuit::unwrap(&self.hops, count, bytes).and_then(|said| emptied(&said).map(<[u8]>::to_vec))
+        else {
+            return Came::Bad;
+        };
+        let mut mark = [0u8; 8];
+        let tail = &bytes[bytes.len().saturating_sub(8)..];
+        mark[..tail.len()].copy_from_slice(tail);
+        let mark = u64::from_le_bytes(mark) ^ count.rotate_left(32);
+        if self.heard.contains(&mark) {
+            return Came::Late;
+        }
+        self.heard.push_back(mark);
+        if self.heard.len() > HEARD {
+            self.heard.pop_front();
+        }
         (self.seen, self.waiting) = (now, None);
-        let Some(said) = circuit::unwrap(&self.hops, count, bytes) else { return Came::Bad };
-        let Some(said) = emptied(&said) else { return Came::Bad };
         match said.split_first() {
-            Some((&SAID_EXTENDED, answer)) if !self.ready() => self.grown(answer, chance),
+            Some((&SAID_EXTENDED, answer)) if !self.ready() => {
+                let came = self.grown(answer, chance);
+                if matches!(came, Came::Bad) {
+                    (self.seen, self.waiting) = before;
+                }
+                came
+            }
             Some((&SAID, rest)) if self.ready() => Came::Said(rest.to_vec()),
             // (An answer to what was asked before the way went on: it
             // is not the relay it goes on to that answered, and the way
             // still waits for that one.)
             Some((&SAID, _)) => {
-                self.waiting = waited;
+                self.waiting = before.1;
                 Came::Late
             }
-            _ => Came::Bad,
+            _ => {
+                (self.seen, self.waiting) = before;
+                Came::Bad
+            }
         }
     }
 
