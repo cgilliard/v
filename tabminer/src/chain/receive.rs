@@ -513,6 +513,24 @@ mod tests {
             node.check_state_block(&BlockRef::from_bytes(&stranger[0]).unwrap(), 7, &roots),
             Err(Error::UnknownParent)
         );
+        // A branch is weighed without being kept: its work is what the
+        // chain that holds it says, nothing is written, and headers
+        // that do not follow, or that break a rule, are refused.
+        let fresh = Chain::open(MemBackend::new(), 64, easy(), seed(), OnlyFrom(6)).unwrap();
+        let genesis = fresh.tip().unwrap().hash();
+        let mut weighed = fresh.weigh_from(&genesis).unwrap();
+        fresh.weigh(&mut weighed, &headers[..4], NOW).unwrap();
+        fresh.weigh(&mut weighed, &headers[4..], NOW).unwrap();
+        assert_eq!(weighed.work(), ahead.known(&headers[5].hash()).unwrap().unwrap().work);
+        assert_eq!(weighed.last().hash(), headers[5].hash());
+        assert_eq!(fresh.best_header().unwrap().header.hash(), genesis);
+        assert!(fresh.known(&headers[0].hash()).unwrap().is_none());
+        let mut again = fresh.weigh_from(&genesis).unwrap();
+        assert_eq!(fresh.weigh(&mut again, &headers[1..], NOW).err(), Some(Error::UnknownParent));
+        let mut late = headers[0];
+        late.timestamp = NOW + easy().max_future_drift + 1;
+        assert!(matches!(fresh.weigh(&mut again, &[late], NOW), Err(Error::TimestampTooNew { .. })));
+        assert_eq!(fresh.weigh_from(&headers[0].hash()).err(), Some(Error::UnknownParent));
         // A block whose header's work was left to a proof has it
         // looked at in full here: its own proof says nothing of it.
         let late = Chain::open(MemBackend::new(), 64, easy(), seed(), OnlyFrom(6)).unwrap();

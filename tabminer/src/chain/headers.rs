@@ -206,6 +206,30 @@ pub fn check(
     Ok(parent.work.saturating_add(block_work((*target).into())))
 }
 
+/// A branch of headers weighed and not kept ([`Chain::weigh`]): where
+/// it has got to, and the work of the chain ending there. What the
+/// rules of the next header need of those before it, and no header
+/// but the last.
+pub struct Weighed {
+    last: Header,
+    times: Times,
+    /// The branch's first block, where targets are counted from it.
+    first: Option<Header>,
+    work: U256,
+}
+
+impl Weighed {
+    /// The work of the chain ending at the last header weighed.
+    pub fn work(&self) -> U256 {
+        self.work
+    }
+
+    /// The last header weighed.
+    pub fn last(&self) -> &Header {
+        &self.last
+    }
+}
+
 /// What a header's rules need of the headers before it.
 #[derive(Clone, Copy)]
 struct Before {
@@ -733,6 +757,52 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         }
         let reached = at.height >= tip.header.height || undo.is_some_and(|oldest| oldest <= at.height + 1);
         Ok((!reached).then_some(at.height))
+    }
+
+    /// Begins to weigh a branch that leaves the headers kept here at
+    /// the header `from`, which is one of them.
+    pub fn weigh_from(&self, from: &Digest) -> Result<Weighed, Error> {
+        let store = self.store();
+        let snap = store.view()?;
+        let (pages, blocks) = (snap.pages(), snap.blocks());
+        let known = self.known_in(pages, blocks, from)?.ok_or(Error::UnknownParent)?;
+        if let Some(e) = known.refusal(true) {
+            return Err(e);
+        }
+        Ok(Weighed {
+            last: known.header,
+            times: self.times_in(pages, blocks, &known.header)?,
+            first: self.anchor_in(pages, blocks, &known.header)?,
+            work: known.work,
+        })
+    }
+
+    /// Checks `headers`, which follow what was weighed so far, by every
+    /// rule of a header ([`check`]), their work by what each claims of
+    /// it, and adds their work: nothing is kept, and nothing is read. A
+    /// branch that leaves the chain far down is weighed so before any
+    /// of it is kept: headers from an old block cost whoever makes
+    /// them next to nothing, there is no end of them, and only a branch
+    /// with more work than the best there is is worth keeping. (Its
+    /// work is claimed, as a header's is when it is kept with its work
+    /// left to a proof: a branch that weighs more is kept and checked
+    /// as any is.)
+    pub fn weigh(&self, weighed: &mut Weighed, headers: &[Header], now: u64) -> Result<(), Error> {
+        for header in headers {
+            if header.prev_hash != weighed.last.hash() {
+                return Err(Error::UnknownParent);
+            }
+            let target = self.target_from(&weighed.last, weighed.first.as_ref());
+            let parent = Known { header: weighed.last, work: weighed.work, status: Status::HeaderValid };
+            let median = weighed.times.median();
+            let work = check(&self.params, header, &parent, median, &target, now, header.quick_pow_check(&target))?;
+            if self.params.schedule.from_first_block && header.height == 1 {
+                weighed.first = Some(*header);
+            }
+            weighed.times.push(header.timestamp);
+            (weighed.last, weighed.work) = (*header, work);
+        }
+        Ok(())
     }
 
     /// The ancestor at `height` of the kept header `from`.

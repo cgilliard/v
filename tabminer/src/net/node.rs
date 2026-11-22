@@ -115,6 +115,9 @@ pub struct Counts {
     pub fetches_failed: u64,
     /// Fetches given up for coming too slowly.
     pub fetches_slow: u64,
+    /// Chains that left ours far down and were weighed whole before
+    /// any of them was kept.
+    pub weighed: u64,
     /// Headers kept that were new.
     pub headers: u64,
     /// Blocks that joined the chain here, and blocks refused.
@@ -140,6 +143,7 @@ impl Counts {
         self.fetched += o.fetched;
         self.fetches_failed += o.fetches_failed;
         self.fetches_slow += o.fetches_slow;
+        self.weighed += o.weighed;
         self.checked += o.checked;
         self.headers += o.headers;
         self.blocks += o.blocks;
@@ -551,6 +555,14 @@ pub(crate) struct Aim {
     /// height, on another branch: only whoever told us of this one
     /// answers for it.
     refused: Vec<SocketAddrV4>,
+    /// Where its chain leaves ours.
+    fork: u32,
+    /// A chain that leaves ours far down is weighed before any of it
+    /// is kept ([`Chain::weigh`]): its headers are fetched and checked
+    /// one run after another, none kept, and if it comes to more work
+    /// than the best there is they are fetched again and kept. What it
+    /// has come to so far, while that is being done.
+    weighing: Option<crate::chain::headers::Weighed>,
 }
 
 /// What the node is after, and what is being done about it: the chain
@@ -3391,29 +3403,50 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // not another for as long as a peer is passed over. (Headers
         // from an old block cost whoever makes them next to nothing,
         // and there is no end of them.)
+        //
+        // And none of it is kept before it is known to come to more
+        // work than the best there is: it is weighed first.
         let ours = self.chain.tip().map_or(0, |tip| tip.height);
+        let mut weighing = None;
         if height.saturating_add(self.chain.keep() as u32) < ours {
             if now < l.deep {
                 self.peers.failed(&from, now);
                 return;
             }
             l.deep = now.saturating_add(self.cfg.sync.pass_over);
+            match self.chain.weigh_from(&id) {
+                Ok(weighed) => weighing = Some(weighed),
+                Err(_) => return self.peers.failed(&from, now),
+            }
         }
-        let run = self.cfg.sync.headers as u32;
-        l.aim = Some(Aim {
-            tip: tip.0,
-            height: tip.1,
-            todo: (height + 1..=tip.1).step_by(run as usize).collect(),
-            done: BTreeMap::new(),
-            next: height + 1,
-            keeping: false,
-            source: from,
-            refused: Vec::new(),
-        });
+        l.aim = Some(self.aim(tip, height, from, weighing));
         l.syncing = true;
         self.shared.say(Event::HeadersWanted { from: height + 1, to: tip.1, peer: from });
         self.shared.work(self.me);
         self.fetch_headers(l, now);
+    }
+
+    /// The headers of the chain with the tip `tip`, from where it leaves
+    /// ours at `fork`: all of them still to be asked for.
+    fn aim(
+        &self,
+        tip: (Digest, u32),
+        fork: u32,
+        source: SocketAddrV4,
+        weighing: Option<crate::chain::headers::Weighed>,
+    ) -> Aim {
+        Aim {
+            tip: tip.0,
+            height: tip.1,
+            todo: (fork + 1..=tip.1).step_by(self.cfg.sync.headers as usize).collect(),
+            done: BTreeMap::new(),
+            next: fork + 1,
+            keeping: false,
+            source,
+            refused: Vec::new(),
+            fork,
+            weighing,
+        }
     }
 
     /// Asks for the runs of headers not yet asked for, as many at once
@@ -3503,6 +3536,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let Some(aim) = l.aim.as_mut().filter(|aim| !aim.keeping) else {
             return;
         };
+        // A chain being weighed: the run is checked and its work added,
+        // here and now (a hash a header), and nothing is kept.
+        if aim.weighing.is_some() {
+            return self.weigh_headers(l);
+        }
         if let Some((headers, from)) = aim.done.remove(&aim.next) {
             aim.keeping = true;
             let first = aim.next;
@@ -3526,6 +3564,40 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             let tip = self.chain.tip().ok().map(|tip| tip.height);
             let defer = defers(self.cfg.sync.sync_point, self.chain.verifier().attests_work(), tip);
             self.work(l, Job::Headers { first, headers, from, unix: self.unix, defer });
+        }
+    }
+
+    /// The runs of a chain being weighed that are here, in order: each
+    /// checked and its work added. At its tip, the chain is fetched
+    /// again to be kept if it has more work than the best there is,
+    /// and let go if not, whoever told of it having said what was not
+    /// so.
+    fn weigh_headers(&mut self, l: &mut List) {
+        let now = self.now;
+        loop {
+            let Some(aim) = l.aim.as_mut() else { return };
+            let Some(weighed) = aim.weighing.as_mut() else { return };
+            let Some((headers, from)) = aim.done.remove(&aim.next) else { return };
+            if self.chain.weigh(weighed, &headers, self.unix).is_err() {
+                return self.headers_refused(l, now, from);
+            }
+            aim.next += headers.len() as u32;
+            if aim.next <= aim.height {
+                continue;
+            }
+            let (tip, fork, source) = ((aim.tip, aim.height), aim.fork, aim.source);
+            let best = self.chain.best_header().map(|k| k.work);
+            let heavier = weighed.last().hash() == tip.0 && best.is_ok_and(|best| weighed.work() > best);
+            self.counts.weighed += 1;
+            if !heavier {
+                // (Not what was said, or no more than there is: its
+                // source is passed over, and nothing was kept.)
+                l.aim = None;
+                self.tell(now, source, Notice::Failed(source));
+                return;
+            }
+            l.aim = Some(self.aim(tip, fork, source, None));
+            return self.fetch_headers(l, now);
         }
     }
 

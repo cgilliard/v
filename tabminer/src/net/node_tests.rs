@@ -1372,6 +1372,10 @@ fn a_node_that_cannot_go_back_to_the_fork_takes_the_state() {
     let c = w.nodes[1].counts();
     assert_eq!((c.states, c.blocks_refused), (1, 1));
     assert!(w.nodes[1].list().join.is_none() && !w.nodes[1].chain().receiving() && !w.nodes[1].list().cut);
+    // (The other chain left this one far under what it could undo: its
+    // headers were weighed whole, none kept, before they were fetched
+    // again and kept, having come to more work.)
+    assert_eq!((c.weighed, c.headers), (1, 30));
 }
 
 /// A node with an old state, further behind than anyone's bodies reach,
