@@ -664,4 +664,29 @@ mod tests {
             p.size() / 1000
         );
     }
+
+    /// No word of the tables that check signatures holds up nothing,
+    /// in their first rows: of the chains' table and the hashes' none at
+    /// all can be changed unseen. Of the machine's, only what a row
+    /// computes with (an operand that is multiplied by nothing, say):
+    /// those are held to their values by what the tables send each
+    /// other, which a table's own constraints say nothing of.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn no_word_of_a_signature_s_tables_is_left_to_the_prover() {
+        use crate::proof::Kind;
+        let (cx, mut chains) = (Shared::new(), Chains::default());
+        let mut entries = Vec::new();
+        for (pk, msg, sig) in &signed(2) {
+            entries.extend(check_into(&cx, &mut chains, pk, msg, sig).unwrap());
+        }
+        cx.state(&entries);
+        let (held, free) = crate::proof::audit(cx, vec![chains], None, 256);
+        assert!(held);
+        for (kind, row, word) in &free {
+            assert!(*kind == Kind::Machine && *word < 16, "word {word} of row {row} of {kind:?} holds up nothing");
+        }
+        // (And some of the machine's are: the looking found something.)
+        assert!(!free.is_empty());
+    }
 }

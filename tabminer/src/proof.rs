@@ -156,6 +156,32 @@ pub fn prove_hidden(cx: Shared, params: impl Fn(usize) -> Params, at_least: [usi
     prove_all(cx, Vec::new(), None, |m| params(m).hiding(), at_least, Some(seed), false).expect("a proof")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: how many rows of each table are to be gone through for
+    /// words that hold up nothing, and those found ([`audit`]).
+    static AUDIT: std::cell::RefCell<Option<(usize, Vec<(Kind, usize, usize)>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: [`holds`], and the words of the first `rows` rows of each
+/// table that can have a bit changed with every constraint of their
+/// table still met ([`crate::circuit::freedoms`]): the table, the row
+/// and the word of each. A word that only what one table sends another
+/// holds to its value is among them: the tables' own constraints are
+/// all that is asked.
+#[cfg(test)]
+pub(crate) fn audit(
+    cx: Shared,
+    chains: Vec<Chains>,
+    work: Option<crate::work::Work>,
+    rows: usize,
+) -> (bool, Vec<(Kind, usize, usize)>) {
+    AUDIT.with(|asked| *asked.borrow_mut() = Some((rows, Vec::new())));
+    let held = holds(cx, chains, work);
+    (held, AUDIT.with(|asked| asked.borrow_mut().take()).map_or(Vec::new(), |found| found.1))
+}
+
 fn prove_all(
     cx: Shared,
     chains: Vec<Chains>,
@@ -236,6 +262,18 @@ fn prove_all(
         })
         .collect();
     let Some(program) = &program else {
+        // (Tests: and which words of the first rows of each table hold
+        // up nothing, if that is asked: [`audit`].)
+        #[cfg(test)]
+        AUDIT.with(|asked| {
+            if let Some((most, found)) = asked.borrow_mut().as_mut() {
+                for (at, part) in parts.iter().enumerate() {
+                    let tried: Vec<usize> = (0..part.witness.rows.min(*most)).collect();
+                    let free = crate::circuit::freedoms(part.circuit, &part.witness, &fixed[at], &tried, |_, _| 0);
+                    found.extend(free.into_iter().map(|(row, word)| (kinds[order[at]], row, word)));
+                }
+            }
+        });
         return Err(machine_rows.holds && parts.iter().all(|part| part.witness.holds()));
     };
     let (proof, _) = match seed {

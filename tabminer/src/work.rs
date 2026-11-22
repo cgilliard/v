@@ -813,4 +813,34 @@ mod tests {
             assert!(!p.verifies(), "table {table} row {row} word {word}");
         }
     }
+
+    /// No word of the tables of a header's work holds up nothing, in
+    /// their first rows, but what the tables send each other holds to
+    /// its value, which a table's own constraints say nothing of: the
+    /// machine's operands, and of a step the count its window of the
+    /// text was last taken with, one element, which nothing but what is
+    /// sent speaks of.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn no_word_of_the_work_s_tables_is_left_to_the_prover() {
+        use crate::alg::Shared;
+        use crate::pow::nonce_from_u64;
+        use crate::proof::Kind;
+        let text = SeedText::new(PowParams::DEV);
+        let cx = Shared::new();
+        let (work, _) = work_into(&cx, &text.table(10), &[7u8; 32], &nonce_from_u64(11));
+        let (held, free) = crate::proof::audit(cx, vec![], Some(work), 128);
+        assert!(held);
+        let mut of_steps = std::collections::BTreeSet::new();
+        for (kind, row, word) in &free {
+            match kind {
+                Kind::Machine => assert!(*word < 16, "word {word} of row {row} of the machine"),
+                Kind::Steps => _ = of_steps.insert(*word),
+                _ => panic!("word {word} of row {row} of {kind:?} holds up nothing"),
+            }
+        }
+        // One element: four words, one after another.
+        let words: Vec<usize> = of_steps.into_iter().collect();
+        assert_eq!((words.len(), words[3] - words[0]), (4, 3), "{words:?}");
+    }
 }
