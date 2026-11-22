@@ -54,6 +54,35 @@ export LLVM_PROFILE_FILE="$PWD/$out/prof/%p-%m.profraw"
 # tests that prove blocks, which a debug build leaves to the release
 # job, are not run here: they are minutes each, and what only they
 # reach is counted as missed, to be reached by a test that is quick.
+#
+# But for those a debug build leaves out only because it is not
+# optimized, and that an optimized build runs in a second or three:
+# this build is optimized, and they are named below (QUICK), each
+# measured at under three seconds in a release build. A test is added
+# to them by name, when it is as quick; one that is named and is not
+# there fails the run.
+QUICK=(
+    alg::tests::a_proof_is_verified_by_rows
+    alg::tests::the_verifier_s_program_is_the_same_for_every_proof
+    argument::tests::a_proof_that_hides_is_of_a_witness_that_holds
+    argument::tests::a_proof_that_hides_its_witness_verifies
+    argument::tests::what_a_hiding_proof_sends_is_the_pads_to_choose
+    arith::tests::a_computation_counts_with_it
+    chain_proof::tests::a_block_that_pays_itself_too_much_is_no_block
+    hidden::tests::the_corners_and_the_cover_hide_together
+    net::node::tests::a_new_node_takes_the_state_and_goes_on_from_it
+    net::node::tests::a_node_long_away_takes_the_state
+    net::node::tests::a_node_restarted_while_taking_a_state_goes_on
+    net::node::tests::a_state_is_gone_on_with_as_of_a_later_block
+    net::node::tests::each_piece_of_a_state_is_checked_as_it_arrives
+    net::node::tests::over_real_sockets_a_state_is_taken
+    net::node::tests::several_workers_take_a_state
+    net::node::tests::the_state_is_taken_only_when_blocks_cannot_be_had
+    net::node::tests::wrong_pieces_of_a_state_are_refused
+    signature::tests::chains_in_several_tables_are_one_proof
+    signature::tests::keys_of_any_height_are_checked_by_one_program
+    signature::tests::signatures_are_checked_by_three_tables
+)
 export CARGO_PROFILE_TEST_OPT_LEVEL=2
 export CARGO_PROFILE_DEV_OPT_LEVEL=2
 export TABMINER_FUZZ_ITERS="${TABMINER_FUZZ_ITERS:-500}"
@@ -99,6 +128,15 @@ for cpu in $variants; do
         [ "$total" -gt 0 ] || continue
         echo "$binary: $total tests in $cores processes"
         pids=""
+        # The quick ones of those an unoptimized build leaves out: in a
+        # process of their own, one at a time.
+        if [ "$cpu" = native ] && grep -qxF "${QUICK[0]}" "$out/all.txt"; then
+            for t in "${QUICK[@]}"; do
+                grep -qxF "$t" "$out/all.txt" || { echo "named as quick, and no such test: $t" >&2; exit 1; }
+            done
+            TABMINER_THREADS=1 "$binary" --ignored --test-threads=1 --exact "${QUICK[@]}" > "$out/shard.quick.log" 2>&1 &
+            pids="$pids $!"
+        fi
         for k in $(seq 0 $((cores - 1))); do
             # Every cores-th test from the k-th: neighbours, which are of
             # one module and cost alike, go to different processes.
@@ -132,11 +170,13 @@ unset RUSTFLAGS
 "$bin/llvm-profdata" merge -sparse "$out"/prof/*.profraw -o "$out/coverage.profdata"
 
 # Only this crate's code: not the dependencies', nor the standard library's.
+# Nor the files that are tests and nothing else (src/tests, the node's
+# and the wallet's): what is measured is the program.
 # Nor the program's own tests and the scale tests: nearly all of them
 # run nodes that prove blocks, or a state the size of years, which is
 # not done here, and what they would have reached of themselves is not
 # what is measured.
-ignore='(/\.cargo/|/rustc/|/src/tests/util\.rs$|/tests/(binary|scale)\.rs$)'
+ignore='(/\.cargo/|/rustc/|/src/tests/|/src/net/node_tests\.rs$|/src/wallet/tests\.rs$|/tests/(binary|scale)\.rs$)'
 # shellcheck disable=SC2086
 "$bin/llvm-cov" report --instr-profile="$out/coverage.profdata" $objects \
     --ignore-filename-regex="$ignore" > "$out/report.txt"

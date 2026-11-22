@@ -4972,6 +4972,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         (&mut self.workers, &self.shared)
     }
 
+    /// Tests: the messages given to be sent that are not sent yet: whom
+    /// each is for, its kind, and what it says.
+    #[cfg(test)]
+    pub(crate) fn posts(&self) -> Vec<(Digest, u8, Vec<u8>)> {
+        let letters = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+        letters.posts.iter().map(|post| (post.to, post.kind, post.body.clone())).collect()
+    }
+
     /// Tests: has the pool look to the chain's last block, as a worker
     /// does when the chain takes one, `taken` blocks having joined.
     #[cfg(test)]

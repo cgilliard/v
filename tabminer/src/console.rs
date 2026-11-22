@@ -1376,7 +1376,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         let until = (self.unix)() + days * 86_400 - 1;
         let word = crate::subnames::delegate(&wallet.identity_key(), name.as_bytes(), &to, until);
         let done = format!(
-            "for {days} days the key of {signer} signs for {name}, by the word of this wallet ({}): there is no              taking it back sooner, but by having the name say another address",
+            "for {days} days the key of {signer} signs for {name}, by the word of this wallet ({}): there is no taking it back sooner, but by having the name say another address",
             wallet.address()
         );
         (self.log)(&format!("Name {name}: {done}"));
@@ -1428,7 +1428,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         let (label, name) = crate::subnames::split(full).ok_or_else(|| format!("'{full}' is no label@name"))?;
         match self.wallet()?.take_name_back(label.as_bytes(), name.as_bytes()).map_err(|e| e.to_string())? {
             true => Ok(format!(
-                "{full} is given out no longer: its certificate is not signed again, and the last holds until its                  time is past (give the name to another wallet to end it at once)"
+                "{full} is given out no longer: its certificate is not signed again, and the last holds until its time is past (give the name to another wallet to end it at once)"
             )),
             false => Err(format!("{full} is not a name this wallet gave out")),
         }
@@ -2398,5 +2398,183 @@ mod tests {
         assert!(begun.contains("begun: 1 and a fee of"), "{begun}");
         assert!(begun.ends_with("sent to its wallet, to be answered"), "{begun}");
         assert!(said(&payer, "slates").contains("1"));
+    }
+
+    /// A message as it comes for a wallet: one sent to it, to be
+    /// answered by the node it came by; or the answer to one, from
+    /// whoever answers.
+    fn message(kind: u8, body: Vec<u8>, from: Option<crate::hash::Digest>) -> crate::msg::Opened {
+        crate::msg::Opened {
+            id: [1; 32],
+            from,
+            answers: from.map(|_| [1; 32]),
+            reply: if from.is_some() { Vec::new() } else { vec![1] },
+            by: from.is_none().then(|| "10.0.0.1:3737".parse().unwrap()),
+            kind,
+            body,
+        }
+    }
+
+    /// The id of a prompt's wallet, and the last message of a kind
+    /// that the node was given to send: whom it is for and what it says.
+    fn id_of(console: &TestConsole) -> crate::hash::Digest {
+        console.wallet.as_ref().unwrap().lock().unwrap().id()
+    }
+
+    fn last_post(desk: &Desk, kind: u8) -> (crate::hash::Digest, Vec<u8>) {
+        let (to, _, body) = desk.node.posts().into_iter().rev().find(|p| p.1 == kind).expect("a message");
+        (to, body)
+    }
+
+    /// A payment sent to an address goes to its wallet as a message,
+    /// is answered by a message, and is signed when the answer comes
+    /// from the wallet it was sent to: and from no other, nor of what
+    /// was not begun, or was begun in a file. One that is not delivered
+    /// is given up.
+    #[test]
+    fn a_payment_is_made_by_messages() {
+        use crate::msg::KIND_SLATE;
+        let (desk, payer, paid) = funded("messages");
+        let to = said(&paid, "address");
+        let begun = said(&payer, &format!("send 5 {to}"));
+        assert!(begun.contains(&format!("begun: 5 and a fee of 0.0000175, to {to}")), "{begun}");
+        let (whom, slate) = last_post(&desk, KIND_SLATE);
+        assert_eq!(whom, id_of(&paid));
+        let id = Slate::from_text(std::str::from_utf8(&slate).unwrap()).unwrap().id;
+        assert!(payer.awaits_answer(&id) && !paid.awaits_answer(&id));
+        // What comes that is no slate, or of no kind there is.
+        assert_eq!(paid.take(&message(99, vec![], None)), Err("a message of a kind not known (99)".to_string()));
+        let nonsense = paid.take(&message(KIND_SLATE, b"nonsense".to_vec(), None));
+        assert_eq!(nonsense, Err("what its sender sent is no slate".to_string()));
+        // Answered by the wallet it is for, back by the node it came by.
+        let answered = paid.take(&message(KIND_SLATE, slate.clone(), None)).unwrap();
+        assert!(answered.ends_with("answered: 5 to this wallet"), "{answered}");
+        let (_, answer) = last_post(&desk, KIND_SLATE);
+        assert_ne!(answer, slate);
+        // One that came by no node cannot be answered.
+        let mut lost = message(KIND_SLATE, slate, None);
+        lost.by = None;
+        assert!(desk.prompt(true).take(&lost).unwrap_err().ends_with("cannot be answered: it came by no node"));
+        // The answer from another wallet is nobody's.
+        let other = payer.take(&message(KIND_SLATE, answer.clone(), Some([9; 32]))).unwrap_err();
+        assert!(
+            other.contains(&format!("was sent to {to}, and ")) && other.ends_with("answers it: not signed"),
+            "{other}"
+        );
+        assert!(payer.awaits_answer(&id));
+        let signed = payer.take(&message(KIND_SLATE, answer.clone(), Some(id_of(&paid)))).unwrap();
+        assert!(signed.contains(&format!("answered by {to}, signed and pooled: transaction ")), "{signed}");
+        assert!(said(&payer, "sent").ends_with("pooled") && !payer.awaits_answer(&id));
+        let again = payer.take(&message(KIND_SLATE, answer, Some(id_of(&paid)))).unwrap_err();
+        assert!(again.ends_with("which this wallet has not begun"), "{again}");
+        assert_eq!(payer.resolved(&id, &id_of(&paid)), Ok(String::new()));
+        // Of a message that was no payment of this wallet's still to be
+        // answered, that it was not delivered is all there is to say.
+        let said_of = payer.undelivered(&id_of(&paid), &id, "nobody there");
+        assert_eq!(said_of, format!("Error: a message to {to} was not delivered (nobody there)"));
+        // A payment begun and not delivered is given up.
+        let begun = said(&payer, &format!("send 2 {to} \"a note\""));
+        assert!(begun.contains("note: \"a note\""), "{begun}");
+        let (_, slate) = last_post(&desk, KIND_SLATE);
+        let id = Slate::from_text(std::str::from_utf8(&slate).unwrap()).unwrap().id;
+        let given_up = payer.undelivered(&id_of(&paid), &id, "nobody there");
+        assert!(given_up.ends_with("was not delivered (nobody there): given up, nothing was spent"), "{given_up}");
+        assert_eq!(said(&payer, "slates"), "no payments begun");
+        // One begun in a file is finalized from a file.
+        let file = desk.file("by-file.slate");
+        said(&payer, &format!("send-file 1 {file}"));
+        said(&paid, &format!("receive {file}"));
+        let answer = std::fs::read(format!("{file}.received")).unwrap();
+        let by_file = payer.take(&message(KIND_SLATE, answer, Some(id_of(&paid)))).unwrap_err();
+        assert!(by_file.contains("was begun in a file") && by_file.ends_with("(finalize its answer from a file)"));
+        // The pool does not take a payment of what is spent already.
+        let logged = desk.logged.lock().unwrap().join("\n");
+        assert!(logged.contains("answered by ") && logged.contains("answered: 5 to this wallet"), "{logged}");
+    }
+
+    /// Names under a name: asked of a wallet that holds no name, each
+    /// command says what it lacks; a key is let sign for a name, by a
+    /// file that only the wallet it names takes.
+    #[test]
+    fn names_under_a_name_are_asked_for_at_the_prompt() {
+        let (desk, holder, other) = funded("under");
+        let (mine, theirs) = (said(&holder, "address"), said(&other, "address"));
+        assert_eq!((holder.reached_by_names(), holder.renew_names()), (Ok(()), Ok(())));
+        assert_eq!(wrong(&holder, "subname set bob@alice x"), "'x' is no address (tab1…)");
+        assert_eq!(wrong(&holder, &format!("subname set bob@alice {theirs}")), "alice is not registered");
+        assert_eq!(wrong(&holder, "subname del bob@alice"), "bob@alice is not a name this wallet gave out");
+        assert_eq!(wrong(&holder, "subname drop bob@alice"), "this wallet is not bob@alice");
+        assert_eq!(wrong(&holder, "send 1 bob@alice"), "alice is not registered");
+        assert!(said(&holder, "subnames").starts_with("no names under names"));
+        // A key that signs for a name, for so many days: written for the
+        // wallet whose key it is, and taken by no other.
+        let file = desk.file("alice.signer");
+        let let_sign = said(&holder, &format!("subname delegate alice {theirs} {file}"));
+        assert!(let_sign.starts_with(&format!("for 30 days the key of {theirs} signs for alice")), "{let_sign}");
+        assert!(said(&holder, &format!("subname delegate alice {theirs} 7 {file}")).starts_with("for 7 days "));
+        assert!(!wrong(&holder, &format!("subname delegate alice {theirs} many {file}")).is_empty());
+        let not_mine = wrong(&holder, &format!("subname signer {file}"));
+        assert!(not_mine.ends_with(&format!("this wallet is {mine}")), "{not_mine}");
+        assert_eq!(wrong(&other, &format!("subname signer {file}")), "alice is not registered");
+        assert!(wrong(&other, &format!("subname signer {}", desk.file("none"))).contains("none"));
+        // What comes as a name given, and is none.
+        assert!(other.take(&message(crate::msg::KIND_NAME, b"nonsense".to_vec(), None)).is_err());
+    }
+
+    /// A name under a name is given by the wallet that holds the name,
+    /// by a certificate sent to the wallet it is given to, which is the
+    /// name once it has it; a payment is sent to it; a key is let sign
+    /// for the name; and a name given is taken back, and let go of.
+    #[test]
+    fn a_name_under_a_name_is_given_paid_and_taken_back() {
+        let (desk, holder, other) = funded("given");
+        let all = [&holder, &other];
+        let (mine, theirs) = (said(&holder, "address"), said(&other, "address"));
+        // The name says its holder's address.
+        assert!(said(&holder, &format!("name-commit alice {mine}")).starts_with("Name alice: committed to"));
+        let revealed = (0..40).any(|_| {
+            desk.mine(&holder, &all);
+            matches!(holder.run("name-reveal alice"), Reply::Said(_))
+        });
+        assert!(revealed);
+        desk.mine(&holder, &all);
+        assert!(said(&holder, "name alice").contains(&format!("\n  as an address: {mine}\n")));
+        // Given: a certificate, sent to the wallet it names.
+        let given = said(&holder, &format!("subname set bob@alice {theirs}"));
+        assert!(given.starts_with(&format!("bob@alice is {theirs}, by a certificate that holds 7 days")), "{given}");
+        assert_eq!(said(&holder, "subnames"), format!("given: bob@alice is {theirs}, for 7.0 days more"));
+        let (whom, bundle) = last_post(&desk, crate::msg::KIND_NAME);
+        assert_eq!(whom, id_of(&other));
+        let taken = other.take(&message(crate::msg::KIND_NAME, bundle.clone(), None)).unwrap();
+        assert_eq!(taken, "This wallet is bob@alice, by a certificate that holds 7.0 days more");
+        assert!(
+            said(&other, "subnames").starts_with("this wallet is bob@alice, for 7.0 days more: reached by it at 0")
+        );
+        // (A certificate for another wallet is not this one's.)
+        assert!(holder.take(&message(crate::msg::KIND_NAME, bundle, None)).is_err());
+        // A key let sign for the name, taken by the wallet it names.
+        let file = desk.file("alice.signer");
+        let let_sign = said(&holder, &format!("subname delegate alice {theirs} {file}"));
+        assert!(let_sign.contains("there is no taking it back sooner, but by having the name say"), "{let_sign}");
+        let signs = said(&other, &format!("subname signer {file}"));
+        assert_eq!(signs, format!("this wallet signs for alice for 30.0 days more, by the word of {mine}"));
+        assert!(said(&other, "subnames").contains(&format!("signs for alice, by the word of {mine}, for 30.0 days")));
+        // Paid by its name: the payment waits to know whose it is.
+        let begun = said(&holder, "send 1 bob@alice");
+        assert!(begun.contains("begun: 1 and a fee of 0.0000175, to bob@alice; sent to its wallet"), "{begun}");
+        let (asked, slate) = last_post(&desk, crate::msg::KIND_SLATE);
+        let id = Slate::from_text(std::str::from_utf8(&slate).unwrap()).unwrap().id;
+        assert_ne!(asked, id_of(&other));
+        let whose = holder.resolved(&id, &id_of(&other)).unwrap();
+        assert!(whose.ends_with(&format!(": bob@alice is {theirs}")), "{whose}");
+        let lost = holder.undelivered(&id_of(&other), &id, "nobody there");
+        assert!(lost.contains(" to bob@alice was not delivered (nobody there): given up"), "{lost}");
+        // Let go of by the wallet that is it, and given out no longer.
+        assert_eq!(said(&other, "subname drop bob@alice"), "this wallet is bob@alice no longer");
+        let taken_back = said(&holder, "subname del bob@alice");
+        assert!(taken_back.starts_with("bob@alice is given out no longer"), "{taken_back}");
+        assert!(taken_back.contains("the last holds until its time is past"), "{taken_back}");
+        assert!(said(&holder, "subnames").starts_with("no names under names"));
+        assert_eq!((holder.reached_by_names(), other.renew_names(), holder.renew_names()), (Ok(()), Ok(()), Ok(())));
     }
 }
