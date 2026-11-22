@@ -4613,6 +4613,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         std::thread::Builder::new()
             .name("applier".into())
             .spawn(move || {
+                // (A node whose blocks are no longer applied answers its
+                // peers and its prompt and stands still for ever, saying
+                // nothing: if this thread fails, the node ends, as it
+                // does when a worker fails.)
+                struct Ends;
+                impl Drop for Ends {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            eprintln!("Error: the thread that applies blocks failed: the node cannot go on");
+                            std::process::abort();
+                        }
+                    }
+                }
+                let _ends = Ends;
                 // Until the node is dropped, and its end of either with it.
                 let mut next: Option<Job> = None;
                 'jobs: while let Some(job) = next.take().or_else(|| todo.recv().ok()) {

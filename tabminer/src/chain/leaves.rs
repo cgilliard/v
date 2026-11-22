@@ -227,6 +227,17 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     /// force, the one before it while a change lasts, and those the
     /// window's votes name. Returns how many went.
     pub fn keep_consensus_files(&self, keep: &[Hash]) -> Result<usize, Error> {
+        // (Looked at before anything is taken to be written: this is
+        // asked again and again, there is seldom anything to let go
+        // of, and whoever waits to write holds up everyone who comes
+        // to read after.)
+        {
+            let store = self.store();
+            let snap = store.view()?;
+            if snap.blocks().files(snap.pages())?.iter().all(|hash| keep.contains(hash)) {
+                return Ok(0);
+            }
+        }
         self.write_blocks(|txn, blocks| {
             let mut gone = 0;
             for hash in blocks.files(txn)? {

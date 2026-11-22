@@ -1124,11 +1124,16 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         // (To this wallet itself, if that is what is asked: a payment
         // that shows the wallet is reached.)
         let mut wallet = self.wallet()?;
-        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
-        let snap = state.snapshot().map_err(|e| e.to_string())?;
-        let slate = wallet
-            .send_noted(amount, fee, note.as_bytes(), &snap, (self.unix)())
-            .map_err(|e| Self::short_of(&wallet, &snap, e))?;
+        // (The chain's state is let go of before anything else is
+        // asked for: whoever holds it and waits for another lock holds
+        // up everyone, once someone comes to write to the chain.)
+        let slate = {
+            let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+            let snap = state.snapshot().map_err(|e| e.to_string())?;
+            wallet
+                .send_noted(amount, fee, note.as_bytes(), &snap, (self.unix)())
+                .map_err(|e| Self::short_of(&wallet, &snap, e))?
+        };
         let done = format!(
             "payment {} begun: {} and a fee of {}, to {}",
             &slate.id_hex()[..8],
@@ -1142,6 +1147,10 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         // from nobody until it is known whose the name is.)
         let done = if note.is_empty() { done } else { format!("{done}, note: \"{}\"", shown(note.as_bytes())) };
         wallet.send_to(&slate.id, &whom).map_err(|e| e.to_string())?;
+        // (And the wallet, before the names are taken and the node is
+        // given what to send: nothing is held while those are waited
+        // for.)
+        drop(wallet);
         let body = slate.to_text().into_bytes();
         match under {
             Some(n) => {
@@ -1242,15 +1251,17 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
     /// would have spent is the wallet's to spend again. What is to be
     /// said of it.
     pub fn undelivered(&self, to: &crate::hash::Digest, slate: &[u8; 32], why: &str) -> String {
-        let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
         // (A certificate that did not reach the wallet it is for: its
-        // tag is the id of the name. Given again later.)
+        // tag is the id of the name. Given again later. Asked of the
+        // wallet before the names are taken, never while they are held:
+        // the wallet and the names are never both waited for.)
         let given = self.wallet().ok().and_then(|wallet| {
             wallet
                 .names_given()
                 .into_iter()
                 .find(|g| digest_to_bytes(&crate::subnames::point(&g.label, &g.name)) == *slate)
         });
+        let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(given) = given {
             names.again.insert(*slate);
             let holder = crate::address::encode(&given.holder);
