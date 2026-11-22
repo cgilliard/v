@@ -1750,7 +1750,7 @@ fn prove_with(
     let blind = seed.map(|_| pcs::Blind {
         g: &blinder,
         pads: &pad_values,
-        g_pads: &pad_blinder,
+        g2: &pad_blinder,
         weights: pad_weights,
         good: &good,
     });
@@ -2488,7 +2488,7 @@ mod tests {
         assert!(!changed(&|p| p.col_rounds[2].0 += F::ONE));
         assert!(!changed(&|p| p.hidden.corners += F::ONE));
         assert!(!changed(&|p| p.pcs.blind_sum += F::ONE));
-        assert!(!changed(&|p| p.pcs.final_value += F::ONE));
+        assert!(!changed(&|p| p.pcs.first_final += F::ONE));
         let n = proof.hidden.extra.len();
         for at in [0, 5, 127, 128, 200, 255, n - 300, n - 2, n - 1] {
             assert!(!changed(&|p| p.hidden.extra[at] += F::ONE), "element {at} of {n}");
@@ -2526,7 +2526,7 @@ mod tests {
         for i in 0..a.len() {
             assert!(a[i] != b[i] && a[i] != c[i] && b[i] != c[i], "element {i}");
         }
-        assert_ne!(one.pcs.final_value, other.pcs.final_value);
+        assert_ne!(one.pcs.first_final, other.pcs.first_final);
     }
 
     #[test]
@@ -3293,7 +3293,7 @@ mod tests {
         }
         assert!(!changed(&|p| p.root[0] ^= 1));
         assert!(!changed(&|p| p.pcs.joined_finals[0] += F::ONE));
-        assert!(!changed(&|p| p.pcs.final_value += F::ONE));
+        assert!(!changed(&|p| p.pcs.first_final += F::ONE));
         assert!(!changed(&|p| p.tables[1].xyz[0] += F::ONE));
         assert!(!changed(&|p| p.tables[1].s_program[0] += F::ONE));
         assert!(!changed(&|p| p.tables.swap(0, 1)));
@@ -3371,7 +3371,7 @@ mod tests {
         p.s[77] += F::ONE;
         assert!(!check(&p));
         let mut p = good();
-        p.pcs.final_value += F::ONE;
+        p.pcs.first_final += F::ONE;
         assert!(!check(&p));
         let mut p = good();
         p.pcs.rounds[2].0 += F::ONE;

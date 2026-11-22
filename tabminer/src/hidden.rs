@@ -71,6 +71,16 @@
 //! it random ([`Places::good`]). The pads' own polynomial begins with
 //! random elements that are no pads, more than there are queries: its
 //! entries the queries open, and its last value, are uniform for them.
+//!
+//! The opening is of the sum, and then of every polynomial at the
+//! point the sum's challenges are ([`crate::pcs::open_weighted`]).
+//! The second says five things more of the witness's polynomial before
+//! a random one joins it: its value at the point, and a coefficient
+//! of each of four rounds. The same 32 elements hide those too, with
+//! the nine of the sum's first rounds and the leaves
+//! (`the_corners_and_the_cover_hide_together`). After those rounds a
+//! second random polynomial joins, of its own: the first has hidden
+//! the sum's rounds, and its value at the point is sent.
 
 use crate::alg::{Alg, Transcript};
 use crate::argument::Layout;
@@ -952,7 +962,15 @@ mod tests {
         // rounds read the cover too, and the leaves the corners. What
         // is seen of both, as one map from the whole last word, is onto:
         // the corners' sum, eight coefficients, and sixteen elements a
-        // leaf, all uniform together.
+        // leaf, all uniform together. And with them what the opening
+        // at the point shows of the polynomial before a random one
+        // joins it there: its value at the point, and a coefficient of
+        // each of that opening's first rounds, which are of the
+        // polynomial under `eq` at the point and by other challenges.
+        // (One a round, not the two sent: under `eq` a round's
+        // polynomial is `eq` in its variable times a line, so its
+        // leading coefficient follows from its constant one and the
+        // claim, for anyone.)
         let (log_cols, groups, step) = (2usize, 16usize, 4usize);
         let layout = Layout { m: vec![11], offset: vec![0], total: 11 };
         let places = Places { log_cols, groups };
@@ -961,6 +979,8 @@ mod tests {
         // Weights on everything, as the ring switching's are, and the
         // challenge's on the corners.
         let (chi, rs) = (rng.f(), rng.fs(4));
+        let point: Vec<F> = rs.iter().copied().chain(rng.fs(7)).collect();
+        let (at_point, again) = (crate::pcs::eq_table(&point), rng.fs(4));
         let mut weights = rng.fs(1 << 11);
         WEIGHED.iter().for_each(|i| weights[places.corner(&layout, *i)] += chi);
         let leaves = [9usize, 40, 41, 100, 130, 200, 255];
@@ -978,6 +998,18 @@ mod tests {
                 let fold = |t: &[F]| -> Vec<F> { t.chunks_exact(2).map(|p| p[0] + *r * (p[0] + p[1])).collect() };
                 (f, w) = (fold(&f), fold(&w));
             }
+            out.push(at_point[at]);
+            let (mut f, mut w) = (message.clone(), at_point.clone());
+            for (i, r) in again.iter().enumerate() {
+                let pairs = || f.chunks_exact(2).zip(w.chunks_exact(2));
+                let claim = f.iter().zip(&w).fold(F::ZERO, |s, (f, w)| s + *f * *w);
+                let c0 = pairs().fold(F::ZERO, |s, (f, w)| s + f[0] * w[0]);
+                let c2 = pairs().fold(F::ZERO, |s, (f, w)| s + (f[0] + f[1]) * (w[0] + w[1]));
+                assert_eq!(c2, c0 * (F::ONE + point[i]).inv() + (claim + c0) * point[i].inv());
+                out.push(c0);
+                let fold = |t: &[F]| -> Vec<F> { t.chunks_exact(2).map(|p| p[0] + *r * (p[0] + p[1])).collect() };
+                (f, w) = (fold(&f), fold(&w));
+            }
             let codeword = domain.encode(&message);
             out.extend(leaves.iter().flat_map(|l| codeword[l << step..(l + 1) << step].iter().copied()));
             out
@@ -986,7 +1018,7 @@ mod tests {
             .flat_map(|g| (0..32).map(move |bit| (g, bit)))
             .map(|(g, bit)| seen(places.at(&layout, g, bit)))
             .collect();
-        let values = 9 + (leaves.len() << step);
+        let values = 14 + (leaves.len() << step);
         let rows: Vec<Vec<F>> = (0..values).map(|v| columns.iter().map(|c| c[v]).collect()).collect();
         assert_eq!(rank(rows), values);
     }

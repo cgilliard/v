@@ -102,8 +102,9 @@ or more less; it is left as it is.
 
 **Joining.** A polynomial that joins has its codeword added to the
 folded one under a fresh challenge: a line, with the error `n / q`
-above **[T]**, ground as a fold. The programs' polynomial, the blinding
-polynomial and the pads' join this way.
+above **[T]**, ground as a fold. The programs' polynomial, the two
+blinding polynomials and the pads' join this way, in the opening at
+the point ("Sums under different weights" below).
 
 **Queries.** If the first codeword is farther than half the minimum
 distance from every codeword that folds rightly, a query finds it out
@@ -150,7 +151,46 @@ this code but the three facts marked.
 
 A polynomial that joins adds its codeword under a challenge; by the
 gap for lines the sum is near the code only if both were, so points 2
-to 4 hold of both.
+to 4 hold of both, as far as this: what the verifier ends with is the
+*sum* of the polynomials at the challenges, each under the challenge it
+joined by. That is one value, and it holds the prover to no more than
+one.
+
+**Sums under different weights.** The argument opens a sum of several
+polynomials, each under weights of its own: the witness's, the
+programs', the pads'. Its sumcheck ends in the claim that
+`sum_k theta_k v_k w_k(r)` is the last value, with `v_k` each
+polynomial at the challenges. Were those challenges the folding's, the
+codeword would give the verifier `sum_k theta'_k v_k` and nothing else
+of the `v_k`: two sums of them under different coefficients, and a
+prover who names the `v_k` after every challenge is known solves for
+them. A false sum was opened so, until this was seen; point 4 above is
+true of one polynomial and was wrongly read of several.
+
+So the opening is in two parts (`pcs::open_weighted`).
+
+1. *The sum's sumcheck, folding nothing*: its challenges `r` are a
+   point, and it ends in the claim above. The prover sends every `v_k`,
+   and they go into the transcript. **[t]**, a sumcheck.
+2. *The polynomials at the point, together*: a second sumcheck, of
+   `sum_b f(b) eq(r, b) = v_1`, with whose challenges `rho` the first
+   codeword is folded. Where the first polynomial has been folded to
+   the size of the `k`-th, a challenge `theta'_k` is drawn, the
+   `k`-th's codeword is added under it, and
+   `theta'_k v_k eq(r_lo, rho_lo)` is added to the claim: from there
+   the sum is of `eq(r_hi, .)` times the one polynomial the codeword is
+   of, the first folded and `theta'_k` times the `k`-th, since under
+   `eq` the weights of both are the same but for the known factor. At
+   the end the claim must be `eq(r, rho)` times what the codeword folds
+   to. By points 1 to 4 that value is the polynomials' sum at `rho`
+   under the `theta'_k`, so the claims added were true as a sum under
+   them; and each `theta'_k` was drawn after every `v_k` was sent, so a
+   false `v_k` passes for one `theta'_k` in `q` (the error of a round;
+   it is ground as a fold, for the gap). **[D]**
+
+The first sumcheck's claim is then checked with values the opening has
+shown. It costs a sumcheck of as many rounds more, and nothing in
+queries or codewords.
 
 ## 3. The argument (`argument.rs`, `grand.rs`, `structure.rs`)
 

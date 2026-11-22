@@ -215,6 +215,34 @@ are no pads, more than there are queries: polynomials of that degree
 take every set of values at that many points, so the entries and the
 last value are uniform, whatever the pads.
 
+**The opening at the point.** The sum's rounds fold nothing: their
+challenges `r` are a point, and the prover then sends the witness's
+polynomial at it, `g` at it, the pads' polynomial at it (its last
+value, as above) and a second random polynomial `g'` at it, and opens
+all of them there together (`docs/SOUNDNESS.md` says why: one codeword
+holds a prover to one value). That opening is the same thing over
+again with `eq(r, .)` for weights and new challenges, and what it shows
+is hidden the same way, in two parts.
+
+*Its first four rounds*, and the value of the witness's polynomial at
+`r`, are of that polynomial alone. A round's polynomial under `eq` is
+`eq` in its variable times a line, so its leading coefficient follows
+from its constant one and the claim for anyone: there are five values
+here, not nine. They are functions of the same last word that hides
+the sum's first rounds and the leaves, and they are uniform with all
+of those together: the test that builds the whole map computes its
+rank with these five rows in it
+(`the_corners_and_the_cover_hide_together`). The value at `r` is not
+new to whoever has the sum's rounds and `g` at `r`, which is why `g`
+alone would not do for what follows.
+
+*After them* `g`, the pads' polynomial and `g'` join, each under a
+challenge, and every round, codeword, polynomial sent and last value
+is of a sum with `g'` in it under a challenge: uniform, for a uniform
+`g'`, which is in nothing before. A query opens `g'`'s entry beside
+the first leaf as it does `g`'s and the pads'. What is seen of `g'`
+itself is those entries and its value at `r`.
+
 **The trees.** No leaf is salted. An unopened leaf of the first tree
 holds an entry of `g`'s codeword, and those of later trees are of the
 blinded sum, so each has 128 bits that the view does not fix, and its
