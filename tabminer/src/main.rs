@@ -57,7 +57,10 @@ impl Making {
     /// Debugging: what a block of `max_block_size` is filled with, if
     /// blocks are filled: as much of what was asked for as fits.
     fn filling(&self, max_block_size: usize) -> Option<(usize, usize)> {
-        None.filter(|_: &(usize, usize)| max_block_size > 0 && self.fill.is_some() && self.filled.is_some())
+        #[cfg(feature = "dev")]
+        return self.fill.map(|(outputs, spends)| miner::fill_plan(max_block_size, outputs, spends));
+        #[cfg(not(feature = "dev"))]
+        return None.filter(|_: &(usize, usize)| max_block_size > 0 && self.fill.is_some() && self.filled.is_some());
     }
 }
 
@@ -420,8 +423,15 @@ fn make_block(
         }
     };
     let dataset = table.read().unwrap_or_else(|e| e.into_inner());
-    let made =
-        miner::mine_with(hold.chain(), setup(), &*dataset, &paid, unix, start, &pooled, &sweeps, &proved, &cancel);
+    let made = match filling {
+        #[cfg(feature = "dev")]
+        Some((outputs, spends)) => {
+            let said = |line: &str| main.log(line);
+            let (chain, filled) = (hold.chain(), making.filled);
+            miner::mine_filled(chain, &*dataset, &paid, unix, start, outputs, spends, filled, &said, &cancel)
+        }
+        _ => miner::mine_with(hold.chain(), setup(), &*dataset, &paid, unix, start, &pooled, &sweeps, &proved, &cancel),
+    };
     // Kept, with its block's id, before the block is handed over; and
     // forgotten at once if there is no block.
     let kept = match &made {
@@ -617,12 +627,20 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         Network::Mainnet => Some(tabminer::prover::Parts::mainnet()),
         #[cfg(feature = "dev")]
         Network::Dev | Network::DevRecursive => Some(tabminer::prover::Parts::dev()),
+        // (Debugging: where no proof is checked, any network's are
+        // those, for want of its own: nothing is made or checked with
+        // them, and its nodes are to agree on them.)
+        #[cfg(feature = "dev")]
+        _ if c.debug_unchecked => Some(tabminer::prover::Parts::dev()),
         _ => std::fs::read(&kept).ok().and_then(|bytes| tabminer::prover::Parts::from_bytes(&bytes)),
     };
-    let again = read.as_ref().filter(|_| c.mine).and_then(|parts| Setup::from_parts(proofs, emission, parts));
+    // (Debugging: nor does one whose blocks are filled with what
+    // nobody sent, which are not proven.)
+    let proves = c.mine && c.debug_fill.is_none();
+    let again = read.as_ref().filter(|_| proves).and_then(|parts| Setup::from_parts(proofs, emission, parts));
     let (parts, proving) = match (read, again) {
         (Some(parts), Some(proving)) => (parts, Some(proving)),
-        (Some(parts), None) if !c.mine => (parts, None),
+        (Some(parts), None) if !proves => (parts, None),
         _ => {
             let began = Instant::now();
             main.log("Making what the proofs are made and checked with: once, for some minutes");
@@ -690,13 +708,38 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         // holds is counted from here.)
         tabminer::heap::reset_peak();
     }
-    // (Debugging: a chain made long before the node starts is not
-    // something this build makes: every block carries a proof.)
+    // Debugging: a chain made long before the node starts, of empty
+    // blocks spaced as far apart as there is time for since its first.
     #[cfg(feature = "dev")]
-    if c.debug_blocks.is_some() {
-        return Err(
-            "debug: this build makes no chain beforehand: its blocks are made one at a time, each proven".into()
-        );
+    if let Some(blocks) = c.debug_blocks {
+        let began = Instant::now();
+        // (Checked against the table as they are applied, where the
+        // network's is small enough to make in a moment, as they are
+        // from here on: from the seed's text a header is a hundred
+        // times the work.)
+        let dataset = small_table(&seed);
+        if let Some(table) = small_table(&seed) {
+            chain.set_dataset(Arc::new(table));
+        }
+        let unix = socket::unix();
+        // (As far apart as there is time for since the first block,
+        // and not so far that the chain would end ahead of now: later
+        // than its blocks are meant to be, so that each asks for the
+        // least work there is.)
+        let most = 500.max(2 * params.schedule.block_time as u64);
+        let spacing = (unix.saturating_sub(params.genesis_timestamp) / (blocks as u64 + 1)).clamp(1, most);
+        main.log(&format!("debug: making the chain {} blocks long", commas(blocks as u64)));
+        let said = |height: u32| {
+            main.log(&format!("debug: {} blocks made in {:.1}s", commas(height as u64), began.elapsed().as_secs_f64()))
+        };
+        miner::extend_empty(&chain, &seed, dataset.as_ref(), blocks, spacing, unix, &said)
+            .map_err(|e| format!("debug: making the chain longer: {e}"))?;
+        let now = chain.tip().map_or(0, |tip| tip.height);
+        main.log(&format!(
+            "debug: a chain of {} blocks ready in {:.1}s",
+            commas(now as u64),
+            began.elapsed().as_secs_f64()
+        ));
     }
     // A chain made under other rules than this build's is not gone on
     // with: nothing made here could build on it, and nothing of it

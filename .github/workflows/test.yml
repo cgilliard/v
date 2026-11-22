@@ -102,13 +102,38 @@ jobs:
           rustup default stable
           rustc --version
 
+      # (The program itself, run as a node, has the job after this one.)
       - name: Test
-        run: cargo test --locked --release --features dev
+        run: cargo test --locked --release --features dev --lib --bins
 
       # Every test marked #[ignore] is run somewhere: by the benchmarks,
       # by a job of its own below, or when the setup is made.
       - name: Check that no ignored test is forgotten
         run: ./tools/ignored.sh
+
+  # The program itself, run as whoever keeps a node runs it
+  # (tabminer/tests/binary.rs): nodes of the dev network that make
+  # blocks, pay each other at the prompt, go over to another branch,
+  # register names, vote, and pay through relays. Every block is proven
+  # and checked, so the tests whose nodes make blocks go one at a time.
+  program:
+    name: program (ubuntu-latest, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked --release --features dev --test binary
 
   # The slow tests: those marked #[ignore] that are not benchmarks, a job
   # each, in a release build. One makes two blocks with the main

@@ -436,6 +436,226 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
     Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved: took, hashes, solved })
 }
 
+/// Debugging only: how many outputs and spends of those asked for a
+/// block of `max_block_size` holds, with its reward and room for a
+/// proof: both less in the same measure, where they do not fit.
+#[cfg(feature = "dev")]
+pub fn fill_plan(max_block_size: usize, outputs: usize, spends: usize) -> (usize, usize) {
+    use crate::output::BLOCK_OUTPUT_SIZE;
+    let space = max_block_size.saturating_sub(HEADER_SIZE + Body::size_of(0, 1, 0, PROOF_BYTES));
+    let asked = spends * crate::codec::POSITION_BYTES + outputs * BLOCK_OUTPUT_SIZE;
+    match asked > space {
+        true => (outputs * space / asked, spends * space / asked),
+        false => (outputs, spends),
+    }
+}
+
+/// Debugging only: makes the block after `chain`'s last without proving
+/// it, where proofs go unchecked: of `outputs` outputs nobody is paid
+/// by (each of one unit), and `spends` spends, chosen at random, of the
+/// outputs the chain began with (`filled`: how many, and how far
+/// apart), with a stand-in the size of a proof. `paid` is the reward:
+/// what the block may make, less a unit for each of the outputs.
+/// `said` is told what the block is and how long building it took.
+#[cfg(feature = "dev")]
+#[allow(clippy::too_many_arguments)]
+pub fn mine_filled<B: Backend + 'static, S: ItemSource + Sync>(
+    chain: &Chain<B, ChainVerifier>,
+    dataset: &S,
+    paid: &Output,
+    unix: u64,
+    start: u64,
+    outputs: usize,
+    spends: usize,
+    filled: Option<(u64, u64)>,
+    said: &dyn Fn(&str),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Mined, Error> {
+    use crate::output::BlockOutput;
+    let began = Instant::now();
+    let params = *chain.params();
+    let tip = chain.tip()?;
+    let height = tip.height + 1;
+    let subsidy = params.subsidy(height);
+    if subsidy == 0 {
+        return Ok(Mined::Finished);
+    }
+    if paid.amount.checked_add(outputs as u64) != Some(subsidy) {
+        return Ok(Mined::Stale);
+    }
+    // (splitmix64, from the system's own randomness.)
+    let mut seed = [0u8; 8];
+    crate::random::fill(&mut seed)?;
+    let mut x = u64::from_le_bytes(seed);
+    let mut next = || {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    // What it spends: outputs the chain began with that are still
+    // unspent, each once.
+    let mut picked: Vec<u64> = Vec::with_capacity(spends);
+    if let Some((n, spacing)) = filled.filter(|(n, _)| *n > 0) {
+        let state = chain.whole()?;
+        let snap = state.snapshot()?;
+        let (at, id) = snap.tip();
+        if at != tip.height || (at > 0 && id != tip.hash()) {
+            return Ok(Mined::Cancelled);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(spends);
+        for _ in 0..4 * spends {
+            if picked.len() == spends {
+                break;
+            }
+            let position = (next() % n) * spacing;
+            if seen.insert(position) && snap.is_unspent(position)? {
+                picked.push(position);
+            }
+        }
+    }
+    picked.sort_unstable();
+    let mut made = vec![paid.block_output()];
+    made.extend((0..outputs).map(|_| BlockOutput {
+        commitment: core::array::from_fn(|_| next() as u8),
+        memo: core::array::from_fn(|_| next() as u8),
+        amount: 1,
+    }));
+    let spent = picked.len();
+    let body = Body { inputs: picked, outputs: made, proof: vec![0u8; PROOF_BYTES], ..Default::default() };
+    let bytes = body.to_bytes();
+    let (state_root, stated) = match chain.header_after(&BodyRef::from_bytes(&bytes)?) {
+        Ok(after) => after,
+        // The chain has gone on meanwhile, and spent what was chosen.
+        Err(_) if chain.tip()?.hash() != tip.hash() => return Ok(Mined::Stale),
+        Err(e) => return Err(e),
+    };
+    if cancel() {
+        return Ok(Mined::Cancelled);
+    }
+    let took = began.elapsed();
+    said(&format!(
+        "debug fill: block {height}: {outputs} outputs, {spent} spends, {} bytes, built in {:.2}s",
+        HEADER_SIZE + bytes.len(),
+        took.as_secs_f64()
+    ));
+    let header = Header {
+        prev_hash: tip.hash(),
+        height,
+        timestamp: unix.max(chain.earliest_timestamp(&tip)?),
+        body_commitment: body.commitment(),
+        state_root,
+        statement: stated.digest(),
+        aux: chain.aux_root()?,
+        mix: tip.mix,
+        nonce: [0; 32],
+    };
+    let target = chain.expected_target(&tip)?;
+    let began = Instant::now();
+    let Some((nonce, mix, hashes)) = solve(dataset, &header.pow_hash(), &target, start, cancel) else {
+        return Ok(Mined::Cancelled);
+    };
+    let header = Header { nonce, mix, ..header };
+    let solved = began.elapsed();
+    Ok(Mined::Block { block: Block { header, body }.to_bytes(), header, proved: took, hashes, solved })
+}
+
+/// The last blocks of a chain made long without a table whose work is
+/// done ([`extend_empty`]): more than a node joining it checks in full.
+#[cfg(feature = "dev")]
+pub const WORKED: u32 = 16;
+
+/// Debugging only: makes `chain`, whose blocks' proofs go unchecked,
+/// `blocks` blocks long, of blocks that are empty but for what each
+/// pays (to nobody) and carry no proof: a chain as long as one that has
+/// run for years, made in minutes, for trying how a node takes its
+/// headers. Their times are `spacing` seconds apart from the first
+/// block's, which on a dev network is far more than its blocks are
+/// meant to be: so each asks for the least work there is. `unix` is
+/// the time now, which no block's time may be ahead of; `progress` is
+/// told, now and then, how long the chain is.
+///
+/// With a table (`dataset`) every block's work is done. Without one a
+/// block's work is tens of milliseconds a try, from the seed's text,
+/// and a year of blocks most of a day: so only the last [`WORKED`] have
+/// their work done, and the rest claim work they have not, in a header
+/// that is otherwise what it should be; the chain is told to take
+/// their word while they are made ([`Chain::debug_trust_work`]). To a
+/// node that takes them as headers, leaving their work to a proof, and
+/// checks in full only the last few, they are what any chain's are.
+#[cfg(feature = "dev")]
+#[allow(clippy::too_many_arguments)]
+pub fn extend_empty<B: Backend + 'static>(
+    chain: &Chain<B, ChainVerifier>,
+    seed: &crate::pow::SeedText<'_>,
+    dataset: Option<&crate::pow::Dataset<'_>>,
+    blocks: u32,
+    spacing: u64,
+    unix: u64,
+    progress: &dyn Fn(u32),
+) -> Result<(), Error> {
+    use crate::output::BlockOutput;
+    let params = *chain.params();
+    loop {
+        let tip = chain.tip()?;
+        let height = tip.height + 1;
+        if height > blocks || params.subsidy(height) == 0 {
+            return Ok(());
+        }
+        // (An output like no other: its commitment is its height.)
+        let mut commitment = [0x0e; 32];
+        commitment[..4].copy_from_slice(&height.to_le_bytes());
+        let paid = BlockOutput { commitment, memo: Default::default(), amount: params.subsidy(height) };
+        let body = Body { outputs: vec![paid], ..Default::default() };
+        let bytes = body.to_bytes();
+        let (state_root, stated) = chain.header_after(&BodyRef::from_bytes(&bytes)?)?;
+        let timestamp = (params.genesis_timestamp + height as u64 * spacing).max(chain.earliest_timestamp(&tip)?);
+        let header = Header {
+            prev_hash: tip.hash(),
+            height,
+            timestamp: timestamp.min(unix),
+            body_commitment: body.commitment(),
+            state_root,
+            statement: stated.digest(),
+            aux: chain.aux_root()?,
+            mix: tip.mix,
+            nonce: [0; 32],
+        };
+        let target = chain.expected_target(&tip)?;
+        let worked = dataset.is_some() || height + WORKED > blocks;
+        chain.debug_trust_work(!worked);
+        let found = match (dataset, worked) {
+            (Some(table), _) => solve(table, &header.pow_hash(), &target, height as u64, &|| false),
+            (None, true) => solve(&seed.at(height as u64), &header.pow_hash(), &target, height as u64, &|| false),
+            // The first nonce whose claim, of a mix of nothing, meets
+            // the target.
+            (None, false) => {
+                let mut claimed = Header { mix: EMPTY, ..header };
+                let mut tried = 0u64;
+                loop {
+                    claimed.nonce = nonce_from_u64(tried);
+                    if claimed.quick_pow_check(&target) {
+                        break Some((claimed.nonce, claimed.mix, tried));
+                    }
+                    tried += 1;
+                }
+            }
+        };
+        let Some((nonce, mix, _)) = found else {
+            chain.debug_trust_work(false);
+            return Ok(());
+        };
+        let block = Block { header: Header { nonce, mix, ..header }, body }.to_bytes();
+        let applied = chain.apply_block(&crate::block::BlockRef::from_bytes(&block)?, unix);
+        chain.debug_trust_work(false);
+        applied?;
+        if height.is_multiple_of(5000) {
+            progress(height);
+        }
+    }
+}
+
 /// A nonce whose hash with `header_hash` meets `target`, with the mix
 /// that goes in the header beside it, and how many were tried: on
 /// every thread there is, the nonces from `start` dealt out among
