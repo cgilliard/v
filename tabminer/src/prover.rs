@@ -423,7 +423,10 @@ impl Parts {
         let mut r = crate::codec::Reader(bytes);
         let pair = |r: &mut crate::codec::Reader<'_>| -> Option<[usize; 2]> {
             let rows = [r.u64()?, r.u64()?];
-            rows.iter().all(|n| (*n == 0 || n.is_power_of_two()) && *n <= 1 << 30).then(|| rows.map(|n| n as usize))
+            // (None, or what a table can be: a power of two, of the
+            // rows of a group of hashes at the least.)
+            let sized = |n: &u64| *n == 0 || (n.is_power_of_two() && (128..=1 << 30).contains(n));
+            rows.iter().all(sized).then(|| rows.map(|n| n as usize))
         };
         let count = |r: &mut crate::codec::Reader<'_>| r.u32().filter(|n| *n <= 1 << 12).map(|n| n as usize);
         if r.u32()? != PARTS_VERSION {

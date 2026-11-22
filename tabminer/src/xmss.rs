@@ -329,7 +329,8 @@ impl Signature {
         if height == 0 || height > MAX_HEIGHT || bytes.len() != Self::size(height) {
             return None;
         }
-        let index = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        // (A leaf the tree has.)
+        let index = Some(u64::from_le_bytes(bytes[..8].try_into().unwrap())).filter(|i| *i >> height == 0)?;
         let mut digests = bytes[8..].chunks_exact(OUT_LEN).map(|d| -> Digest { d.try_into().unwrap() });
         let randomizer = digests.next()?;
         let mut wots = [[0u8; OUT_LEN]; CHAINS];

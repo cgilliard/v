@@ -140,7 +140,12 @@ fn covered_digest_of(outputs: impl Iterator<Item = (Commitment, Digest)>) -> Dig
     outputs.fold(EMPTY, |acc, (commitment, slot)| {
         let mut item = [0u8; 64];
         item[..32].copy_from_slice(&commitment);
-        item[32..32 + MEMO_LEN + 8].copy_from_slice(&slot[..MEMO_LEN + 8]);
+        // (The slot whole: an output's ends in nothing, as a block lists
+        // it, and a covenant's that does not is of no output there
+        // could be, to this as to a proof. Were its end left out, two
+        // encodings would be one policy, of which only one could be
+        // spent here.)
+        item[32..].copy_from_slice(&slot);
         let mut pair = [0u8; 64];
         pair[..32].copy_from_slice(&acc);
         pair[32..].copy_from_slice(&hash_domain(DOM_OUT_ITEM, &item));
@@ -941,6 +946,29 @@ impl<'a> PolicyInputRef<'a> {
         Ok(())
     }
 
+    /// Whether the input is said the one way there is to say it, where
+    /// what it is checked by ([`PolicyInputRef::check`], and a proof)
+    /// takes more than one: its leaf within bounds; a state number only
+    /// where a condition reads it; the signers of each condition in the
+    /// order of its keys. None of that is under a transaction's id or a
+    /// signature, and whoever passed a transaction on could say it
+    /// another way, of the same id: a pool takes the one.
+    pub fn canonical(&self) -> bool {
+        let read = self
+            .leaf
+            .conds()
+            .any(|c| matches!(c, CondRef::State(_) | CondRef::Thresh { mode: Mode::Rebindable { .. }, .. }));
+        self.leaf.valid()
+            && (read || self.state == 0)
+            && self.witnesses().all(|(_, witness)| match witness {
+                WitnessRef::Signatures(signers) => {
+                    let keys: Vec<u8> = signers.map(|s| s.key).collect();
+                    keys.windows(2).all(|pair| pair[0] < pair[1])
+                }
+                _ => true,
+            })
+    }
+
     /// The input, owned.
     pub fn to_input(&self) -> PolicyInput {
         PolicyInput {
@@ -1538,6 +1566,23 @@ mod tests {
         let (back, rest) = PolicyInput::read(&bytes).unwrap();
         assert!(rest.is_empty());
         assert_eq!(back, spend);
+        // It is said the one way there is to say it. Its signers the
+        // other way about, or a state number that nothing reads, is the
+        // same spend to whatever checks it, said another way: which a
+        // pool does not take.
+        let said = |spend: &PolicyInput| {
+            let bytes = spend.to_bytes();
+            let view = PolicyInputRef::read(&bytes).unwrap().0;
+            (view.check(&body, &outputs, 1, 0), view.canonical())
+        };
+        assert_eq!(said(&spend), (Ok(()), true));
+        let mut other = spend.clone();
+        if let CondWitness::Signatures(signers) = &mut other.witness[0] {
+            signers.reverse();
+        }
+        assert_eq!(said(&other), (Ok(()), false));
+        let other = PolicyInput { state: 9, ..spend.clone() };
+        assert_eq!(said(&other), (Ok(()), false));
 
         // HTLC claim with the preimage; refund after the timeout.
         let mut claim = policy.spend(1, amount, 7);

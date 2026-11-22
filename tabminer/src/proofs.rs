@@ -357,7 +357,11 @@ impl Proof {
             Some(head)
         };
         let height = u32::from_le_bytes(take(4)?.try_into().ok()?);
-        let position = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        // (A position there is: the path reads no more of it than the
+        // tree is deep, and one past that would be the same proof said
+        // another way.)
+        let position =
+            Some(u64::from_le_bytes(take(8)?.try_into().ok()?)).filter(|p| *p < crate::output::OUTPUT_CAPACITY)?;
         let key_hash = digest_from_bytes(take(32)?)?;
         let amount = u64::from_le_bytes(take(8)?.try_into().ok()?);
         let memo = memo_from_bytes(take(MEMO_BYTES)?).ok()?;

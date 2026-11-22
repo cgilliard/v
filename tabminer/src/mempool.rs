@@ -542,6 +542,10 @@ fn check_static(tx: &TransactionRef<'_>, policy: &Policy) -> Result<(u64, u64), 
         return Err(Reject::Malformed);
     }
     if n.policy_inputs > 0 {
+        // (Said the one way there is, before anything is made of it.)
+        if !tx.policy_inputs().all(|input| input.canonical()) {
+            return Err(Reject::Malformed);
+        }
         let rule = tx.to_transaction().rule(|_| ([0; 20], 0));
         let rows = rule.policy.iter().map(crate::segment::policy_rows).max().unwrap_or(0);
         if rows > MAX_TX_ROWS {
