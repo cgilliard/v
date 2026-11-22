@@ -56,11 +56,11 @@ export LLVM_PROFILE_FILE="$PWD/$out/prof/%p-%m.profraw"
 # reach is counted as missed, to be reached by a test that is quick.
 #
 # But for those a debug build leaves out only because it is not
-# optimized, and that an optimized build runs in a second or three:
-# this build is optimized, and they are named below (QUICK), each
-# measured at under three seconds in a release build. A test is added
-# to them by name, when it is as quick; one that is named and is not
-# there fails the run.
+# optimized, and that an optimized build runs in seconds: this build is
+# optimized, and they are named below (QUICK), each measured at under
+# seven seconds in a release build (most of them under one). A test is
+# added to them by name, when it is as quick; one that is named and is
+# not there fails the run.
 QUICK=(
     alg::tests::a_proof_is_verified_by_rows
     alg::tests::the_verifier_s_program_is_the_same_for_every_proof
@@ -79,9 +79,13 @@ QUICK=(
     net::node::tests::several_workers_take_a_state
     net::node::tests::the_state_is_taken_only_when_blocks_cannot_be_had
     net::node::tests::wrong_pieces_of_a_state_are_refused
+    proof::tests::a_proof_that_hides_is_verified_by_a_computation
+    segment::tests::two_runs_are_joined_and_a_transaction_may_lie_across_them
+    signature::tests::a_proof_of_signatures_is_verified_by_rows
     signature::tests::chains_in_several_tables_are_one_proof
     signature::tests::keys_of_any_height_are_checked_by_one_program
     signature::tests::signatures_are_checked_by_three_tables
+    signature::tests::two_proofs_of_signatures_are_joined
 )
 export CARGO_PROFILE_TEST_OPT_LEVEL=2
 export CARGO_PROFILE_DEV_OPT_LEVEL=2

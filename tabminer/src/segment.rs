@@ -2747,6 +2747,21 @@ mod tests {
         covered: u32,
         signs: Option<([u64; 2], Option<Digest>)>,
     ) -> (bool, bool) {
+        let (run, tx) = spend_run(c, leaf, state, outs, covered, signs);
+        let mut record = Record::start(&c.outputs, EMPTY, EMPTY, 100);
+        (proves(run, None), record.apply(&mut c.outputs.clone(), &tx).is_ok())
+    }
+
+    /// The run of such a spend, and its transaction.
+    #[allow(clippy::type_complexity)]
+    fn spend_run(
+        c: &Channel,
+        leaf: usize,
+        state: u32,
+        outs: Vec<(Output, Digest)>,
+        covered: u32,
+        signs: Option<([u64; 2], Option<Digest>)>,
+    ) -> (Run, Transaction) {
         use crate::conditions::{PolicyInput, Shown, rebind_message};
         let conds = c.policy.0[leaf].clone();
         let owners: Vec<Digest> = outs.iter().map(|o| o.1).collect();
@@ -2792,8 +2807,7 @@ mod tests {
             outputs.insert(output, 100);
         }
         run.settle();
-        let mut record = start;
-        (proves(run, None), record.apply(&mut c.outputs.clone(), &tx).is_ok())
+        (run, tx)
     }
 
     #[test]
@@ -3103,7 +3117,15 @@ mod tests {
         let c = circuit();
         let n = named();
         let wc = 1usize << c.log_cols;
-        let runs = [run_of(&a_scene(), |_, _| {}).0, named_run(&n, true).0];
+        // (And two spends of a policy's output: one by a covenant, one
+        // by a channel's two keys.)
+        let ch = channel();
+        let mine = key_hash(&key(0));
+        let covenant = spend_run(&ch, 1, 0, vec![(ch.settle, mine)], 1, None).0;
+        let root = ch.policy.root();
+        let next = (Output::to(&root, 60, [7; MEMO]), root);
+        let rebound = spend_run(&ch, 0, 7, vec![next], 1, Some(([7, 7], None))).0;
+        let runs = [run_of(&a_scene(), |_, _| {}).0, named_run(&n, true).0, covenant, rebound];
         let mut kinds = std::collections::BTreeSet::new();
         for run in runs {
             let (rows, program, public) = run.finish(128);
@@ -3136,8 +3158,7 @@ mod tests {
             // (And the words past a row's own are nobody's: of nothing.)
             assert!(w.words.chunks(wc).all(|row| row[c.cols..].iter().all(|word| *word == 0)));
         }
-        // Fifty and more of the kinds there are were among them: all
-        // but those of a policy's spend.
-        assert!(kinds.len() >= 50, "{} kinds", kinds.len());
+        // Nearly every kind there is was among them.
+        assert!(kinds.len() >= 65, "{} of {KINDS} kinds", kinds.len());
     }
 }
