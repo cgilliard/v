@@ -1351,6 +1351,29 @@ fn a_node_far_behind_takes_the_state_though_the_blocks_could_be_had() {
     }
 }
 
+/// A node whose chain is not the one with the most work, and which
+/// cannot undo as far as where the two part, takes the state as of a
+/// block of the other: how far a node can go back is its own affair,
+/// and it is not left on a chain of its own for it.
+#[test]
+fn a_node_that_cannot_go_back_to_the_fork_takes_the_state() {
+    let ahead = chain_of(easy());
+    grow_wide(&ahead, 30, 20, 1);
+    // (It can undo eight blocks, and has twenty the other has not.)
+    let ours = Chain::open(MemBackend::new(), 8, easy(), seed(), AcceptAllProofs).unwrap();
+    ours.set_dataset(table());
+    let ours = Arc::new(ours);
+    grow_wide(&ours, 20, 20, 2);
+    let mut w = World::with(vec![ahead, ours], &joining());
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(90 * SECOND);
+    assert_eq!(tip(&w, 1), tip(&w, 0));
+    assert_eq!(w.nodes[1].chain().state().root(), w.nodes[0].chain().state().root());
+    let c = w.nodes[1].counts();
+    assert_eq!((c.states, c.blocks_refused), (1, 1));
+    assert!(w.nodes[1].list().join.is_none() && !w.nodes[1].chain().receiving() && !w.nodes[1].list().cut);
+}
+
 /// A node with an old state, further behind than anyone's bodies reach,
 /// gives it up for the state taken whole.
 #[test]

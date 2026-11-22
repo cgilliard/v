@@ -163,6 +163,9 @@ pub enum Error {
     /// The outputs a block makes do not sum to what it spends and its
     /// subsidy.
     Supply,
+    /// A block makes an output of no coins: an output of none is a
+    /// commitment to a name, which is made as one.
+    EmptyOutput,
     /// The block's proof is not accepted.
     BadProof,
     /// The body of a block of the branch is not kept.
@@ -273,6 +276,7 @@ impl fmt::Display for Error {
             Error::BadBodyCommitment => f.write_str("the body is not the header's"),
             Error::TooLarge(size) => write!(f, "a block of {size} bytes is too large"),
             Error::Supply => f.write_str("the block makes coins it may not"),
+            Error::EmptyOutput => f.write_str("the block makes an output of no coins"),
             Error::BadProof => f.write_str("the block's proof is not accepted"),
             Error::MissingBody => f.write_str("a block of the branch has no body kept"),
             Error::BadProofBefore(_) => {
@@ -355,6 +359,7 @@ mod tests {
             Error::BadBodyCommitment,
             Error::TooLarge(9),
             Error::Supply,
+            Error::EmptyOutput,
             Error::BadProof,
             Error::MissingBody,
             Error::BadProofBefore([0; 16]),

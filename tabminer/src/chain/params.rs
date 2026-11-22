@@ -27,7 +27,7 @@ use crate::u256::U256;
 /// schedule makes, 735,840,000 of them, is 7.4 × 10^18 base units, which a
 /// `u64` (1.8 × 10^19) holds with room for 2.5 times as many; at eleven
 /// decimals it would not.
-pub const COIN: u64 = 10_000_000_000;
+pub const COIN: u64 = crate::ledger::COIN;
 /// Decimal places of [`COIN`].
 pub const DECIMALS: usize = 10;
 /// Blocks per year at the ten-minute target: 144 a day.
@@ -35,11 +35,7 @@ pub const BLOCKS_PER_YEAR: u32 = 144 * 365;
 
 /// Mainnet emission: 1500 coins a block for 3.5 years, 500 for 3.5 years,
 /// then 7 for 1000 years, 735,840,000 coins in all; then the chain ends.
-pub const MAINNET_EMISSION: &[(u32, u64)] = &[
-    (BLOCKS_PER_YEAR * 7 / 2, 1500 * COIN),
-    (BLOCKS_PER_YEAR * 7 / 2, 500 * COIN),
-    (BLOCKS_PER_YEAR * 1000, 7 * COIN),
-];
+pub const MAINNET_EMISSION: &[(u32, u64)] = crate::ledger::MAINNET_EMISSION.0;
 
 /// The 32 bytes `hex` writes, as 64 digits: a hash as it is shown. The
 /// program is not built of anything else.
@@ -141,7 +137,10 @@ impl ChainParams {
         genesis_target: U256([0, 0, 0, 1 << 36]), // 2^20 hashes, about a second on 12 cores
         max_target: ChainParams::MAINNET.max_target,
         max_block_size: 2_000_000,
-        max_future_drift: 2 * 3600,
+        // (A sixth of the half life, where the main network's two
+        // hours are a twenty-fourth of its: a block stamped as far
+        // ahead as may be makes the next an eighth easier, not free.)
+        max_future_drift: 10,
         median_time_window: 11,
         emission: MAINNET_EMISSION,
         min_reveal: crate::name::MIN_REVEAL,
@@ -170,6 +169,7 @@ impl ChainParams {
     pub const DEV_RECURSIVE: ChainParams = ChainParams {
         genesis_nonce: *b"tabminer dev network, recursive.",
         schedule: Schedule { block_time: 10, half_life: 300, from_first_block: true },
+        max_future_drift: 50,
         ..Self::DEV
     };
 

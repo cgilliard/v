@@ -68,13 +68,13 @@ pub const CHARSET: &[u8; 37] = b"abcdefghijklmnopqrstuvwxyz0123456789_";
 /// users as their owners admit, so few top-level ones are needed; a name
 /// never expires, so a slow allocation keeps the namespace from being
 /// taken early.
-pub const MAX_REVEALS: usize = 5;
+pub const MAX_REVEALS: usize = crate::registry::MAX_REVEALS;
 /// Most commits in a block: one, the long-run rate of new names.
-pub const MAX_COMMITS: usize = 1;
+pub const MAX_COMMITS: usize = crate::registry::MAX_COMMITS;
 /// Most updates in a block.
-pub const MAX_UPDATES: usize = 8;
+pub const MAX_UPDATES: usize = crate::registry::MAX_UPDATES;
 /// Most swept commits in a block.
-pub const MAX_SWEEPS: usize = 16;
+pub const MAX_SWEEPS: usize = crate::registry::MAX_SWEEPS;
 /// A commit made in the block at height `h` can be revealed in blocks
 /// `h + MIN_REVEAL` to `h + MAX_REVEAL`, and swept after that.
 ///
@@ -84,8 +84,8 @@ pub const MAX_SWEEPS: usize = 16;
 /// then commit to the name first: how deep is deep enough is for
 /// whoever registers the name to say, not the chain (the wallet waits
 /// as long as it waits before it spends an output, unless told).
-pub const MIN_REVEAL: u32 = 1;
-pub const MAX_REVEAL: u32 = 288;
+pub const MIN_REVEAL: u32 = crate::registry::MIN_REVEAL;
+pub const MAX_REVEAL: u32 = crate::registry::MAX_REVEAL;
 
 /// Whether a commit made at `commit_height` can be revealed at `height`,
 /// where a commit waits `min_reveal` blocks ([`MIN_REVEAL`] on mainnet).

@@ -646,6 +646,11 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     let (parts, proving) = match (read, again) {
         (Some(parts), Some(proving)) => (parts, Some(proving)),
         (Some(parts), None) if !proves => (parts, None),
+        // (The main network's are never made here: a node with others
+        // of its own would make blocks nobody takes, and take nobody's.)
+        _ if matches!(c.network, Network::Mainnet) => {
+            return Err("the proofs' setup built in is not this build's: it makes no block of the main network".into());
+        }
         _ => {
             let began = Instant::now();
             main.log("Making what the proofs are made and checked with: once, for some minutes");
@@ -658,6 +663,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             (parts, Some(proving))
         }
     };
+    if matches!(c.network, Network::Mainnet) && parts.own != params.program {
+        return Err("the proofs' setup built in is not the main network's".into());
+    }
     params.program = parts.own;
     let mut verifier = ChainVerifier::of(&proofs, &parts);
     if let Some(proving) = proving

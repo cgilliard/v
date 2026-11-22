@@ -38,6 +38,9 @@ pub const NAME_MAX: usize = 32;
 /// Levels of the registry: a name's place is this many bits of its hash.
 pub const HEIGHT: usize = 128;
 /// Blocks after its commitment that a name may be revealed from, and to.
+/// (These and the four after are the chain's too: [`crate::name`] and the
+/// chain's parameters have them from here, and say why they are what
+/// they are.)
 pub const MIN_REVEAL: u32 = 1;
 pub const MAX_REVEAL: u32 = 288;
 /// What a block may hold of each.

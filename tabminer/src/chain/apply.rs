@@ -128,8 +128,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
     /// `now` is the caller's clock, in seconds.
     ///
     /// A block that breaks a rule is remembered as invalid, by id, so it
-    /// is not checked again; one whose branch leaves the chain below
-    /// what can be undone is set aside.
+    /// is not checked again. One whose branch has the most work and
+    /// leaves the chain below what can be undone
+    /// ([`Error::NoUndoRecord`]) is not kept, and nothing is held
+    /// against it: its header is, and the chain is then cut off
+    /// ([`Chain::cut_off`]) until the state is taken as of a block of
+    /// that branch. How far a node can go back is its own affair, and
+    /// which chain is the one is not.
     pub fn apply_block(&self, block: &BlockRef<'_>, now: u64) -> Result<Applied, Error> {
         let _timed = Timed(std::time::Instant::now(), block.header().height);
         let id = block.header().hash();
@@ -156,8 +161,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
                 result = Err(Error::BadProofBefore(Error::id_half(&bad)));
             }
         }
+        if result == Err(Error::NoUndoRecord) {
+            // (The session kept nothing of it. A header that is there
+            // already stays as it was.)
+            let _ = self.accept_header(block.header(), now);
+        }
         let status = match &result {
-            Err(Error::NoUndoRecord) => Some(Status::Aside),
             Err(e) if condemns(e) => Some(Status::Invalid),
             _ => None,
         };
@@ -264,6 +273,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         }
         if HEADER_SIZE + body.size() > self.params.max_block_size {
             return Err(Error::BadProof);
+        }
+        // An output of nothing is told from a commitment to a name by
+        // its hash alone, which the store does not see: no block makes
+        // one.
+        if body.outputs().any(|o| o.amount == 0) {
+            return Err(Error::EmptyOutput);
         }
         Ok(())
     }
@@ -729,6 +744,8 @@ pub(crate) mod tests {
         // More coins than it spends and is paid; and fewer.
         refused(&block(&chain, &body(&[1], &[out(4, 2000 * COIN + 1)])), Error::Supply, true);
         refused(&block(&chain, &body(&[], &[out(5, PAY - 1)])), Error::Supply, true);
+        // An output of no coins, the block's sums as they should be.
+        refused(&block(&chain, &body(&[], &[out(5, PAY), out(6, 0)])), Error::EmptyOutput, true);
         // An output spent already, and one never made.
         refused(&block_with(&chain, &body(&[0], &[out(6, PAY)]), Some(d(1))), Error::NoSuchOutput(0), true);
         refused(&block_with(&chain, &body(&[9], &[out(7, PAY)]), Some(d(1))), Error::NoSuchOutput(9), true);
@@ -1035,7 +1052,8 @@ pub(crate) mod tests {
     }
 
     /// Bodies are kept for the blocks that can be undone and no longer,
-    /// and a branch that leaves the chain below them is set aside.
+    /// and a branch that leaves the chain below them is not gone over
+    /// to: the chain is cut off from it, and says so.
     #[test]
     fn what_cannot_be_undone_is_not_kept() {
         let (ours, theirs) = (open_with(easy(), 3, AcceptAllProofs), open(easy()));
@@ -1052,10 +1070,16 @@ pub(crate) mod tests {
             assert_eq!(apply(&ours, x), Ok(Applied::Side));
         }
         let before = (ours.tip().unwrap(), ours.state().root());
+        assert_eq!(ours.cut_off(), Ok(None));
         assert_eq!(apply(&ours, &b[6]), Err(Error::NoUndoRecord));
         assert_eq!((ours.tip().unwrap(), ours.state().root()), before);
-        assert_eq!(status(&ours, &b[6]), Some(Status::Aside));
-        assert_eq!(apply(&ours, &b[6]), Err(Error::SetAside));
+        // Nothing is held against the block: its header is the best
+        // there is, and it is refused again for the same reason. The
+        // chain is cut off where the branch leaves it.
+        assert_eq!(status(&ours, &b[6]), Some(Status::HeaderOnly));
+        assert_eq!(ours.best_header().unwrap().header, header_of(&b[6]));
+        assert_eq!(apply(&ours, &b[6]), Err(Error::NoUndoRecord));
+        assert_eq!(ours.cut_off(), Ok(Some(0)));
         // The chain goes on, and a fork within reach is still taken.
         let a7 = extend(&ours, &body(&[], &[out(16, PAY)]));
         let stayed = open(easy());
@@ -1066,5 +1090,9 @@ pub(crate) mod tests {
         assert_eq!(apply(&ours, &c8), Ok(Applied::Reorganized { fork_height: 6, unwound: 1 }));
         assert_eq!(ours.state().root(), stayed.state().root());
         assert_eq!(status(&ours, &a7), Some(Status::Valid));
+        // (With the most work on its own branch again, it is cut off
+        // from nothing.)
+        assert_eq!(ours.best_header().unwrap().header, header_of(&c8));
+        assert_eq!(ours.cut_off(), Ok(None));
     }
 }

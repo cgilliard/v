@@ -711,6 +711,30 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         })
     }
 
+    /// Where the branch of the header with the most work leaves the
+    /// chain, if that is below what the chain can undo: the height of
+    /// the last block the two share. The chain cannot go over to that
+    /// branch block by block, and is on the one with the most work
+    /// again only by taking the state as of a block of it.
+    pub fn cut_off(&self) -> Result<Option<u32>, Error> {
+        let state = self.whole()?;
+        let undo = state.oldest_undo();
+        let snap = state.snapshot()?;
+        let (pages, blocks) = (snap.pages(), snap.blocks());
+        let tip = self.tip_in(pages, blocks, snap.tip().0)?;
+        let mut at = self.best_in(pages, blocks, &tip)?.header;
+        // (A header above the chain's last is on another branch or
+        // leads down to that block: the chain's own are above none.)
+        while !self.is_main_in(pages, blocks, &at)? {
+            match self.header_in(pages, blocks, &at.prev_hash)? {
+                Some(parent) => at = parent,
+                None => return Ok(None),
+            }
+        }
+        let reached = at.height >= tip.header.height || undo.is_some_and(|oldest| oldest <= at.height + 1);
+        Ok((!reached).then_some(at.height))
+    }
+
     /// The ancestor at `height` of the kept header `from`.
     pub fn ancestor(&self, from: &Header, height: u32) -> Result<Option<Header>, Error> {
         if height > from.height {

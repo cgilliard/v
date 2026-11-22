@@ -601,6 +601,10 @@ pub(crate) struct List {
     /// The work of headers is being checked in full, by whoever does
     /// what takes time ([`Job::Confirm`]): one such at a time.
     confirming: bool,
+    /// A block of the branch with the most work was refused because
+    /// the chain cannot undo so far ([`Chain::cut_off`]): looked into
+    /// before blocks are asked for, until it is so no longer.
+    cut: bool,
 }
 
 impl List {
@@ -620,6 +624,7 @@ impl List {
             views: vec![View::default(); workers],
             syncing: false,
             confirming: false,
+            cut: false,
         }
     }
 }
@@ -3834,10 +3839,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // asked for once it is to be: what was asked for is let come.
         // (And where the chain is so far behind that the state is to be
         // taken, that is seen to before a block is asked for.)
-        if l.join.is_none() && now >= l.rejoin.0 && self.far_behind() {
+        if l.join.is_none() && now >= l.rejoin.0 && self.far_behind(l) {
             self.sync_state(l, now);
         }
-        if self.chain.receiving() || l.join.as_ref().is_some_and(|j| j.far) {
+        // (Nor is a block asked for that the chain cannot go over to:
+        // it would be refused as the last one was, and asked for
+        // again.)
+        if self.chain.receiving() || l.join.as_ref().is_some_and(|j| j.far) || self.cut_off(l).is_some() {
             return;
         }
         let mut need = vec![self.chain.params().genesis().header; self.cfg.sync.lookahead];
@@ -4071,6 +4079,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Err(e) => {
                 self.counts.blocks_refused += 1;
                 self.shared.say(Event::BlockRefused { header, from, why: e.to_string() });
+                l.cut |= e == Error::NoUndoRecord;
                 // A body that is not the header's, a proof that does
                 // not hold (the block may be good, and is asked of
                 // another), or a block that breaks a rule: whoever
@@ -4259,9 +4268,37 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// Whether the chain is further under the best header than a node
     /// catches up from block by block
     /// ([`super::config::Sync::sync_behind`]).
-    fn far_behind(&self) -> bool {
+    /// Where the branch with the most work leaves the chain, if the
+    /// chain cannot undo so far and a block was refused for it.
+    fn cut_off(&self, l: &mut List) -> Option<u32> {
+        if !l.cut {
+            return None;
+        }
+        match self.chain.cut_off() {
+            Ok(Some(fork)) => Some(fork),
+            // (While the state is being taken there is nothing to
+            // undo, and what it will be cut off from is not known.)
+            Err(Error::Receiving) => None,
+            _ => {
+                l.cut = false;
+                None
+            }
+        }
+    }
+
+    /// Whether the state is to be taken though blocks could be had:
+    /// the chain is further behind than it is set to catch up from, or
+    /// cannot go back to where the branch with the most work leaves
+    /// it.
+    fn far_behind(&self, l: &mut List) -> bool {
         let (point, behind) = (self.cfg.sync.sync_point, self.cfg.sync.sync_behind);
-        if point == 0 || behind == 0 || self.chain.receiving() {
+        if point == 0 || self.chain.receiving() {
+            return false;
+        }
+        if self.cut_off(l).is_some() {
+            return true;
+        }
+        if behind == 0 {
             return false;
         }
         match (self.chain.best_header(), self.chain.tip()) {
@@ -4277,7 +4314,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // (So far behind that the state is taken though the blocks
         // could be had: whatever is being done with blocks goes on
         // until the chain begins to receive it.)
-        let far = self.far_behind();
+        let far = self.far_behind(l);
         if point == 0 || l.aim.is_some() || (!far && !l.applying.is_empty()) {
             return false;
         }
@@ -4303,7 +4340,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let Some(reach) = state_reach(&l.views) else {
             return false;
         };
-        let height = best.height.saturating_sub(point).max(reach).max(1);
+        // (And of the branch the chain cannot go over to, if it is cut
+        // off from one: above where that branch leaves it.)
+        let above = self.cut_off(l).map_or(0, |fork| fork + 1);
+        let height = best.height.saturating_sub(point).max(reach).max(above).max(1);
         if height > best.height {
             return false;
         }

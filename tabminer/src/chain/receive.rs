@@ -31,7 +31,7 @@
 //! ([`Chain::begin_receiving`], again): the parts that are the same
 //! are kept.
 
-use crate::block::{BlockRef, Header};
+use crate::block::{BlockRef, BodyRef, Header};
 use crate::error::Error;
 use crate::hash::Digest;
 use crate::name::Record as NameRecord;
@@ -57,13 +57,31 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
     /// over says, and the header and the proof hold them to).
     pub fn check_state_block(&self, block: &BlockRef<'_>, next: u64, roots: &(Digest, Digest)) -> Result<(), Error> {
         let (header, body) = (block.header(), block.body());
-        let known = {
+        let (known, target) = {
             let store = self.store();
             let snap = store.view()?;
-            self.known_in(snap.pages(), snap.blocks(), &header.hash())?.ok_or(Error::UnknownParent)?
+            let (pages, blocks) = (snap.pages(), snap.blocks());
+            let known = self.known_in(pages, blocks, &header.hash())?.ok_or(Error::UnknownParent)?;
+            // (What its work is held to, if its work was never looked
+            // at in full.)
+            let target = match known.status {
+                Status::WorkPending => {
+                    let parent = self.known_in(pages, blocks, &header.prev_hash)?.ok_or(Error::UnknownParent)?;
+                    let first = self.anchor_in(pages, blocks, &parent.header)?;
+                    Some(self.target_from(&parent.header, first.as_ref()))
+                }
+                _ => None,
+            };
+            (known, target)
         };
         if known.invalid() {
             return Err(Error::KnownInvalid);
+        }
+        // Its proof attests the work of the headers before it, and not
+        // its own: that is checked here, whoever calls, if it was left
+        // to a proof.
+        if target.is_some_and(|target| !self.full_pow(header, &target)) {
+            return Err(Error::BadProofOfWork);
         }
         self.check_body(header, &body)?;
         if crate::registry::state_root(&roots.0, &roots.1) != header.state_root {
@@ -234,6 +252,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         // have a state at a block its chain did not have.
         let finished = receiving.finish_with(self.keep, |txn, blocks| {
             let known = self.known_in(txn, blocks, &target.block)?.ok_or_else(|| corrupt("the block is not kept"))?;
+            // (The body is that block's, whoever hands it over.)
+            if BodyRef::from_bytes(body)?.commitment() != known.header.body_commitment {
+                return Err(Error::BadBodyCommitment);
+            }
             // (All of them at once: a chain is as many heights as it
             // has blocks.)
             let mut h = known.header;
@@ -491,6 +513,15 @@ mod tests {
             node.check_state_block(&BlockRef::from_bytes(&stranger[0]).unwrap(), 7, &roots),
             Err(Error::UnknownParent)
         );
+        // A block whose header's work was left to a proof has it
+        // looked at in full here: its own proof says nothing of it.
+        let late = Chain::open(MemBackend::new(), 64, easy(), seed(), OnlyFrom(6)).unwrap();
+        late.set_dataset(table());
+        assert_eq!(late.accept_headers(&headers, NOW, true), (6, None));
+        assert_eq!(late.known(&headers[5].hash()).unwrap().unwrap().status, Status::WorkPending);
+        assert!(late.full_pow_heights.lock().unwrap().is_empty());
+        assert_eq!(late.check_state_block(&view, 6, &roots), Ok(()));
+        assert_eq!(*late.full_pow_heights.lock().unwrap(), [6]);
     }
 
     /// A node that stops while it is taking a state is, when it starts
