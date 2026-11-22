@@ -49,7 +49,7 @@ struct Row<V> {
     /// last count of the window this row holds.
     window: V,
     count: [V; 4],
-    counted: [V; 4],
+    inverse: [V; 4],
     last: [V; 4],
     /// The item, as the item's last row sends it, and the index as its
     /// first does.
@@ -76,7 +76,7 @@ fn row<C: Ctx>(c: &mut C) -> Row<C::V> {
     let hash = compress(c, cv.clone(), m.clone(), t);
     let window = c.input();
     let count = std::array::from_fn(|_| c.input());
-    let counted = std::array::from_fn(|_| c.input());
+    let inverse = std::array::from_fn(|_| c.input());
     let last = std::array::from_fn(|_| c.input());
     let item = std::array::from_fn(|_| c.input());
     let index = c.input();
@@ -94,7 +94,7 @@ fn row<C: Ctx>(c: &mut C) -> Row<C::V> {
         out: hash.out,
         window,
         count,
-        counted,
+        inverse,
         last,
         item,
         index,
@@ -138,10 +138,12 @@ pub fn circuit() -> Circuit {
             s.send(tuple(&r.at, &r.text, Sum::constant(F::ONE)));
             s.receive(tuple(&r.at, &r.text, Sum::element(&r.last)));
             // The read: the block is a window taken with a count, and put
-            // back with the count times the fixed element.
-            s.product(Sum::element(&r.count), Sum::constant(COUNT), Sum::element(&r.counted));
+            // back with the count times the fixed element. The count is
+            // not zero, having an inverse: with none, what is put back
+            // is what was taken, and the block is nobody's text.
+            s.product(Sum::element(&r.count), Sum::element(&r.inverse), Sum::constant(F::ONE));
             s.receive(tuple(&r.window, &r.m, Sum::element(&r.count)));
-            s.send(tuple(&r.window, &r.m, Sum::element(&r.counted)));
+            s.send(tuple(&r.window, &r.m, Sum::element(&r.count).scaled(COUNT)));
             // The item, from its last row: the output and the key. The
             // index, from its first.
             let bit = |b: u32| Sum::bits(&r.bits, b.trailing_zeros() as usize, 1);
@@ -186,11 +188,13 @@ fn element(x: F) -> [u32; 4] {
 }
 
 impl Reads {
-    /// A read of window `w`: its count as it is taken and as it is put
-    /// back.
+    /// A read of window `w`: its count as it is taken, and that
+    /// count's inverse. (It is put back with the count times
+    /// [`COUNT`].)
     pub fn read(&mut self, w: usize) -> ([u32; 4], [u32; 4]) {
         self.0[w] += 1;
-        (element(power(self.0[w] - 1)), element(power(self.0[w])))
+        let count = power(self.0[w] - 1);
+        (element(count), element(count.inv()))
     }
 }
 
@@ -220,13 +224,13 @@ impl Steps {
             let block: [u32; 16] = blake3::words(text.window(w));
             let out = blake3::compress(&key, &block, 0, 64, FLAGS);
             let (first, last) = (step == 0, step == parents - 1);
-            let (count, counted) = reads.read(w);
+            let (count, inverse) = reads.read(w);
             let mut r = [0u32; INPUTS];
             r[..8].copy_from_slice(&key);
             r[8..24].copy_from_slice(&block);
             r[24] = w as u32;
             r[25..29].copy_from_slice(&count);
-            r[29..33].copy_from_slice(&counted);
+            r[29..33].copy_from_slice(&inverse);
             let sends = at.filter(|_| last);
             if sends.is_some() {
                 r[37..45].copy_from_slice(&out);
@@ -267,10 +271,10 @@ impl Steps {
             let take = (WINDOWS - self.rows.len()).min(parents);
             for (r, p) in more.rows[..take].iter().zip(&more.program) {
                 let w = r[24] as usize;
-                let (count, counted) = reads.read(w);
+                let (count, inverse) = reads.read(w);
                 let mut r = *r;
                 r[25..29].copy_from_slice(&count);
-                r[29..33].copy_from_slice(&counted);
+                r[29..33].copy_from_slice(&inverse);
                 self.rows.push(r);
                 self.program.push(*p);
             }
@@ -318,7 +322,7 @@ pub mod mix {
         items: [V; 32],
         window: [V; 16],
         count: [V; 4],
-        counted: [V; 4],
+        inverse: [V; 4],
         out: [V; 32],
         /// For each product by the prime (the 32 words, then the two
         /// selectors): five shifts and five words of carries.
@@ -351,7 +355,7 @@ pub mod mix {
             };
         }
         let (mix, seed, seed_taken, items, window) = (words!(32), words!(8), words!(8), words!(32), words!(16));
-        let (count, counted, out) = (words!(4), words!(4), words!(32));
+        let (count, inverse, out) = (words!(4), words!(4), words!(32));
         let products = (0..34).map(|_| words!(10)).collect();
         let (pair, picked, sent) = (c.input(), c.input(), words!(32));
         let (number, first, goes_on, pairs, bits) = (c.program(), c.program(), c.program(), c.program(), c.program());
@@ -369,7 +373,7 @@ pub mod mix {
             items,
             window,
             count,
-            counted,
+            inverse,
             out,
             products,
             pair,
@@ -454,15 +458,12 @@ pub mod mix {
                 s.receive(vec![Sum::word(&r.index_at[0]), even.clone()]);
                 s.receive(vec![Sum::word(&r.index_at[1]), even.add(&bit(ACCESS))]);
                 // The window, read as the steps read theirs.
-                s.product(Sum::element(&r.count), Sum::constant(COUNT), Sum::element(&r.counted));
-                let read = |count: &[Expr; 4]| -> Vec<Sum> {
-                    std::iter::once(Sum::word(&r.picked))
-                        .chain(elements(&r.window))
-                        .chain([Sum::element(count)])
-                        .collect()
+                s.product(Sum::element(&r.count), Sum::element(&r.inverse), Sum::constant(F::ONE));
+                let read = |count: Sum| -> Vec<Sum> {
+                    std::iter::once(Sum::word(&r.picked)).chain(elements(&r.window)).chain([count]).collect()
                 };
-                s.receive(read(&r.count));
-                s.send(read(&r.counted));
+                s.receive(read(Sum::element(&r.count)));
+                s.send(read(Sum::element(&r.count).scaled(COUNT)));
                 // The mix, sent by the last row.
                 for (e, part) in elements(&r.out).into_iter().enumerate() {
                     let copy = Sum::element(&r.sent[4 * e..4 * e + 4]);
@@ -545,7 +546,7 @@ pub mod mix {
                 items[16..].copy_from_slice(&source.item(index + 1));
             }
             let x: [u32; 16] = blake3::words(text.window(window));
-            let (count, counted) = reads.read(window);
+            let (count, inverse) = reads.read(window);
             let mut out = [0u32; 32];
             for k in 0..32 {
                 let (words, product) = product_words(mix[k]);
@@ -558,7 +559,7 @@ pub mod mix {
             r[48..80].copy_from_slice(&items);
             r[80..96].copy_from_slice(&x);
             r[96..100].copy_from_slice(&count);
-            r[100..104].copy_from_slice(&counted);
+            r[100..104].copy_from_slice(&inverse);
             r[104..136].copy_from_slice(&out);
             r[136..476].copy_from_slice(products.as_flattened());
             (r[476], r[477]) = (pair, window as u32);
@@ -747,6 +748,14 @@ mod tests {
         assert!(!proves(steps, &mut reads, &text, &expect));
         // A step that reads another window than its key picks.
         let (steps, mut reads, expect) = three(&text, |s| s.rows[40][24] ^= 1);
+        assert!(!proves(steps, &mut reads, &text, &expect));
+        // A read with a count of nothing, which is taken and put back
+        // as the same thing and so is of no text at all: it has no
+        // inverse. (The last row's, whose window none reads after.)
+        let (mut steps, mut reads, expect) = three(&text, |_| {});
+        let last = steps.rows.last_mut().unwrap();
+        last[25..33].fill(0);
+        reads.0[last[24] as usize] -= 1;
         assert!(!proves(steps, &mut reads, &text, &expect));
     }
 
