@@ -1515,6 +1515,7 @@ fn prove_with(
     let room = seed.map(|_| Room::of(params).expect("a polynomial large enough for the pads"));
     let mut pads: Option<Pads> = None;
     let (mut blinder, mut pad_values, mut corners): (Vec<F>, Vec<F>, F) = (Vec::new(), Vec::new(), F::ZERO);
+    let mut pad_blinder: Vec<F> = Vec::new();
     if let (Some(seed), Some(places), Some(room)) = (seed, &places, &room) {
         let stream = Stream(seed);
         let (made, values) = Pads::new(room, &stream, params.round_bits);
@@ -1527,9 +1528,11 @@ fn prove_with(
         corners = crate::hidden::WEIGHED.iter().fold(F::ZERO, |sum, i| sum + f[places.corner(&layout, *i)]);
         blinder = vec![F::ZERO; room.len];
         crate::parallel::par_fill(&mut blinder, |i| stream.at(1 << 41 | i as u64));
+        pad_blinder = vec![F::ZERO; room.len];
+        crate::parallel::par_fill(&mut pad_blinder, |i| stream.at(1 << 42 | i as u64));
     }
     let com = match seed {
-        Some(_) => pcs::commit_blind(params, domain, &f, &blinder, &pad_values),
+        Some(_) => pcs::commit_blind(params, domain, &f, &blinder, &pad_values, &pad_blinder),
         None => pcs::commit(params, domain, &f),
     };
     times.commit += t.elapsed();
@@ -1744,7 +1747,13 @@ fn prove_with(
     let t = Instant::now();
     let step = params.steps()[0];
     let good = |indices: &[usize]| places.is_some_and(|p| p.good(step, indices));
-    let blind = seed.map(|_| pcs::Blind { g: &blinder, pads: &pad_values, weights: pad_weights, good: &good });
+    let blind = seed.map(|_| pcs::Blind {
+        g: &blinder,
+        pads: &pad_values,
+        g_pads: &pad_blinder,
+        weights: pad_weights,
+        good: &good,
+    });
     proof.pcs = pcs::open_weighted(params, domain, &com, &f, first, joiners, blind, &mut tr);
     times.open += t.elapsed();
     (proof, times)

@@ -663,13 +663,14 @@ impl Opens<Sym> for HashedOpens {
         for (_, s) in &shapes[1..] {
             at.push(at[at.len() - 1].iter().map(|i| i >> s).collect());
         }
+        let places: Vec<usize> = joined.iter().map(|t| t.codeword).collect();
         let of = |tree: &Tree<Sym>, joined: bool| {
             // A joiner's leaves are the entries of the codeword it
             // joined: a query's is its leaf in the codeword before.
             let (height, s) = shapes[tree.codeword];
             let (height, indices) =
                 if joined { (height + s, &at[tree.codeword - 1]) } else { (height, &at[tree.codeword]) };
-            paths(tree, indices, height, crate::pcs::leaf_len(params, tree.codeword, joined))
+            paths(tree, indices, height, crate::pcs::leaf_len(params, tree.codeword, joined, &places))
         };
         let own: Vec<_> = trees.iter().map(|t| of(t, false)).collect::<Option<_>>()?;
         let others: Vec<_> = joined.iter().map(|t| of(t, true)).collect::<Option<_>>()?;
