@@ -563,7 +563,7 @@ pub fn circuit() -> Circuit {
                 bit
             };
 
-            // The kind: one bit between two words, and each flag that bit
+            // The kind: one bit among its words, and each flag that bit
             // in every place.
             for (i, word) in kind.iter().enumerate() {
                 let less = adder(s, word, &ones(), None, &next_aux());
@@ -578,6 +578,16 @@ pub fn circuit() -> Circuit {
                 s.zero_where(&ones(), flag.xor(&turned(flag, 1)));
             }
             s.zero_where(&con(1), any(&(0..KINDS).collect::<Vec<_>>()).xor(&con(1)));
+            // (A word has one bit at most and the flags are odd in
+            // number, which three are: no two words have a bit. A row
+            // of three kinds would be held to no rule two of them
+            // share.)
+            let within = |i: usize| any(&(32 * i..KINDS.min(32 * (i + 1))).collect::<Vec<_>>());
+            for i in 0..KIND_WORDS {
+                for j in i + 1..KIND_WORDS {
+                    s.constrain(within(i), within(j), con(0));
+                }
+            }
             // Which kind follows which; where a run starts and ends.
             for (k, spec) in SPECS.iter().enumerate().skip(1) {
                 let allowed = spec.before.iter().fold(ones(), |x, j| x.xor(&flags[*j].prev()));
@@ -800,6 +810,10 @@ pub fn circuit() -> Circuit {
             // What each kind asks of what came before.
             same(s, &[HEAD, SLEAF, OPC, REC1], &before(&r.counts[..2]), &[con(0), con(0)]);
             same(s, &[HEAD, SLEAF, OPC, REC1], &before(&r.body), &before(&r.id));
+            // (And none of the outputs its conditions are on still to
+            // come: a transaction that said two and made one is not
+            // ended by the next one's beginning.)
+            same(s, &[HEAD, SLEAF, OPC, REC1], &[p(&r.take)], &[con(0)]);
             // Transactions, then the operations on names they carried,
             // then sweeps.
             same(s, &[HEAD], &[p(&r.phase[0])], &[con(0)]);
@@ -1877,6 +1891,51 @@ impl Run {
         self.removal(path, 0);
     }
 
+    /// A row with the flags of several kinds at once, as no honest run
+    /// has: for the test that it is refused.
+    #[cfg(test)]
+    fn push_multi(&mut self, kinds: &[usize], dom: u32, block: [u32; 16], set: impl FnOnce(&mut State, [u32; 8])) {
+        let old = self.state;
+        let cv = [dom, 0, 0, 0, 0, 0, 0, 0];
+        let out = blake3::compress(&cv, &block, 0, 64, FULL);
+        let mut to = self.state;
+        set(&mut to, out);
+        let mut r = [0u32; INPUTS];
+        r[..8].copy_from_slice(&cv);
+        r[8..24].copy_from_slice(&block);
+        (r[24], r[25]) = (64, FULL);
+        for kind in kinds {
+            r[26 + kind / 32] |= 1 << (kind % 32);
+            r[FRONT + kind] = !0;
+        }
+        r[FRONT + KINDS] = dom;
+        let state = to.words();
+        let at = FRONT + 1 + KINDS;
+        r[at..at + STATE].copy_from_slice(&state);
+        r[at + STATE] = 0;
+        let mut aux = auxiliary(&old, &to, kinds[0], self.kind, 0, block[15]);
+        for (w, a) in aux.iter_mut().enumerate().take(KIND_WORDS) {
+            let word = r[26 + w];
+            *a = carries(word, !0, 0).0;
+        }
+        r[at + STATE + 1..at + STATE + 1 + aux.len()].copy_from_slice(&aux);
+        self.rows.push(r);
+        (self.state, self.kind, self.dir, self.out) = (to, kinds[0], 0, out);
+    }
+
+    /// A head that says a cover the transaction does not have.
+    #[cfg(test)]
+    fn head_saying(&mut self, tx: &Transaction, cover: [u32; 8]) {
+        let mut block = [0u32; 16];
+        (block[0], block[1]) = ((tx.inputs.len() + tx.policy.len()) as u32, (tx.outputs.len() + tx.ops.len()) as u32);
+        block[2] = tx.covered;
+        let id = words(&tx.id());
+        self.step(HEAD, block, |s, out| {
+            (s.body, s.id, s.counts[0], s.counts[1]) = (out, id, block[0], block[1]);
+            (s.cover, s.covered, s.take) = (cover, [0; 8], block[2]);
+        });
+    }
+
     /// Rows so far.
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -2245,6 +2304,73 @@ mod tests {
             assert_eq!(p.verifies(), held, "a proof verifies when its rows hold");
         }
         held
+    }
+
+    /// A transaction that says conditions are on two of its outputs
+    /// and makes one is not ended by another's beginning: the output
+    /// it made is nobody's to choose.
+    #[test]
+    fn a_transaction_does_not_end_with_outputs_owed() {
+        use crate::conditions::{Cond, Policy, PolicyInput, Shown, covered};
+        let mine = key_hash(&key(0));
+        let thief = key_hash(&key(7));
+        let fixed = [Output::to(&mine, 20, [1; MEMO]), Output::to(&mine, 40, [2; MEMO])];
+        let policy = Policy(vec![vec![Cond::Outputs { count: 2, digest: covered(&fixed) }]]);
+        let mut tree = Outputs::default();
+        let position = tree.insert(&Output::to(&policy.root(), 60, [4; MEMO]), 90);
+        let input = PolicyInput {
+            amount: 60,
+            memo: [4; MEMO],
+            created: 90,
+            position,
+            conds: policy.0[0].clone(),
+            index: 0,
+            siblings: policy.path(0),
+            shown: vec![Shown::Nothing],
+            state: 0,
+        };
+        let set = Set(vec![[5u8; 32]]);
+        let stolen = Output::to(&thief, 60, [9; MEMO]);
+        let tx =
+            Transaction { inputs: vec![], outputs: vec![stolen], ops: vec![], policy: vec![input.clone()], covered: 2 };
+        let outputs = tree.clone();
+        let mut start = Record::start(&outputs, EMPTY, EMPTY, 100);
+        // The ledger's rules refuse it.
+        assert!(start.apply(&mut tree.clone(), &tx).is_err());
+        let start = Record::start(&outputs, EMPTY, EMPTY, 100);
+        let mut run = Run::new(&start, closed(), &set.root());
+        run.head_saying(&tx, words(&covered(&fixed)));
+        run.frontier(&outputs.frontier_without([position]));
+        run.policy_input(&input, &outputs.path(position), &[]);
+        run.output(&stolen, &thief);
+        run.head(&Transaction::default());
+        let (rows, program, public) = run.finish(128);
+        assert!(!holds(&rows, &program, &public));
+    }
+
+    /// A row is of one kind: one of three, a bit in each word of its
+    /// kind, would be held to no rule two of them share, and here
+    /// would leave an operation on a name out of what the block
+    /// carries.
+    #[test]
+    fn a_row_of_three_kinds_is_refused() {
+        use crate::registry::{Op, commit, name_hash};
+        let outputs = Outputs::default();
+        let set = Set(vec![[5u8; 32]]);
+        let op = Op::Commit { commit: commit(&name_hash("dave"), &[1; 32], &[2; 32]), memo: [5; MEMO] };
+        let tx = Transaction { inputs: vec![], outputs: vec![], ops: vec![op.clone()], policy: vec![], covered: 0 };
+        let start = Record::start(&outputs, EMPTY, EMPTY, 100);
+        let mut run = Run::new(&start, closed(), &set.root());
+        run.head(&tx);
+        let opw = words(&op.digest());
+        let block = Run::pair(&run.state.body, &opw);
+        run.push_multi(&[PAD, OPBODY, SETL], DOM_BODY_OP, block, |s, out| {
+            (s.body, s.counts[1], s.hold) = (out, s.counts[1].wrapping_sub(1), opw);
+            (s.v, s.w, s.pos, s.cnt, s.stage) = ([0; 8], [0; 8], s.next0, 0, 1);
+        });
+        run.head(&Transaction::default());
+        let (rows, program, public) = run.finish(128);
+        assert!(!holds(&rows, &program, &public));
     }
 
     #[test]
