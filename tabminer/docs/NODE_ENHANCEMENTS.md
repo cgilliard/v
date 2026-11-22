@@ -46,6 +46,15 @@ Each entry says what was seen, where, and what the change would be.
   chunk (a slow or lossy path, or pacing that does not recover), and
   whether it should grow again sooner.
 
+### 5. What is said when a wallet is made is too long
+
+- **Seen:** same test, at the miner's first start. After
+  `Server is ready!` come a blank line, three lines about the twelve
+  words, a blank line, the words indented, a blank line, and then the
+  prompt.
+- **Change:** `Server is ready!`, then one line, `Recovery phrase:`
+  followed by the twelve words, then the prompt. Nothing else.
+
 ## Done
 
 (Nothing yet.)
