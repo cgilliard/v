@@ -721,6 +721,8 @@ fn a_wallet_is_made_again_from_its_words() {
     second.stop();
     let again = Command::new(TABMINER)
         .args(["--network", "dev", "--no-mine", "--restore", "--data-dir", &dirs[1].display().to_string()])
+        // (A port of the test's own: the default may be another node's.)
+        .args(["--listen", &at(1)])
         .output()
         .unwrap();
     assert!(!again.status.success() && String::from_utf8_lossy(&again.stderr).contains("there is a wallet already"));

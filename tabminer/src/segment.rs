@@ -2029,8 +2029,27 @@ pub struct Proved {
 /// The proof of `run`, filled to `at_least` rows, under the parameters
 /// `params` gives for its size.
 pub fn prove(run: Run, at_least: usize, params: impl Fn(usize) -> Params) -> Proved {
-    let c = circuit();
     let (rows, program, public) = run.finish(at_least);
+    prove_rows(&rows, program, public, params)
+}
+
+/// Whether rows ([`Run::finish`]) meet every constraint, with `public`
+/// as what is said of them: what a proof of them would show, known
+/// without making one.
+pub fn holds(rows: &[[u32; INPUTS]], program: &[u32], public: &[u32]) -> bool {
+    let c = circuit();
+    let fixed = Fixed { program, public };
+    Witness::new(&c, rows.len(), |c| self::run(c), |i| rows[i], &fixed).holds()
+}
+
+/// [`prove`], of a run's rows as [`Run::finish`] gives them.
+pub fn prove_rows(
+    rows: &[[u32; INPUTS]],
+    program: Vec<u32>,
+    public: Vec<u32>,
+    params: impl Fn(usize) -> Params,
+) -> Proved {
+    let c = circuit();
     let params = params(variables(&c, rows.len()));
     let domain = Domain::new(params.k(), true);
     let committed = Program::new(&c, &params, &domain, program);
@@ -2208,14 +2227,24 @@ mod tests {
         (run, record)
     }
 
-    /// Whether the run's rows are proven for the public values `public`
-    /// (the run's own if none are given).
+    /// Whether the run's rows meet the constraints, with `public` said
+    /// of them if not what they are of. Where the build is optimized a
+    /// proof is made as well, and verified against what is said: it
+    /// verifies when the rows hold and not otherwise.
     fn proves(run: Run, public: Option<&[u32]>) -> bool {
-        let mut p = prove(run, 128, |m| Params::plain(m, 1, 4, 4));
-        if let Some(public) = public {
-            p.public = public.to_vec();
+        shown(run.finish(128), public)
+    }
+
+    /// [`proves`], of a run's rows as they are finished.
+    fn shown((rows, program, made): (Vec<[u32; INPUTS]>, Vec<u32>, Vec<u32>), public: Option<&[u32]>) -> bool {
+        let said = public.unwrap_or(&made);
+        let held = holds(&rows, &program, said);
+        if !cfg!(debug_assertions) {
+            let mut p = prove_rows(&rows, program, made.clone(), |m| Params::plain(m, 1, 4, 4));
+            p.public = said.to_vec();
+            assert_eq!(p.verifies(), held, "a proof verifies when its rows hold");
         }
-        p.verifies()
+        held
     }
 
     #[test]
@@ -2235,7 +2264,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_run_of_payments_is_proven_to_be_its_record() {
         let scene = a_scene();
         let (run, record) = run_of(&scene, |_, _| {});
@@ -2261,7 +2289,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn rows_that_break_a_rule_are_not_proven() {
         let scene = a_scene();
         // A word of a row changed after the run was made, one row at a
@@ -2439,7 +2466,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn names_are_committed_revealed_updated_and_swept() {
         let n = named();
         let (run, start, record) = named_run(&n, true);
@@ -2463,7 +2489,6 @@ mod tests {
     /// Operations on names are done after every transaction, and sweeps
     /// after them: nothing else is rows that are proven.
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn operations_are_done_after_the_transactions() {
         use crate::registry::Op;
         let n = named();
@@ -2518,7 +2543,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn names_rules_are_the_rows_too() {
         use crate::registry::{Op, commit};
         let made = |revealed_at: u32, stale_at: u32, change: &dyn Fn(&mut Named), sweep: bool| {
@@ -2651,7 +2675,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_policy_s_output_is_spent_by_its_conditions() {
         use crate::conditions::{Cond, Shown};
         let g = guarded(&|_, _, _| {});
@@ -2774,7 +2797,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_covenant_fixes_the_outputs() {
         let c = channel();
         let mine = key_hash(&key(0));
@@ -2795,7 +2817,6 @@ mod tests {
     /// on, those met and those still to come, are the next run's from
     /// the one before.
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_covenant_s_outputs_may_lie_across_runs() {
         use crate::conditions::{Cond, Policy, PolicyInput, Shown, covered};
         let mine = key_hash(&key(0));
@@ -2841,12 +2862,11 @@ mod tests {
                 next.output(output, &mine);
             }
             next.settle();
-            let params = |m| Params::plain(m, 1, 4, 4);
-            let (first, then) = (prove(run, 128, params), prove(next, 128, params));
             // The second begins as the first ended.
+            let (first, then) = (run.finish(128), next.finish(128));
             let ins = 4 * (CHAINED + FIXED);
-            assert_eq!(first.public[ins..], then.public[..4 * CHAINED]);
-            first.verifies() && then.verifies()
+            assert_eq!(first.2[ins..], then.2[..4 * CHAINED]);
+            shown(first, None) & shown(then, None)
         };
         for cut in 0..=3 {
             assert!(made(cut, &fixed[1]), "cut after {cut} outputs");
@@ -2856,7 +2876,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_channel_s_keys_sign_a_state_not_a_transaction() {
         use crate::conditions::{covered, rebind_message};
         let c = channel();

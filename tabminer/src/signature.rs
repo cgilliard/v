@@ -486,8 +486,35 @@ mod tests {
         assert_eq!((tall.program, tall.tables.clone()), (plain.program, plain.tables.clone()));
     }
 
+    /// Whether what was compiled is rows that meet their tables'
+    /// constraints; and, where the build is optimized, whether a proof
+    /// of them verifies.
+    fn shown(cx: Shared, chains: Vec<Chains>) -> bool {
+        if cfg!(debug_assertions) {
+            return crate::proof::holds(cx, chains, None);
+        }
+        let p = prove(cx, chains, |m| Params::plain(m, 1, 4, 4));
+        p.holds && p.verifies()
+    }
+
+    /// Keys of trees of several heights, each checked by rows that hold
+    /// and found to have the entry that is theirs.
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn a_key_of_any_height_is_checked_by_rows_that_hold() {
+        for (height, leaf) in [(1usize, 1u64), (3, 6), (5, 17)] {
+            let mut sk = SecretKey::generate_with_height(&[height as u8; 32], height);
+            sk.set_next_index(leaf);
+            let (pk, msg) = (sk.public_key(), [height as u8 ^ 0x5A; 32]);
+            let sig = sk.sign(&msg).unwrap();
+            let (cx, mut chains) = (Shared::new(), Chains::default());
+            let found = check_into(&cx, &mut chains, &pk, &msg, &sig).expect("a signature of the key's height");
+            assert_eq!([found[0].value(), found[1].value()], halves(&entry(&pk, &msg, leaf)));
+            cx.state(&found);
+            assert!(shown(cx, vec![chains]), "height {height}");
+        }
+    }
+
+    #[test]
     fn a_signature_that_is_not_the_key_s_has_another_entry() {
         let (pk, msg, sig) = signed(1).swap_remove(0);
         let expect = halves(&entry(&pk, &msg, sig.index));
@@ -496,9 +523,8 @@ mod tests {
             let e = check_into(&cx, &mut chains, pk, msg, sig)?;
             let values = [e[0].value(), e[1].value()];
             cx.state(&e);
-            let p = prove(cx, vec![chains], |m| Params::plain(m, 1, 4, 4));
             // The rows are a true check of something, whatever it is.
-            assert!(p.holds && p.verifies());
+            assert!(shown(cx, vec![chains]));
             Some(values)
         };
         assert_eq!(found(&pk, &msg, &sig), Some(expect));

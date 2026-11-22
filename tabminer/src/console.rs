@@ -168,8 +168,8 @@ pub fn made(phrase: &str) -> String {
 }
 
 /// What the commands are run on.
-pub struct Console<B: Backend + 'static, W: Backend> {
-    pub hold: Handle<B, ChainVerifier>,
+pub struct Console<B: Backend + 'static, W: Backend, V = ChainVerifier> {
+    pub hold: Handle<B, V>,
     /// None for a node started without a wallet.
     pub wallet: Option<Arc<Mutex<Wallet<W>>>>,
     /// The time by the calendar, in seconds.
@@ -268,8 +268,8 @@ type Said = Result<String, String>;
 /// transactions were signed from: so that a wallet whose file has gone
 /// back to an earlier state never signs from one of them again. How
 /// many outputs it was behind on.
-pub fn observe<B: Backend + 'static, W: Backend>(
-    hold: &Handle<B, ChainVerifier>,
+pub fn observe<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + Sync>(
+    hold: &Handle<B, V>,
     wallet: &Mutex<Wallet<W>>,
 ) -> Result<usize, String> {
     let mut seen = Vec::new();
@@ -281,7 +281,7 @@ pub fn observe<B: Backend + 'static, W: Backend>(
     wallet.lock().unwrap_or_else(|e| e.into_inner()).observe_signatures(&seen).map_err(|e| e.to_string())
 }
 
-impl<B: Backend + 'static, W: Backend> Console<B, W> {
+impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + Sync> Console<B, W, V> {
     /// Does what `line` asks, and gives what is to be said of it.
     pub fn run(&self, line: &str) -> Reply {
         // (Words; and what is between quotes is one, spaces and all:
@@ -1958,6 +1958,198 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::Chain;
+    use crate::chain::apply::tests::{extend, grow};
+    use crate::chain::headers::tests::{NOW, easy, seed, table};
+    use crate::chain::verify::AcceptAllProofs;
+    use crate::net::node::Node;
+    use crate::store::testing::MemBackend;
+    use crate::wallet::follow::follow;
+
+    type TestChain = Chain<MemBackend, AcceptAllProofs>;
+    type TestConsole = Console<MemBackend, MemBackend, AcceptAllProofs>;
+
+    /// A node's chain, with the prompts of wallets on it: what each was
+    /// told is kept, and the files they pass each other are in a
+    /// directory of the test's own.
+    struct Desk {
+        chain: Arc<TestChain>,
+        node: Node<MemBackend, AcceptAllProofs>,
+        hold: Handle<MemBackend, AcceptAllProofs>,
+        logged: Arc<Mutex<Vec<String>>>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Desk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Desk {
+        fn new(name: &str) -> Desk {
+            let chain = Chain::open(MemBackend::new(), 64, easy(), seed(), AcceptAllProofs).unwrap();
+            chain.set_dataset(table());
+            let chain = Arc::new(chain);
+            let node = Node::new(crate::net::config::Config::default(), *b"TEST", Arc::clone(&chain), [9; 32], 0);
+            let dir = std::env::temp_dir().join(format!("tabminer-console-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let hold = node.hold();
+            Desk { chain, node, hold, logged: Arc::default(), dir }
+        }
+
+        /// A prompt with a new wallet, or with none.
+        fn prompt(&self, with_wallet: bool) -> TestConsole {
+            let wallet = with_wallet.then(|| {
+                let mut wallet = Wallet::open(MemBackend::new()).unwrap().0;
+                wallet.set_min_confirmations(1);
+                Arc::new(Mutex::new(wallet))
+            });
+            let logged = Arc::clone(&self.logged);
+            Console {
+                hold: self.hold.clone(),
+                wallet,
+                unix: || NOW,
+                log: Arc::new(move |line: &str| logged.lock().unwrap().push(line.to_string())),
+                debug: true,
+                max_names: 5,
+                names: Arc::default(),
+            }
+        }
+
+        fn file(&self, name: &str) -> String {
+            self.dir.join(name).display().to_string()
+        }
+
+        /// A block of everything the pool holds, its reward and its fees
+        /// paid to `to`; and the wallets of `all` brought up to it.
+        fn mine(&self, to: &TestConsole, all: &[&TestConsole]) {
+            let (mut pooled, mut fees) = (Vec::new(), 0u64);
+            self.hold.pool(&mut |pool| {
+                for entry in pool.entries() {
+                    pooled.push(entry.tx().to_transaction());
+                    fees += entry.fee;
+                }
+            });
+            let height = self.chain.tip().unwrap().height + 1;
+            let due = self.chain.params().subsidy(height) + fees;
+            let reward = to.wallet.as_ref().unwrap().lock().unwrap().receive(due, NOW).unwrap();
+            let outputs = [&reward].into_iter().chain(pooled.iter().flat_map(|tx| &tx.outputs));
+            let body = crate::block::Body {
+                inputs: pooled.iter().flat_map(|tx| tx.spent_positions()).collect(),
+                outputs: outputs.map(|output| output.block_output()).collect(),
+                ops: pooled.iter().flat_map(|tx| &tx.ops).map(|op| op.block_op()).collect(),
+                ..Default::default()
+            };
+            extend(&self.chain, &body);
+            self.node.pool_follows(1);
+            for console in all {
+                follow(&self.chain, &mut console.wallet.as_ref().unwrap().lock().unwrap(), NOW).unwrap();
+            }
+        }
+    }
+
+    /// What a command says, which is no error; and the error one says.
+    fn said(console: &TestConsole, line: &str) -> String {
+        match console.run(line) {
+            Reply::Said(text) => text,
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+
+    fn wrong(console: &TestConsole, line: &str) -> String {
+        match console.run(line) {
+            Reply::Wrong(text) => text,
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+
+    /// What is asked of a node at its prompt, of one with no wallet and
+    /// of one whose wallet holds nothing: each command says what there
+    /// is, or what it lacks.
+    #[test]
+    fn a_prompt_says_how_the_node_stands() {
+        let desk = Desk::new("stands");
+        grow(&desk.chain, 2, 1);
+        let (bare, held) = (desk.prompt(false), desk.prompt(true));
+        assert_eq!(bare.run(""), Reply::Nothing);
+        assert_eq!(bare.run("quit"), Reply::Quit);
+        assert_eq!(bare.run("exit"), Reply::Quit);
+        assert!(said(&bare, "help").starts_with("commands:"));
+        assert_eq!(wrong(&bare, "nonsense"), "nonsense: no such command (see help)");
+        assert_eq!(wrong(&bare, "send"), "send: not what it takes (see help)");
+        for line in ["status", "peers", "mempool", "fees", "leaves", "consensus"] {
+            assert!(!said(&bare, line).is_empty(), "{line}");
+        }
+        assert!(said(&bare, "status").starts_with("block 2 ("), "{}", said(&bare, "status"));
+        assert!(said(&bare, "consensus").starts_with("mode init\nnothing is decided before block 144"));
+        assert!(said(&bare, "leaves").starts_with("no leaf is set"));
+        assert!(said(&bare, "mempool").starts_with("0 transactions, 0 bytes; the pool asks 25,000 a unit of weight"));
+        assert!(said(&bare, "fees").contains("a simple payment weighs 7 (an input 1, an output 3 by default)"));
+        assert_eq!(said(&bare, "peers"), "0 peers known, 0 of them live");
+        // What is the wallet's is asked of a wallet.
+        let none = "this node has no wallet (it was started with --no-wallet)";
+        for line in
+            ["balance", "address", "outputs", "slates", "sent", "names", "payments", "subnames", "prune", "mining"]
+        {
+            assert_eq!(wrong(&bare, line), none, "{line}");
+            assert!(!said(&held, line).is_empty(), "{line}");
+        }
+        assert_eq!(bare.run("seed"), Reply::Wrong(none.to_string()));
+        assert_eq!(bare.run("password"), Reply::Wrong(none.to_string()));
+        assert_eq!(held.run("password"), Reply::NewPassword);
+        assert_eq!(said(&held, "seed").split_whitespace().count(), 37);
+        assert!(said(&held, "address").starts_with("tab1"));
+        assert_eq!(said(&held, "balance"), "spendable   0");
+        assert_eq!(said(&held, "outputs"), "no outputs");
+        assert_eq!(said(&held, "slates"), "no payments begun");
+        assert_eq!(said(&held, "sent"), "no payments sent that are not in a block");
+        assert_eq!(said(&held, "names"), "no names");
+        assert_eq!(said(&held, "payments"), "no payments made, and nothing burned");
+        assert!(said(&held, "mining").starts_with("no blocks won in the last 64"));
+        assert!(wrong(&held, "send-file lots x").contains("is not an amount of coins"));
+        // A wallet that holds nothing pays nothing.
+        assert!(!wrong(&held, &format!("send-file 1 {}", desk.file("none.slate"))).is_empty());
+        assert!(wrong(&held, &format!("receive {}", desk.file("none.slate"))).contains("No such file"));
+    }
+
+    /// A payment between two wallets at their prompts, by a slate in a
+    /// file: begun, answered, signed and pooled, and in a block.
+    #[test]
+    fn a_payment_is_made_at_the_prompt() {
+        let (desk, payer, paid) = funded("pays");
+        assert_eq!(said(&payer, "balance"), "spendable   3,000");
+        assert_eq!(said(&payer, "outputs").matches("1,500  confirmed").count(), 2);
+        let slate = desk.file("payment.slate");
+        let begun = said(&payer, &format!("send-file 12.5 {slate}"));
+        assert!(begun.contains("begun: 12.5 and a fee of"), "{begun}");
+        assert!(said(&payer, "slates").contains("12.5"));
+        let answered = said(&paid, &format!("receive {slate}"));
+        assert!(answered.contains("answered: 12.5 to this wallet"), "{answered}");
+        assert_eq!(said(&paid, "balance"), "spendable   0\nunverified  12.5");
+        let signed = said(&payer, &format!("finalize {slate}.received"));
+        assert!(signed.contains("signed and pooled"), "{signed}");
+        assert_eq!(said(&payer, "slates"), "no payments begun");
+        assert!(said(&payer, "mempool").starts_with("1 transactions, "));
+        assert!(said(&payer, "mempool").contains("weight 7  fee 0.0000175  (25,000 a unit)"));
+        assert!(said(&payer, "sent").ends_with("fee 0.0000175  pooled"));
+        desk.mine(&payer, &[&payer, &paid]);
+        assert_eq!(said(&paid, "balance"), "spendable   12.5");
+        assert!(said(&payer, "payments").contains("12.5  paid to tab1"));
+        assert!(said(&payer, "payments").ends_with(": in block 3, proof ready"));
+        assert!(said(&paid, "status").contains("wallet: 12.5 confirmed"));
+        assert_eq!(said(&payer, "sent"), "no payments sent that are not in a block");
+        let logged = desk.logged.lock().unwrap().join("\n");
+        assert!(
+            logged.contains("begun: 12.5") && logged.contains("answered: 12.5") && logged.contains("signed and pooled")
+        );
+        // A payment with a note and a fee said; and more than there is.
+        let noted = said(&payer, &format!("send-file 1 0.001 {slate} \"for the tea\""));
+        assert!(noted.contains("begun: 1 and a fee of 0.001"), "{noted}");
+        assert!(!wrong(&payer, &format!("send-file 1000000 {slate}")).is_empty());
+        assert!(wrong(&payer, &format!("send-file 1 nothing {slate}")).contains("is not a fee"));
+    }
 
     #[test]
     fn coins_are_written_and_read() {
@@ -1975,5 +2167,225 @@ mod tests {
         for bad in ["", ".5", "1.", "1.00000000001", "-1", "1e3", "1,000", "99999999999999999999", "1844674408"] {
             assert_eq!(parse_coins(bad), None, "{bad}");
         }
+    }
+
+    /// A desk with a payer whose wallet has two blocks' rewards, and
+    /// another wallet.
+    fn funded(name: &str) -> (Desk, TestConsole, TestConsole) {
+        let desk = Desk::new(name);
+        let (payer, paid) = (desk.prompt(true), desk.prompt(true));
+        desk.mine(&payer, &[&payer, &paid]);
+        desk.mine(&payer, &[&payer, &paid]);
+        (desk, payer, paid)
+    }
+
+    /// A payment of `amount` from `payer` to `paid`, pooled: the id of
+    /// its transaction, as it is said.
+    fn pay(desk: &Desk, payer: &TestConsole, paid: &TestConsole, amount: &str) -> String {
+        let slate = desk.file("payment.slate");
+        assert!(said(payer, &format!("send-file {amount} {slate}")).contains("begun"));
+        assert!(said(paid, &format!("receive {slate}")).contains("answered"));
+        let signed = said(payer, &format!("finalize {slate}.received"));
+        signed.split("transaction ").nth(1).unwrap()[..8].to_string()
+    }
+
+    /// A payment sent is sped up and taken back while no block has it;
+    /// and what will not be made is forgotten.
+    #[test]
+    fn a_payment_sent_is_sped_up_and_taken_back() {
+        let (desk, payer, paid) = funded("back");
+        let id = pay(&desk, &payer, &paid, "3");
+        assert!(said(&payer, "sent").contains("pooled"));
+        assert_eq!(wrong(&payer, &format!("resend {id}")), "the pool does not take it: already in the pool");
+        // Sped up: another transaction in its place, paying twice the
+        // rate.
+        let bumped = said(&payer, &format!("bump {id}"));
+        assert!(bumped.starts_with(&format!("payment sent {id} sped up: transaction ")), "{bumped}");
+        assert!(bumped.contains("with a fee of 0.000035\n") && bumped.ends_with(BUMPED), "{bumped}");
+        assert!(said(&payer, "mempool").contains("fee 0.000035  (50,000 a unit)"));
+        assert_eq!(wrong(&payer, "bump 00"), "no payment sent with an id that starts 00");
+        assert_eq!(wrong(&payer, "cancel zz"), "no payment begun or sent with an id that starts zz");
+        assert_eq!(wrong(&payer, "resend 00"), "no payment sent with an id that starts 00");
+        assert_eq!(wrong(&payer, "bump"), "bump: not what it takes (see help)");
+        // Taken back: the same outputs spent to the wallet itself.
+        let sent = said(&payer, "sent");
+        let now = sent.split_whitespace().next().unwrap().to_string();
+        let back = said(&payer, &format!("cancel {now}"));
+        assert!(back.starts_with(&format!("payment sent {now} taken back: transaction ")), "{back}");
+        assert!(back.ends_with(CANCELLED), "{back}");
+        assert_eq!(said(&paid, "balance"), "spendable   0\nunverified  3");
+        desk.mine(&payer, &[&payer, &paid]);
+        assert_eq!(said(&payer, "sent"), "no payments sent that are not in a block");
+        // What the other was to have is never made: forgotten when
+        // asked.
+        assert_eq!(said(&paid, "prune"), "1 outputs expected that will not be made were forgotten");
+        assert_eq!(said(&paid, "balance"), "spendable   0");
+        let logged = desk.logged.lock().unwrap().join("\n");
+        assert!(logged.contains(" sped up: transaction ") && logged.contains(" taken back: transaction "), "{logged}");
+        // A payment begun and not yet answered is given up.
+        let slate = desk.file("given-up.slate");
+        let begun = said(&payer, &format!("send-file 2 {slate}"));
+        let id = begun.split_whitespace().nth(1).unwrap().to_string();
+        let given = payer.run(&format!("cancel {id}"));
+        assert!(matches!(&given, Reply::Said(_)), "{given:?}");
+        assert_eq!(said(&payer, "slates"), "no payments begun");
+    }
+
+    /// What was paid is listed, proven in a file and verified from it;
+    /// and coins are burned.
+    #[test]
+    fn payments_are_proven_and_coins_burned() {
+        let (desk, payer, paid) = funded("proofs");
+        let id = pay(&desk, &payer, &paid, "7");
+        desk.mine(&payer, &[&payer, &paid]);
+        desk.mine(&payer, &[&payer, &paid]);
+        let file = desk.file("payment.proof");
+        let listed = said(&payer, "payments");
+        assert!(listed.contains(&format!("  {id}")) && listed.ends_with(": in block 3, proof ready"), "{listed}");
+        assert!(said(&payer, &format!("payment-proof {id}")).starts_with("-----BEGIN TAB PAYMENT PROOF-----\n"));
+        assert_eq!(said(&payer, &format!("payment-proof {id} {file}")), format!("the proof of {id}, in block 3"));
+        // Whoever has the file and the chain can say what it proves.
+        for anyone in [&payer, &paid] {
+            let holds = said(anyone, &format!("verify-proof {file}"));
+            assert!(holds.starts_with("the proof holds: tab1") && holds.contains(" paid 7 to tab1"), "{holds}");
+            assert!(holds.contains("in block 3 (") && holds.contains("which has 2 confirmations"), "{holds}");
+        }
+        assert_eq!(
+            wrong(&payer, "payment-proof 00"),
+            "no payment or burn of a transaction that begins 00 (see payments)"
+        );
+        assert!(wrong(&payer, &format!("verify-proof {}", desk.file("none"))).starts_with("cannot read "));
+        std::fs::write(desk.file("nonsense"), "nonsense").unwrap();
+        assert!(!wrong(&payer, &format!("verify-proof {}", desk.file("nonsense"))).is_empty());
+        // Coins burned, for a purpose that is said: what it is for is
+        // between quotes.
+        assert_eq!(wrong(&payer, "burn 2 for"), "burn: not what it takes (see help)");
+        assert_eq!(wrong(&payer, "burn lots \"for the test\""), "'lots' is not an amount of coins");
+        let burned = said(&payer, "burn 2 \"for the test\"");
+        assert!(burned.starts_with("Burned: 2 for tab1"), "{burned}");
+        assert!(burned.contains(", for \"for the test\": transaction "), "{burned}");
+        assert!(said(&payer, "sent").ends_with("pooled"));
+        desk.mine(&payer, &[&payer, &paid]);
+        desk.mine(&payer, &[&payer, &paid]);
+        let listed = said(&payer, "payments");
+        assert!(listed.contains("2  burned for tab1"), "{listed}");
+        assert!(listed.contains("for \"for the test\": in block 5, proof ready"), "{listed}");
+        let burn =
+            listed.lines().find(|l| l.contains("burned")).unwrap().split_whitespace().next().unwrap().to_string();
+        assert_eq!(said(&payer, &format!("burn-proof {burn} {file}")), format!("the proof of {burn}, in block 5"));
+        assert!(said(&paid, &format!("verify-proof {file}")).starts_with("the proof holds: "));
+        assert_eq!(said(&payer, "balance"), "spendable   8,991");
+        let outputs = said(&payer, "outputs");
+        assert!(outputs.contains("  spent ") && outputs.contains("  confirmed "), "{outputs}");
+        let status = said(&payer, "status");
+        assert!(status.starts_with("block 6 (") && status.ends_with("wallet: 8,991 confirmed"), "{status}");
+    }
+
+    /// A name is committed to, revealed, changed, offered and signed
+    /// over, at the prompts of two wallets.
+    #[test]
+    fn a_name_is_registered_changed_and_given() {
+        let (desk, maker, other) = funded("names");
+        let all = [&maker, &other];
+        assert_eq!(said(&maker, "names"), "no names");
+        assert_eq!(said(&maker, "name alice"), "alice is not registered");
+        assert_eq!(wrong(&maker, "name-commit Alice"), "Alice is not a valid name");
+        // Committed to: which says nothing of the name. Revealed once
+        // the commit has been in the chain for as long as is asked.
+        assert!(said(&maker, "name-commit alice -").starts_with("Name alice: committed to: transaction "));
+        assert!(said(&maker, "names").contains("committed, not yet revealed"));
+        assert_eq!(wrong(&maker, "name-commit alice"), "the wallet has already committed to that name");
+        assert_eq!(wrong(&maker, "name-reveal alice"), "the commit is not on chain yet");
+        let revealed = (0..40).any(|_| {
+            desk.mine(&maker, &all);
+            matches!(maker.run("name-reveal alice"), Reply::Said(text) if text.starts_with("Name alice: revealed: "))
+        });
+        assert!(revealed);
+        assert_eq!(wrong(&maker, "name-reveal alice"), "no commit for alice");
+        desk.mine(&maker, &all);
+        let nothing = "0".repeat(64);
+        assert!(said(&maker, "names").contains(&format!("  owned  says {nothing}")));
+        assert!(said(&maker, "name alice").starts_with(&format!("alice says {nothing}\n  its owner's key: ")));
+        assert_eq!(said(&other, "name alice"), said(&maker, "name alice"));
+        // Changed: what it says.
+        let says = "01000000".repeat(8);
+        assert!(wrong(&maker, "name-update alice nonsense").starts_with("'nonsense' is not what a name says"));
+        assert!(said(&maker, &format!("name-update alice {says}")).starts_with("Name alice: changed: transaction "));
+        assert!(said(&maker, "names").contains("owned, a change signed"));
+        desk.mine(&maker, &all);
+        assert!(said(&other, "name alice").starts_with(&format!("alice says {says}\n  as an address: tab1")));
+        assert!(said(&maker, "names").contains(&format!("  owned  says {says}")));
+        // Given to the other wallet: which writes the record, for the
+        // owner to sign over.
+        let offer = desk.file("alice.offer");
+        assert!(said(&other, &format!("name-offer alice {offer} -")).starts_with("Name alice: an offer written"));
+        assert!(said(&other, "names").contains("offered to this wallet"));
+        assert!(said(&maker, &format!("name-transfer {offer}")).starts_with("Name alice: signed over: transaction "));
+        assert!(said(&maker, "names").contains("being given away"));
+        desk.mine(&maker, &all);
+        assert_eq!(said(&maker, "names"), "no names");
+        assert!(said(&other, "names").contains(&format!("  owned  says {nothing}")));
+        let logged = desk.logged.lock().unwrap().join("\n");
+        for step in ["committed to", "revealed", "changed", "signed over"] {
+            assert!(logged.contains(&format!("Name alice: {step}: transaction ")), "{step}: {logged}");
+        }
+        // A wallet looks for what is its own on the chain, and finds
+        // nothing it did not know.
+        assert!(said(&other, "scan").starts_with("0 outputs found that were not known"));
+        for line in ["subname set bob.alice x", "subname del bob.alice", "subname drop bob.alice"] {
+            assert_eq!(wrong(&other, line), "'bob.alice' is no label@name");
+        }
+    }
+
+    /// The wallet's password is set and asked for; leaves are set, and
+    /// a consensus file voted for.
+    #[test]
+    fn a_wallet_is_locked_and_leaves_are_set() {
+        let (desk, payer, _) = funded("locked");
+        assert!(!payer.locked());
+        assert!(payer.set_password("", "a password").unwrap().starts_with("The wallet's password is set"));
+        assert!(payer.locked());
+        assert_eq!(payer.run("seed"), Reply::Password);
+        assert_eq!(payer.run("password"), Reply::NewPassword);
+        assert_eq!(payer.seed("wrong"), Err("wrong wallet password".to_string()));
+        assert_eq!(payer.seed("a password").unwrap().split_whitespace().count(), 37);
+        assert_eq!(payer.set_password("wrong", "x"), Err("wrong wallet password".to_string()));
+        assert!(payer.set_password("a password", "").unwrap().starts_with("The wallet has no password now"));
+        assert!(!payer.locked());
+        // Leaves: what the blocks made here commit to, a value each.
+        let value = "ab".repeat(32);
+        let set = said(&payer, &format!("set-leaf-value 1 {value}"));
+        assert!(set.starts_with("leaf 1 is set\nroot  "), "{set}");
+        assert!(said(&payer, "leaves").starts_with(&format!("   1  {value}\nroot  ")));
+        assert_eq!(wrong(&payer, "set-leaf-value 1 nonsense"), "the value is 64 hex digits");
+        assert_eq!(wrong(&payer, "set-leaf-value 99 00"), "the leaves are 0 to 15");
+        // The first is the vote for a consensus file: one that is none
+        // is not voted for; one that is, is.
+        let file = desk.file("consensus.txt");
+        std::fs::write(&file, "nonsense\n").unwrap();
+        let no_mode = "the first directive must be `mode init` or `mode onion`";
+        assert!(wrong(&payer, &format!("set-leaf 0 {file}")).ends_with(no_mode));
+        assert!(wrong(&payer, &format!("debug-consensus {file}")).ends_with(no_mode));
+        assert!(wrong(&payer, &format!("set-leaf 0 {}", desk.file("none"))).contains("No such file"));
+        std::fs::write(&file, "mode onion\n").unwrap();
+        assert!(wrong(&payer, &format!("set-leaf 0 {file}")).contains("fewer than the 3 needed"));
+        let relays: Vec<String> = (1..=3u32).map(|i| crate::address::encode(&[i as u8; 32])).collect();
+        let text: String = relays.iter().enumerate().map(|(i, id)| format!("relay {id} 10.0.0.{i}:3737\n")).collect();
+        std::fs::write(&file, format!("# three relays\nmode onion\n{text}")).unwrap();
+        let voted = said(&payer, &format!("set-leaf 0 {file}"));
+        assert!(voted.contains("vote for") && voted.contains("mode onion"), "{voted}");
+        assert!(said(&payer, "leaves").contains("(the vote for a consensus file)"));
+        assert!(said(&payer, "consensus").starts_with("mode init\n"));
+        // (Debugging: the file in force at once, with no vote.)
+        let forced = payer.run(&format!("debug-consensus {file}"));
+        assert!(matches!(&forced, Reply::Said(_)), "{forced:?}");
+        assert!(said(&payer, "consensus").contains("the blocks made here vote for "));
+        // A payment to an address goes to its wallet by the message
+        // layer; to what is no address, nowhere.
+        assert_eq!(wrong(&payer, "send 1 nobody"), "'nobody' is no address (tab1…) and no @name");
+        let begun = said(&payer, &format!("send 1 {}", crate::address::encode(&[7; 32])));
+        assert!(begun.contains("begun: 1 and a fee of"), "{begun}");
+        assert!(begun.ends_with("sent to its wallet, to be answered"), "{begun}");
+        assert!(said(&payer, "slates").contains("1"));
     }
 }

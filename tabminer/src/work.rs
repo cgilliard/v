@@ -750,6 +750,35 @@ mod tests {
         assert!(!proves(steps, &mut reads, &text, &expect));
     }
 
+    /// A header's work as rows: they meet their tables' constraints,
+    /// and state the work as the miner computes it.
+    #[test]
+    fn a_header_s_work_is_rows_that_hold() {
+        use crate::alg::{Shared, halves};
+        use crate::pow::{hashimoto, nonce_from_u64};
+        let text = SeedText::new(PowParams::DEV);
+        let source = text.table(10);
+        let (header, nonce) = ([7u8; 32], nonce_from_u64(11));
+        let out = hashimoto(&source, &header, &nonce);
+        let cx = Shared::new();
+        let (work, stated) = work_into(&cx, &source, &header, &nonce);
+        let expect: Vec<F> = [header, nonce, out.mix, out.result].iter().flat_map(halves).collect();
+        assert_eq!(stated, expect);
+        assert!(crate::proof::holds(cx, vec![], Some(work)));
+        for (table, row, word) in [(0, 300, 8), (1, 5, 48), (1, 9, 80), (1, 63, 104)] {
+            let cx = Shared::new();
+            let (mut work, _) = work_into(&cx, &source, &header, &nonce);
+            if table == 0 {
+                work.steps.0[row][word] ^= 1;
+            } else {
+                work.mix.0[row][word] ^= 1;
+            }
+            // Work with an item that is not the text's, or a window that
+            // is not: rows that do not hold.
+            assert!(!crate::proof::holds(cx, vec![], Some(work)), "table {table} row {row} word {word}");
+        }
+    }
+
     #[test]
     #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
     fn a_header_s_work_is_proven() {

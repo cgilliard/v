@@ -624,7 +624,7 @@ pub(crate) mod tests {
     }
 
     /// Makes the block of `body` and applies it: it must extend.
-    fn extend<V: ProofVerifier + Sync>(chain: &Chain<MemBackend, V>, body: &Body) -> Vec<u8> {
+    pub(crate) fn extend<V: ProofVerifier + Sync>(chain: &Chain<MemBackend, V>, body: &Body) -> Vec<u8> {
         let bytes = block(chain, body);
         assert_eq!(apply(chain, &bytes), Ok(Applied::Extended));
         bytes

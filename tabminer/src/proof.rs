@@ -131,7 +131,20 @@ pub fn prove_with(
     params: impl Fn(usize) -> Params,
     at_least: [usize; 2],
 ) -> Proved {
-    prove_all(cx, chains, work, params, at_least, None)
+    prove_all(cx, chains, work, params, at_least, None, false).expect("a proof")
+}
+
+/// Whether what was compiled in `cx`, with the chains' tables and the
+/// work's beside it, is rows that meet every constraint of their
+/// tables, and assertions that held: what a proof of them would show of
+/// each table by itself, known without making one. (That what one table
+/// sends another takes is left to the proof.)
+pub fn holds(cx: Shared, chains: Vec<Chains>, work: Option<crate::work::Work>) -> bool {
+    let plain = |m| Params::plain(m, 1, 1, 4);
+    match prove_all(cx, chains, work, plain, [128, 128], None, true) {
+        Err(held) => held,
+        Ok(_) => unreachable!("no proof is made"),
+    }
 }
 
 /// [`prove_at`], for a proof that says nothing of the computation but
@@ -140,7 +153,7 @@ pub fn prove_with(
 /// to be random itself and used for nothing else. The machine's rows
 /// must be enough for the pads: 2^15 are.
 pub fn prove_hidden(cx: Shared, params: impl Fn(usize) -> Params, at_least: [usize; 2], seed: [u8; 32]) -> Proved {
-    prove_all(cx, Vec::new(), None, |m| params(m).hiding(), at_least, Some(seed))
+    prove_all(cx, Vec::new(), None, |m| params(m).hiding(), at_least, Some(seed), false).expect("a proof")
 }
 
 fn prove_all(
@@ -150,7 +163,8 @@ fn prove_all(
     params: impl Fn(usize) -> Params,
     at_least: [usize; 2],
     seed: Option<[u8; 32]>,
-) -> Proved {
+    only_checked: bool,
+) -> Result<Proved, bool> {
     let circuits = Circuits::new();
     let Compiler { asm, trace, arith, .. } = cx.finish();
     let numbers = (!arith.is_empty()).then(|| arith.finish(128));
@@ -188,10 +202,14 @@ fn prove_all(
         Kind::Steps => work.as_ref().expect("the work's tables").steps.1.clone(),
         Kind::Mix => work.as_ref().expect("the work's tables").mix.1.clone(),
     };
-    let program = Program::of(&params, &domain, &tables, order.iter().map(|i| program_of(*i)).collect());
+    // (The programs are committed to for a proof only: rows are checked
+    // against the words themselves.)
+    let words: Vec<Vec<u32>> = order.iter().map(|i| program_of(*i)).collect();
+    let program = (!only_checked).then(|| Program::of(&params, &domain, &tables, words.clone()));
+    let words_of = |at: usize| -> &[u32] { program.as_ref().map_or(&words[at], |p| &p.words[at]) };
     let public = |i: usize| -> &[u32] { if kinds[i] == Kind::Machine { &machine_rows.public } else { &[] } };
     let fixed: Vec<Fixed> =
-        order.iter().enumerate().map(|(at, i)| Fixed { program: &program.words[at], public: public(*i) }).collect();
+        order.iter().enumerate().map(|(at, i)| Fixed { program: words_of(at), public: public(*i) }).collect();
     let t = std::time::Instant::now();
     let parts: Vec<Part> = (order.iter().enumerate())
         .map(|(at, i)| {
@@ -217,11 +235,14 @@ fn prove_all(
             Part { circuit, witness, public: public(i) }
         })
         .collect();
-    let (proof, _) = match seed {
-        Some(seed) => prove_hiding(&params, &domain, parts, Some(&program), seed),
-        None => prove_tables(&params, &domain, parts, Some(&program)),
+    let Some(program) = &program else {
+        return Err(machine_rows.holds && parts.iter().all(|part| part.witness.holds()));
     };
-    Proved {
+    let (proof, _) = match seed {
+        Some(seed) => prove_hiding(&params, &domain, parts, Some(program), seed),
+        None => prove_tables(&params, &domain, parts, Some(program)),
+    };
+    Ok(Proved {
         params,
         program: program.root(),
         proof,
@@ -230,7 +251,7 @@ fn prove_all(
         holds: machine_rows.holds,
         used,
         proving: t.elapsed(),
-    }
+    })
 }
 
 impl Proved {

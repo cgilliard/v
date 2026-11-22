@@ -4692,6 +4692,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         (&mut self.workers, &self.shared)
     }
 
+    /// Tests: has the pool look to the chain's last block, as a worker
+    /// does when the chain takes one, `taken` blocks having joined.
+    #[cfg(test)]
+    pub(crate) fn pool_follows(&self, taken: u32) {
+        if let Ok(tip) = self.workers[0].chain.tip() {
+            self.workers[0].pool_follows(&tip, taken);
+        }
+    }
+
     /// How the node stands, to be asked while its workers run.
     pub fn hold(&self) -> Handle<B, V> {
         Handle {
