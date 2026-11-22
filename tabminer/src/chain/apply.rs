@@ -298,6 +298,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         // What the outputs come to: with the subsidy, what was spent.
         let made: u128 = body.outputs().map(|o| o.amount as u128).sum();
         let (era, left) = Statement::era_at(&Emission(self.params.emission), height);
+        let (table, grows) = Statement::table_at(&self.params.pow, height);
         Statement {
             program: self.params.program,
             height,
@@ -312,6 +313,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
             names: roots.1,
             tip: *parent,
             ops,
+            table,
+            grows,
         }
     }
 

@@ -642,7 +642,8 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // (Debugging: nor does one whose blocks are filled with what
     // nobody sent, which are not proven.)
     let proves = c.mine && c.debug_fill.is_none();
-    let again = read.as_ref().filter(|_| proves).and_then(|parts| Setup::from_parts(proofs, emission, parts));
+    let again =
+        read.as_ref().filter(|_| proves).and_then(|parts| Setup::from_parts(proofs, emission, params.pow, parts));
     let (parts, proving) = match (read, again) {
         (Some(parts), Some(proving)) => (parts, Some(proving)),
         (Some(parts), None) if !proves => (parts, None),

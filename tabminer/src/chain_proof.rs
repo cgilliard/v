@@ -72,10 +72,16 @@ pub struct Statement {
     pub tip: Digest,
     /// The last block's running hash of its operations on names.
     pub ops: Digest,
+    /// Which table the work of the last block's header is of (0 before
+    /// the first block, then one more than the times the table has
+    /// doubled), and the blocks left before it doubles
+    /// ([`Statement::table_at`]).
+    pub table: u32,
+    pub grows: u32,
 }
 
 /// Elements of a [`Statement`].
-pub const STATEMENT: usize = 20;
+pub const STATEMENT: usize = 22;
 
 /// What counts blocks down: a block fewer is this many times less.
 const COUNT: F = F(2);
@@ -146,6 +152,41 @@ impl Eras {
     }
 }
 
+/// The table of the proof of work as a circuit's arithmetic follows it,
+/// as it follows the emission ([`Eras`]): which table it is is an
+/// element, the blocks left before it doubles a power of [`COUNT`], and
+/// which is next, how long that one lasts and the mask of a pair's
+/// index in it ([`crate::work::pairs_mask`]) are polynomials in the
+/// first.
+struct Sizes {
+    next: Vec<F>,
+    reset: Vec<F>,
+    mask: Vec<F>,
+}
+
+impl Sizes {
+    fn of(pow: &crate::pow::PowParams) -> Sizes {
+        let room = (pow.max_log_dataset_items - pow.log_dataset_items) as usize;
+        let table = |i: usize| F(i as u128);
+        // Table 0 is before the first block, whose header's work is of
+        // the first table as block one's is; table `room + 1` is the
+        // last, which is its own next and whose count never runs out.
+        let log = |i: usize| pow.log_dataset_items + (i.max(1) - 1) as u32;
+        let mask = |i: usize| F(crate::work::pairs_mask(log(i)) as u128);
+        // The first block is the first of its table's that has a
+        // header before it; every other table begins with a block that
+        // has a whole epoch after it.
+        let reset = |i: usize| match i {
+            0 => F::ZERO,
+            i if i > room => F::ZERO,
+            1 => power(COUNT, pow.epoch_blocks as u128 - 2),
+            _ => power(COUNT, pow.epoch_blocks as u128 - 1),
+        };
+        let points = |f: &dyn Fn(usize) -> F| interpolate(&(0..room + 2).map(|i| (table(i), f(i))).collect::<Vec<_>>());
+        Sizes { next: points(&|i| table((i + 1).min(room + 1))), reset: points(&reset), mask: points(&mask) }
+    }
+}
+
 impl Statement {
     /// Where a chain begins: no block, an empty state.
     pub fn genesis() -> Statement {
@@ -163,6 +204,8 @@ impl Statement {
             names: crate::registry::empty_roots()[crate::registry::HEIGHT],
             tip: [0; 32],
             ops: [0; 32],
+            table: 0,
+            grows: 0,
         }
     }
 
@@ -178,7 +221,24 @@ impl Statement {
         out.extend(halves(&self.names));
         out.extend(halves(&self.tip));
         out.extend(halves(&self.ops));
+        // A table that grows no more has no count.
+        out.push(F(self.table as u128));
+        out.push(if self.grows == u32::MAX { F::ZERO } else { power(COUNT, self.grows as u128) });
         out
+    }
+
+    /// Which table the work of the header at `height` is of, as a
+    /// statement says it (one more than the times the table has
+    /// doubled; 0 at height 0, whose header has none before it), and
+    /// the blocks left after that one before it doubles.
+    pub fn table_at(pow: &crate::pow::PowParams, height: u32) -> (u32, u32) {
+        let room = pow.max_log_dataset_items - pow.log_dataset_items;
+        let epoch = pow.epoch_of(height as u64);
+        match height {
+            0 => (0, 0),
+            _ if epoch >= room => (room + 1, u32::MAX),
+            _ => (epoch + 1, pow.epoch_blocks - 1 - height % pow.epoch_blocks),
+        }
     }
 
     /// The digest a proof of the statement has as its public value, and
@@ -202,9 +262,15 @@ impl Statement {
     }
 
     /// The statement after `block`, by the step of program `program`,
-    /// under `emission`.
-    pub fn after(program: &Digest, block: &crate::block_proof::Statement, emission: &Emission) -> Statement {
+    /// under `emission` and with the tables of `pow`.
+    pub fn after(
+        program: &Digest,
+        block: &crate::block_proof::Statement,
+        emission: &Emission,
+        pow: &crate::pow::PowParams,
+    ) -> Statement {
         let (era, left) = Statement::era_at(emission, block.height);
+        let (table, grows) = Statement::table_at(pow, block.height);
         Statement {
             program: *program,
             height: block.height,
@@ -219,6 +285,8 @@ impl Statement {
             names: block.names[1],
             tip: crate::header::id_of(&block.work[0], &block.work[1], &block.work[2]),
             ops: block.ops,
+            table,
+            grows,
         }
     }
 }
@@ -254,13 +322,17 @@ pub struct Plan {
     depth: usize,
     pub genesis: Digest,
     pub emission: Emission,
+    /// The network's proof of work: how large its table is, and when
+    /// it doubles.
+    pub pow: crate::pow::PowParams,
 }
 
 impl Plan {
-    pub fn new(shapes: Vec<Shape>, genesis: Digest, emission: Emission) -> Plan {
+    pub fn new(shapes: Vec<Shape>, genesis: Digest, emission: Emission, pow: crate::pow::PowParams) -> Plan {
         assert!(!shapes.is_empty() && emission.0.len() <= 6 && emission.0.iter().all(|e| e.0 > 0));
+        assert!(pow.max_log_dataset_items >= pow.log_dataset_items && pow.epoch_blocks >= 2);
         let depth = shapes.len().next_power_of_two().trailing_zeros().max(1) as usize;
-        Plan { shapes, depth, genesis, emission }
+        Plan { shapes, depth, genesis, emission, pow }
     }
 
     fn node(&self, level: usize, index: usize) -> Digest {
@@ -368,11 +440,29 @@ pub fn step_into(
     let ended = cx.input(F(run_out as u128));
     let inverse = cx.input(less.value().inv());
     assert!((less.clone() * ended.clone()).is(&zero));
-    assert!((less * inverse).is(&(ended.clone() + one)));
+    assert!((less * inverse).is(&(ended.clone() + one.clone())));
     let era = ((at(&eras.next, era) + era.clone()) * ended.clone() + era.clone()).kept();
     let fewer = (count.clone() * cx.constant(COUNT.inv())).kept();
     let count = (at(&eras.reset, &era) + fewer.clone()) * ended + fewer;
     assert!(st[16].is(&at(&eras.pays, &era)));
+
+    // The table. The work the block's proof showed is of the header
+    // before this block, and of the table the chain said that header's
+    // work is of: no other, larger or smaller. Then, as with the
+    // emission: if no block was left before the table doubles, this
+    // block's header is the next one's first.
+    let sizes = Sizes::of(&plan.pow);
+    let (table, grows) = (&p[20], &p[21]);
+    assert!(st[29].is(&at(&sizes.mask, table)));
+    let doubled = grows.value() == F::ONE;
+    let less = grows.clone() + one.clone();
+    let turned = cx.input(F(doubled as u128));
+    let inverse = cx.input(less.value().inv());
+    assert!((less.clone() * turned.clone()).is(&zero));
+    assert!((less * inverse).is(&(turned.clone() + one.clone())));
+    let table = ((at(&sizes.next, table) + table.clone()) * turned.clone() + table.clone()).kept();
+    let fewer = (grows.clone() * cx.constant(COUNT.inv())).kept();
+    let grows = (at(&sizes.reset, &table) + fewer.clone()) * turned + fewer;
 
     let mut stated = own;
     stated.extend([st[12].clone(), st[2].clone(), st[3].clone(), st[11].clone()]);
@@ -390,6 +480,7 @@ pub fn step_into(
     let named: Vec<Sym> = work_hash.iter().chain(&st[25..29]).cloned().collect();
     stated.extend(cx.hashed(crate::hash::DOM_BLOCK, &named));
     stated.extend([st[21].clone(), st[22].clone()]);
+    stated.extend([table, grows]);
     cx.state(&stated);
     Some(stated.iter().map(Sym::value).collect())
 }
@@ -492,6 +583,7 @@ mod tests {
                 vec![Shape { root: [3; 32], rested }, Shape { root: sample.0.program, rested }],
                 genesis.program,
                 EMISSION,
+                crate::pow::PowParams::DEV,
             );
             let cx = Shared::new();
             let mut reader = Deferred::new(&cx);
@@ -540,7 +632,7 @@ mod tests {
             let step = prove_hidden(cx, params, shape, [0xA1 + i as u8; 32]);
             assert!(step.holds && step.verifies() && step.params.blind, "block {}", i + 1);
             assert_eq!(step.program, own, "block {}", i + 1);
-            let expect = Statement::after(&own, &block, &EMISSION);
+            let expect = Statement::after(&own, &block, &EMISSION, &crate::pow::PowParams::DEV);
             assert_eq!((expect.era, expect.left), [(1, 1), (1, 0), (2, 0), (3, u32::MAX)][i]);
             // The chain is now at the header whose work was shown.
             assert_eq!(expect.tip, header.id());
@@ -667,7 +759,12 @@ mod tests {
             let cx = Shared::new();
             let began = genesis_into(&cx);
             let genesis = prove_hidden(cx, published, shape, [0xB0; 32]);
-            let plan = Plan::new(vec![Shape { root: first.0.program, rested }], genesis.program, MAINNET_EMISSION);
+            let plan = Plan::new(
+                vec![Shape { root: first.0.program, rested }],
+                genesis.program,
+                MAINNET_EMISSION,
+                crate::pow::PowParams::MAINNET,
+            );
             let step = || {
                 let cx = Shared::new();
                 let mut reader = Deferred::new(&cx);
@@ -953,7 +1050,7 @@ mod tests {
         let cx = Shared::new();
         let began = genesis_into(&cx);
         let genesis = prove_hidden(cx, published, sized, [0xC0; 32]);
-        let plan = Plan::new(shapes, genesis.program, MAINNET_EMISSION);
+        let plan = Plan::new(shapes, genesis.program, MAINNET_EMISSION, crate::pow::PowParams::MAINNET);
         let step = |index: usize, this: &Stated, before: &Stated, first: bool, own: &Digest, rest: &Digest| {
             let cx = Shared::new();
             let mut reader = Deferred::new(&cx);
@@ -1116,5 +1213,49 @@ mod tests {
         let large = 67_280_421_310_721u128;
         assert_eq!(u128::MAX % large, 0);
         assert_ne!(power(COUNT, u128::MAX / large), F::ONE);
+    }
+
+    /// The table a statement says the next work is of, and its count,
+    /// go from block to block by the step's arithmetic as the chain's
+    /// own rule has them; and the mask the step holds a work to is that
+    /// of the table the chain checks that header's work with. For a
+    /// table that doubles twice, one that doubles five times, and one
+    /// that does not grow.
+    #[test]
+    fn the_table_is_followed_from_block_to_block() {
+        use crate::pow::PowParams;
+        let small = |room: u32, epoch_blocks: u32| PowParams {
+            log_dataset_items: 10,
+            max_log_dataset_items: 10 + room,
+            epoch_blocks,
+            ..PowParams::DEV
+        };
+        for pow in [small(2, 4), small(5, 3), small(1, 2), PowParams::DEV] {
+            let sizes = Sizes::of(&pow);
+            let count = |left: u32| if left == u32::MAX { F::ZERO } else { power(COUNT, left as u128) };
+            assert_eq!(Statement::table_at(&pow, 0), (0, 0));
+            for height in 0..40u32 {
+                let (table, grows) = Statement::table_at(&pow, height);
+                // The work of the header at this height is of this table.
+                let mask = crate::work::pairs_mask(pow.log_items_at(height as u64));
+                assert_eq!(at(&sizes.mask, &F(table as u128)), F(mask as u128), "height {height}");
+                // The step: one block fewer, or the next table.
+                let (t, c) = (F(table as u128), count(grows));
+                let turned = if c == F::ONE { F::ONE } else { F::ZERO };
+                let next = (at(&sizes.next, &t) + t) * turned + t;
+                let fewer = c * COUNT.inv();
+                let left = (at(&sizes.reset, &next) + fewer) * turned + fewer;
+                let (table, grows) = Statement::table_at(&pow, height + 1);
+                assert_eq!((next, left), (F(table as u128), count(grows)), "after height {height}");
+            }
+        }
+        // The main network's: its first table for a year of blocks, and
+        // the sixth for good.
+        let main = PowParams::MAINNET;
+        assert_eq!(Statement::table_at(&main, 1), (1, main.epoch_blocks - 2));
+        assert_eq!(Statement::table_at(&main, main.epoch_blocks - 1), (1, 0));
+        assert_eq!(Statement::table_at(&main, main.epoch_blocks), (2, main.epoch_blocks - 1));
+        assert_eq!(Statement::table_at(&main, 5 * main.epoch_blocks), (6, u32::MAX));
+        assert_eq!(Statement::table_at(&main, u32::MAX), (6, u32::MAX));
     }
 }

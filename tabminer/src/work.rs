@@ -306,7 +306,7 @@ pub mod mix {
     use crate::pow::{ItemSource, PowParams};
 
     /// Words a row takes as inputs.
-    pub const INPUTS: usize = 510;
+    pub const INPUTS: usize = 512;
     /// Words of program a row reads.
     pub const PROGRAM: usize = 32;
     /// Rows: an access each, and as many again that fill the table.
@@ -330,18 +330,27 @@ pub mod mix {
         pair: V,
         picked: V,
         sent: [V; 32],
+        /// The mask of a pair's index, which says how large the table
+        /// is: in a row that is an access, and nothing in one that is
+        /// not. And the same as the first row takes it.
+        masked: V,
+        mask_taken: V,
         /// The access's number; masks for the first row and the others;
-        /// the mask of a pair's index; bits for the first row, the last
-        /// and a row that is an access; the addresses.
+        /// a mask for a row that is an access; bits for the first row,
+        /// the last and a row that is an access; the addresses; a mask
+        /// for an access after the first; where the pairs' mask is
+        /// taken from.
         number: V,
         first: V,
         goes_on: V,
-        pairs: V,
+        access: V,
         bits: V,
         seed_at: [V; 2],
         item_at: [V; 8],
         index_at: [V; 2],
         out_at: [V; 8],
+        later: V,
+        mask_at: V,
     }
 
     const FIRST: u32 = 1;
@@ -358,12 +367,14 @@ pub mod mix {
         let (count, inverse, out) = (words!(4), words!(4), words!(32));
         let products = (0..34).map(|_| words!(10)).collect();
         let (pair, picked, sent) = (c.input(), c.input(), words!(32));
-        let (number, first, goes_on, pairs, bits) = (c.program(), c.program(), c.program(), c.program(), c.program());
+        let (masked, mask_taken) = (c.input(), c.input());
+        let (number, first, goes_on, access, bits) = (c.program(), c.program(), c.program(), c.program(), c.program());
         let seed_at = std::array::from_fn(|_| c.program());
         let item_at = std::array::from_fn(|_| c.program());
         let index_at = std::array::from_fn(|_| c.program());
         let out_at = std::array::from_fn(|_| c.program());
-        for _ in 25..PROGRAM {
+        let (later, mask_at) = (c.program(), c.program());
+        for _ in 27..PROGRAM {
             c.program();
         }
         Row {
@@ -379,15 +390,19 @@ pub mod mix {
             pair,
             picked,
             sent,
+            masked,
+            mask_taken,
             number,
             first,
             goes_on,
-            pairs,
+            access,
             bits,
             seed_at,
             item_at,
             index_at,
             out_at,
+            later,
+            mask_at,
         }
     }
 
@@ -437,7 +452,14 @@ pub mod mix {
                 // The selectors: of the access's number and the seed, and
                 // of the mix.
                 let pick = times_prime(s, &r.seed[0].xor(&r.number), &r.products[32]).xor(&r.mix[0]);
-                s.constrain(pick, r.pairs.clone(), r.pair.clone());
+                // (Under the mask of a pair's index: how large the table
+                // is. It is no part of the program, which is then one
+                // for a table of any size: it is the same in every
+                // access, nothing in a row that is none, and what the
+                // first row takes it to be, which the work states.)
+                s.constrain(pick, r.masked.clone(), r.pair.clone());
+                s.zero_where(&r.access.xor(&ones), r.masked.clone());
+                s.zero_where(&r.later, r.masked.xor(&r.masked.prev()));
                 let pick = times_prime(s, &r.seed[1].xor(&r.number), &r.products[33]).xor(&r.mix[16]);
                 s.constrain(pick, con(WINDOWS as u32 - 1), r.picked.clone());
 
@@ -449,6 +471,8 @@ pub mod mix {
                     s.product(Sum::element(&r.seed[4 * h..4 * h + 4]), bit(FIRST), taken.clone());
                     s.receive(vec![Sum::word(&r.seed_at[h]), taken]);
                 }
+                s.product(Sum::word(&r.masked), bit(FIRST), Sum::word(&r.mask_taken));
+                s.receive(vec![Sum::word(&r.mask_at), Sum::word(&r.mask_taken)]);
                 // The two items, and that they are the pair picked: the
                 // even item of the pair, and the one after it.
                 for (e, part) in elements(&r.items).into_iter().enumerate() {
@@ -486,6 +510,8 @@ pub mod mix {
         pub items: Vec<([u32; 8], [u32; 2])>,
         /// Of the mix's eight elements, sent.
         pub out: [u32; 8],
+        /// Of the mask of a pair's index, taken.
+        pub mask: u32,
     }
 
     /// The shifts and carries of a product by the prime, and the product.
@@ -520,7 +546,7 @@ pub mod mix {
     ) -> (Vec<[u32; INPUTS]>, Vec<u32>, Vec<usize>, [u32; 32]) {
         let params: &PowParams = source.params();
         assert!(params.accesses <= ROWS);
-        let pairs = (1u32 << (source.log_items() - 1)) - 1;
+        let pairs = super::pairs_mask(source.log_items());
         let text = source.seed();
         let mut mix: [u32; 32] = std::array::from_fn(|k| seed[k % 8]);
         let (mut rows, mut program, mut indices) = (Vec::new(), Vec::new(), Vec::new());
@@ -568,8 +594,10 @@ pub mod mix {
                 r[478..510].copy_from_slice(&out);
                 last = out;
             }
+            (r[510], r[511]) = (if access { pairs } else { 0 }, if i == 0 { pairs } else { 0 });
             (p[0], p[1], p[2], p[3]) =
-                (i as u32, if i == 0 { !0 } else { 0 }, if i == 0 { 0 } else { !0 }, if access { pairs } else { 0 });
+                (i as u32, if i == 0 { !0 } else { 0 }, if i == 0 { 0 } else { !0 }, if access { !0 } else { 0 });
+            (p[25], p[26]) = (if access && i > 0 { !0 } else { 0 }, if i == 0 { at.mask } else { 0 });
             p[4] = if i == 0 { FIRST } else { 0 } | if is_last { LAST } else { 0 } | if access { ACCESS } else { 0 };
             if i == 0 {
                 p[5..7].copy_from_slice(&at.seed);
@@ -593,6 +621,12 @@ pub mod mix {
 // A header's work, whole
 // ---------------------------------------------------------------------------
 
+/// The mask of a pair's index in a table of `2^log_items` items: what
+/// says, in a proof of work, which table the work is of.
+pub fn pairs_mask(log_items: u32) -> u32 {
+    (1u32 << (log_items - 1)) - 1
+}
+
 /// The work's two tables, as rows and programs.
 pub struct Work {
     pub steps: (Vec<[u32; INPUTS]>, Vec<u32>),
@@ -603,8 +637,9 @@ pub struct Work {
 /// two tables: the seed hashed from the header's hash and the nonce,
 /// the accesses and the items they read, the mix hashed, and the result.
 /// The computation is said to be of the header's hash, the nonce, the
-/// mix and the result: those, as elements. `source` gives the items and
-/// says which table the work is of.
+/// mix and the result, and of a table of a size: those, as elements,
+/// the size as the mask of a pair's index ([`pairs_mask`]). `source`
+/// gives the items and says which table the work is of.
 pub fn work_into<S: crate::pow::ItemSource>(
     cx: &crate::alg::Shared,
     source: &S,
@@ -622,7 +657,9 @@ pub fn work_into<S: crate::pow::ItemSource>(
     let of: Vec<Sym> = data.iter().zip(&said).map(|(at, x)| cx.outside(*at, *x)).collect();
     let seed: Vec<Sym> = out.iter().zip(halves(&seed_digest)).map(|(at, x)| cx.outside(*at, x)).collect();
     let reserve = || cx.with(|c| c.trace.reserve());
+    let mask = cx.input(F(pairs_mask(source.log_items()) as u128));
     let at = mix::At {
+        mask: mask.send(),
         seed: [seed[0].send(), seed[1].send()],
         items: (0..accesses)
             .map(|_| (std::array::from_fn(|_| reserve()), std::array::from_fn(|_| reserve())))
@@ -645,7 +682,7 @@ pub fn work_into<S: crate::pow::ItemSource>(
     let mixed: Vec<Sym> = (0..8).map(|e| cx.outside(at.out[e], word(e))).collect();
     let mix = cx.hashed(DOM_POW_MIX, &mixed);
     let result = cx.hashed(DOM_POW_RESULT, &[mix[0].clone(), mix[1].clone(), seed[0].clone(), seed[1].clone()]);
-    let stated: Vec<Sym> = of.into_iter().chain(mix).chain(result).collect();
+    let stated: Vec<Sym> = of.into_iter().chain(mix).chain(result).chain([mask]).collect();
     cx.state(&stated);
     (Work { steps, mix: (mix_rows, mix_program) }, stated.iter().map(Sym::value).collect())
 }
@@ -771,7 +808,9 @@ mod tests {
         let out = hashimoto(&source, &header, &nonce);
         let cx = Shared::new();
         let (work, stated) = work_into(&cx, &source, &header, &nonce);
-        let expect: Vec<F> = [header, nonce, out.mix, out.result].iter().flat_map(halves).collect();
+        // (And of which table: the mask of a pair's index in it.)
+        let table = F(pairs_mask(crate::pow::ItemSource::log_items(&source)) as u128);
+        let expect: Vec<F> = [header, nonce, out.mix, out.result].iter().flat_map(halves).chain([table]).collect();
         assert_eq!(stated, expect);
         assert!(crate::proof::holds(cx, vec![], Some(work)));
         for (table, row, word) in [(0, 300, 8), (1, 5, 48), (1, 9, 80), (1, 63, 104)] {
@@ -802,7 +841,9 @@ mod tests {
         let cx = Shared::new();
         let (work, stated) = work_into(&cx, &source, &header, &nonce);
         // What the rows are of is the work as the miner computes it.
-        let expect: Vec<F> = [header, nonce, out.mix, out.result].iter().flat_map(halves).collect();
+        // (And of which table: the mask of a pair's index in it.)
+        let table = F(pairs_mask(crate::pow::ItemSource::log_items(&source)) as u128);
+        let expect: Vec<F> = [header, nonce, out.mix, out.result].iter().flat_map(halves).chain([table]).collect();
         assert_eq!(stated, expect);
         assert_eq!((work.steps.0.len(), work.mix.0.len()), (WINDOWS, mix::ROWS));
         let p = crate::proof::prove_with(cx, vec![], Some(work), |m| Params::plain(m, 1, 4, 4), [128, 128]);

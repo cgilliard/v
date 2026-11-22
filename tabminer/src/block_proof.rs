@@ -125,7 +125,7 @@ pub fn join_into(cx: &Shared, tables: &Tables, reader: &mut impl Reader<Sym>, ch
 /// Digests of programs a block's root states before the statement.
 pub const PROGRAMS: usize = 6;
 /// Elements of a [`Statement`].
-pub const STATEMENT: usize = 29;
+pub const STATEMENT: usize = 30;
 
 /// What a block's proof is of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -155,6 +155,9 @@ pub struct Statement {
     /// The work shown of the header before this block's: that header's
     /// work's hash, its nonce and its mix. Zeros if none is shown.
     pub work: [Digest; 3],
+    /// The size of the table that work is of, as the mask of a pair's
+    /// index ([`crate::work::pairs_mask`]). Zero if none is shown.
+    pub table: u32,
 }
 
 impl Statement {
@@ -175,6 +178,7 @@ impl Statement {
             ops: record.done[1],
             signed: *signed,
             work: [[0; 32]; 3],
+            table: 0,
         }
     }
 
@@ -196,6 +200,7 @@ impl Statement {
         out.extend(self.names.iter().flat_map(halves));
         out.extend(halves(&self.ops));
         out.extend(self.work.iter().flat_map(halves));
+        out.push(F(self.table as u128));
         out
     }
 }
@@ -239,7 +244,7 @@ pub enum Beside<'a> {
 /// Elements a proof of signatures and work together states: the hash of
 /// what it rested on, the signatures' root and its level, and the
 /// work's header's hash, nonce and mix.
-pub const BESIDE: usize = 11;
+pub const BESIDE: usize = 12;
 
 /// A computation, in `cx`, that verifies a proof of signatures and a
 /// proof of a header's work and states both: so that a root has one
@@ -257,7 +262,9 @@ pub fn beside_into(
     let of = work.proof.verify_into(cx, &tables.compiled, reader)?;
     let said = cx.stated(&[of[2].clone(), of[3].clone()], work.stated);
     let below = cx.hashed(DOM_RESTED, &[v.own, v.below, of[..2].to_vec()].concat());
-    let stated = [below.to_vec(), v.root.to_vec(), vec![v.level], said[..6].to_vec()].concat();
+    // (Of the work: the header's work's hash, the nonce, the mix, and
+    // the table's size; not the result, which the header says.)
+    let stated = [below.to_vec(), v.root.to_vec(), vec![v.level], said[..6].to_vec(), vec![said[8].clone()]].concat();
     cx.state(&stated);
     Some(stated.iter().map(Sym::value).collect())
 }
@@ -303,11 +310,11 @@ pub fn root_with(
                     let of = w.proof.verify_into(cx, &tables.compiled, reader)?;
                     let said = cx.stated(&[of[2].clone(), of[3].clone()], w.stated);
                     programs.extend(of[..2].iter().cloned());
-                    said[..6].to_vec()
+                    said[..6].iter().chain(&said[8..9]).cloned().collect()
                 }
                 None => {
                     programs.extend(zeros(2));
-                    zeros(6).collect()
+                    zeros(7).collect()
                 }
             };
             (set, worked)
@@ -669,7 +676,8 @@ mod tests {
         let root = crate::proof::prove(cx, vec![], params);
         assert!(root.holds && root.verifies());
         let mix = crate::pow::hashimoto(&source, &header, &nonce).mix;
-        let with_work = Statement { work: [header, nonce, mix], ..expect };
+        let table = crate::work::pairs_mask(crate::pow::ItemSource::log_items(&source));
+        let with_work = Statement { work: [header, nonce, mix], table, ..expect };
         assert_eq!(one[2 * PROGRAMS..], with_work.elements()[..]);
         // It states the one proof's program where the signatures' was,
         // and what that rested on.

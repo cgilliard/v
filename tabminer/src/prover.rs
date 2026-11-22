@@ -786,7 +786,7 @@ impl Setup {
             let began = genesis_into(&cx);
             let genesis = prove_hidden(cx, level.published, rows, seed());
             assert!(genesis.holds);
-            let plan = Plan::new(shapes.clone(), genesis.program, emission);
+            let plan = Plan::new(shapes.clone(), genesis.program, emission, *source.params());
             let cx = Shared::new();
             let mut reader = Deferred::new(&cx);
             let (block, before) =
@@ -845,7 +845,7 @@ impl Setup {
     /// `emission`: its circuits made, and the proof of where a chain
     /// begins made again. `None` if the parts are not this build's: that
     /// proof is of another program, or of other sizes, than they say.
-    pub fn from_parts(level: Level, emission: Emission, parts: &Parts) -> Option<Setup> {
+    pub fn from_parts(level: Level, emission: Emission, pow: crate::pow::PowParams, parts: &Parts) -> Option<Setup> {
         let shapes = 1 + (level.trees + 1) * (level.runs.len() + level.joins);
         if parts.shapes.len() != shapes || parts.nodes.len() < level.trees || parts.joins.len() < level.joins {
             return None;
@@ -860,7 +860,7 @@ impl Setup {
         same.then(|| Setup {
             level,
             tables: Tables::new(),
-            plan: Plan::new(parts.shapes.clone(), parts.genesis, emission),
+            plan: Plan::new(parts.shapes.clone(), parts.genesis, emission, pow),
             own: parts.own,
             rows: parts.rows,
             genesis,
@@ -1537,12 +1537,12 @@ pub(crate) mod tests {
         let bytes = parts.to_bytes();
         assert!(Parts::from_bytes(&bytes[..bytes.len() - 1]).is_none());
         assert!(Parts::from_bytes(&[&bytes[..], &[0]].concat()).is_none());
-        let again = Setup::from_parts(Level::SMALL, Emission(params.emission), &parts).unwrap();
+        let again = Setup::from_parts(Level::SMALL, Emission(params.emission), params.pow, &parts).unwrap();
         assert!(again.parts() == parts && again.own == setup.own);
         // Parts of another build's circuits: the proof of where a chain
         // begins is not of the program they say.
         let other = Parts { genesis: [1; 32], ..parts.clone() };
-        assert!(Setup::from_parts(Level::SMALL, Emission(params.emission), &other).is_none());
+        assert!(Setup::from_parts(Level::SMALL, Emission(params.emission), params.pow, &other).is_none());
         // A block made by the setup made again is taken by a chain that
         // has the verifier of the parts alone.
         let chain =
@@ -1596,7 +1596,7 @@ pub(crate) mod tests {
         };
         let params = ChainParams { genesis_mix: None, ..params };
         let began = Instant::now();
-        let setup = Setup::from_parts(Level::MAINNET, Emission(params.emission), &parts).unwrap();
+        let setup = Setup::from_parts(Level::MAINNET, Emission(params.emission), params.pow, &parts).unwrap();
         println!("the setup, from its file: {:.1?}", began.elapsed());
         let chain =
             Chain::open(MemBackend::new(), 8, params, text, ChainVerifier::of(&Level::MAINNET, &parts)).unwrap();
