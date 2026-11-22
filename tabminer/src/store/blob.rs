@@ -1,14 +1,21 @@
-//! Bytes too many for one page: a chain of pages.
+//! Bytes too many for one page: pages, and a list of them.
 //!
 //! A block's body is megabytes and a page holds 64 KB, so what is long
-//! is cut into pages, each naming the one after it. A [`Blob`] is where
-//! the first is and how many bytes there are in all; it is what a record
-//! elsewhere holds of the bytes.
+//! is cut into pages, and where they are is written in a list: a page
+//! of its own, or a chain of them if one does not hold it. A [`Blob`]
+//! is where the first page is and how many bytes there are in all; it
+//! is what a record elsewhere holds of the bytes. Bytes that fit one
+//! page are that page, and have no list.
 //!
 //! ```text
-//! page := next page (6) | bytes
 //! blob := first page (6) | length (4)
+//! first page := the bytes, if they fit one page; else a list
+//! list := next list (6) | page (6) ...
 //! ```
+//!
+//! Where the bytes are is known from the lists alone: a file opened
+//! finds the pages in use without reading megabytes of every block,
+//! at one page read for every 700 MB or so.
 //!
 //! The pages are pages of the state's file like any others: written in a
 //! transaction, in place when it commits, freed in another.
@@ -18,15 +25,18 @@ use std::io;
 use super::backend::Backend;
 use super::pagefile::{Extent, MAX_UNITS, PageFile, ReadPages, Txn, UNIT};
 
-/// Bytes a page of a chain holds, after the next page's place.
-const CHUNK: usize = Extent::capacity(MAX_UNITS) - 6;
+/// Bytes a page holds.
+const CHUNK: usize = Extent::capacity(MAX_UNITS);
+/// Pages a list names, after the next list's place: some 700 MB of
+/// them. (A few, where this is tested: megabytes then have lists.)
+const LISTED: usize = if cfg!(test) { 4 } else { (CHUNK - 6) / 6 };
 const NONE: Extent = Extent { start: 0, units: 0 };
 
 fn corrupt(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
-/// Bytes kept as a chain of pages.
+/// Bytes kept as pages.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Blob {
     first: Extent,
@@ -41,41 +51,48 @@ impl Blob {
     /// Writes `bytes` as pages of `txn`.
     pub fn write<B: Backend>(txn: &Txn<'_, B>, bytes: &[u8]) -> io::Result<Blob> {
         assert!(!bytes.is_empty() && bytes.len() <= u32::MAX as usize);
-        // The last page first: each names the one after it.
-        let mut next = NONE;
-        let mut page = Vec::with_capacity(6 + CHUNK.min(bytes.len()));
-        for chunk in bytes.chunks(CHUNK).rev() {
-            page.clear();
-            put_extent(&mut page, next);
-            page.extend_from_slice(chunk);
-            next = txn.write(&page)?;
+        let len = bytes.len() as u32;
+        if bytes.len() <= CHUNK {
+            return Ok(Blob { first: txn.write(bytes)?, len });
         }
-        Ok(Blob { first: next, len: bytes.len() as u32 })
+        let pages = bytes.chunks(CHUNK).map(|chunk| txn.write(chunk)).collect::<io::Result<Vec<Extent>>>()?;
+        // The last list first: each names the one after it.
+        let mut next = NONE;
+        let mut list = Vec::with_capacity(6 + 6 * LISTED.min(pages.len()));
+        for listed in pages.chunks(LISTED).rev() {
+            list.clear();
+            put_extent(&mut list, next);
+            listed.iter().for_each(|e| put_extent(&mut list, *e));
+            next = txn.write(&list)?;
+        }
+        Ok(Blob { first: next, len })
     }
 
     /// The bytes.
     pub fn read(&self, pages: &impl ReadPages) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; MAX_UNITS as usize * UNIT];
         let mut out = Vec::with_capacity(self.len as usize);
-        self.each_page(pages, &mut |_, data| out.extend_from_slice(data))?;
+        for page in self.places(pages)?.1 {
+            out.extend_from_slice(pages.read_page(page, &mut buf)?);
+        }
         match out.len() == self.len as usize {
             true => Ok(out),
-            false => Err(corrupt("a chain of pages is not as long as it says")),
+            false => Err(corrupt("a blob is not as long as it says")),
         }
     }
 
     /// Frees the pages.
     pub fn free<B: Backend>(&self, txn: &Txn<'_, B>) -> io::Result<()> {
-        let mut chain = Vec::new();
-        self.each_page(txn, &mut |e, _| chain.push(e))?;
-        chain.into_iter().for_each(|e| txn.free(e));
+        let (lists, pages) = self.places(txn)?;
+        lists.into_iter().chain(pages).for_each(|e| txn.free(e));
         Ok(())
     }
 
-    /// Marks the pages in `file`'s map of free space.
+    /// Marks the pages in `file`'s map of free space: its lists are
+    /// read, and none of its bytes.
     pub fn mark<B: Backend>(&self, file: &PageFile<B>) -> io::Result<()> {
-        let mut chain = Vec::new();
-        self.each_page(file, &mut |e, _| chain.push(e))?;
-        chain.into_iter().try_for_each(|e| file.mark(e))
+        let (lists, pages) = self.places(file)?;
+        lists.into_iter().chain(pages).try_for_each(|e| file.mark(e))
     }
 
     pub fn put(&self, out: &mut Vec<u8>) {
@@ -89,7 +106,7 @@ impl Blob {
         match (blob.first.units, blob.len) {
             (0, 0) => Ok(None),
             (1..=MAX_UNITS, 1..) => Ok(Some(blob)),
-            _ => Err(corrupt("a chain's place is not one")),
+            _ => Err(corrupt("a blob's place is not one")),
         }
     }
 
@@ -101,24 +118,38 @@ impl Blob {
         }
     }
 
-    /// Calls `f` with each page of the chain, and its bytes.
-    fn each_page(&self, pages: &impl ReadPages, f: &mut dyn FnMut(Extent, &[u8])) -> io::Result<()> {
-        let mut buf = vec![0u8; MAX_UNITS as usize * UNIT];
-        let mut at = self.first;
-        // No more pages than the length needs: a chain that goes on is
+    /// Where its lists are, and where its bytes are, in their order.
+    fn places(&self, pages: &impl ReadPages) -> io::Result<(Vec<Extent>, Vec<Extent>)> {
+        // No more pages than the length needs: a list that goes on is
         // not this blob's.
-        for _ in 0..(self.len as usize).div_ceil(CHUNK) {
+        let need = (self.len as usize).div_ceil(CHUNK);
+        if need <= 1 {
+            return Ok((Vec::new(), vec![self.first]));
+        }
+        let mut buf = vec![0u8; MAX_UNITS as usize * UNIT];
+        let (mut lists, mut found) = (Vec::new(), Vec::with_capacity(need));
+        let mut at = self.first;
+        while found.len() < need {
             if at.units == 0 || at.units > MAX_UNITS {
-                return Err(corrupt("a chain of pages ends early"));
+                return Err(corrupt("a blob's list ends early"));
             }
-            let payload = pages.read_page(at, &mut buf)?;
-            let (next, data) = payload.split_at_checked(6).ok_or_else(|| corrupt("a chain's page is not one"))?;
-            f(at, data);
-            at = get_extent(next);
+            let list = pages.read_page(at, &mut buf)?;
+            let listed = (need - found.len()).min(LISTED);
+            if list.len() != 6 + 6 * listed {
+                return Err(corrupt("a blob's list is not one"));
+            }
+            lists.push(at);
+            at = get_extent(&list[..6]);
+            for place in list[6..].chunks_exact(6).map(get_extent) {
+                if place.units == 0 || place.units > MAX_UNITS {
+                    return Err(corrupt("a blob's page is not one"));
+                }
+                found.push(place);
+            }
         }
         match at.units {
-            0 => Ok(()),
-            _ => Err(corrupt("a chain of pages does not end")),
+            0 => Ok((lists, found)),
+            _ => Err(corrupt("a blob's list does not end")),
         }
     }
 }
@@ -177,10 +208,41 @@ mod tests {
         assert!(Blob { len: blob.len + CHUNK as u32, ..blob }.read(&file).is_err());
         assert!(Blob { len: blob.len - CHUNK as u32, ..blob }.read(&file).is_err());
         assert!(Blob { len: blob.len - 1, ..blob }.read(&file).is_err());
+        let (blob, _) = kept[3];
+        assert!(Blob { len: blob.len - 1, ..blob }.read(&file).is_err());
+        assert!(Blob { len: blob.len + 1, ..blob }.read(&file).is_err());
 
         let txn = file.begin().unwrap();
         kept.iter().for_each(|(blob, _)| blob.free(&txn).unwrap());
         txn.commit(&[]).unwrap();
         assert_eq!(file.space().0, empty);
+    }
+
+    /// A file opened finds where bytes are without reading them: of
+    /// what fits one page nothing is read, and of what is long its
+    /// list, however many megabytes there are.
+    #[test]
+    fn the_pages_are_found_without_reading_the_bytes() {
+        use crate::store::testing::{Counting, temp_dir};
+        let dir = temp_dir("blob-marked");
+        let file = PageFile::create(Counting::open(&dir.join("state"))).unwrap();
+        let txn = file.begin().unwrap();
+        let blobs = [1, CHUNK, CHUNK + 1, LISTED * CHUNK, LISTED * CHUNK + 1, 2_000_000]
+            .map(|len| (len, Blob::write(&txn, &vec![7u8; len]).unwrap()));
+        txn.commit(&[]).unwrap();
+        let used = file.space().0;
+        drop(file);
+        let again = PageFile::open(Counting::open(&dir.join("state"))).unwrap();
+        again.backend().take();
+        for (len, blob) in blobs {
+            blob.mark(&again).unwrap();
+            let [reads, bytes, ..] = again.backend().take();
+            let lists = if len > CHUNK { len.div_ceil(CHUNK).div_ceil(LISTED) as u64 } else { 0 };
+            assert_eq!(reads, lists, "{len}");
+            assert!(bytes <= lists * (MAX_UNITS as usize * UNIT) as u64, "{len}: {bytes}");
+        }
+        again.seal();
+        assert_eq!(again.space().0, used);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -84,7 +84,11 @@ pub fn empty_state() -> Digest {
     compress(super::sparse::empty(super::sparse::HEIGHT), &super::names::empty_root())
 }
 
-const VERSION: u8 = 1;
+/// How a root record of this making begins. (1 was of blocks kept as
+/// chains of pages, each naming the next: [`super::blob`].)
+const VERSION: u8 = 3;
+/// What records of makings before this one began with.
+const OLDER: [u8; 1] = [1];
 /// What a root record begins with while its state is still being
 /// received from other nodes ([`super::receive`]): not a state to open.
 pub(super) const RECEIVING: u8 = 2;
@@ -219,6 +223,11 @@ impl Meta {
         }
         if b.first() == Some(&RECEIVING) {
             return Err(corrupt("the state is still being received"));
+        }
+        if b.first().is_some_and(|v| OLDER.contains(v)) {
+            return Err(corrupt(
+                "the state was kept by an earlier version, and is not read by this one: with its directory gone, it is taken again",
+            ));
         }
         if b.len() != RECORD || b[0] != VERSION {
             return Err(corrupt("the state's root record is not one"));
