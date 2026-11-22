@@ -1,0 +1,62 @@
+name: program
+
+# The program itself, run as whoever keeps a node runs it, in full
+# (tabminer/tests/binary.rs): nodes of the dev network that make blocks,
+# pay each other at the prompt, go over to another branch, register
+# names and give them, are made again from their words, pay addresses
+# and through relays; and, in a job of its own, vote for a consensus
+# file over the 144 blocks a vote takes. Every block is proven and
+# checked, so the tests go one at a time: an hour and more, and some
+# hours for the vote. Every night; two of them on every push (test.yml).
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  program:
+    name: program, all of it (ubuntu-latest, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked --release --features dev --test binary
+
+  vote:
+    name: a vote of 144 blocks (ubuntu-latest, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: >
+          cargo test --locked --release --features dev --test binary --
+          --ignored --exact a_consensus_file_is_voted_for_and_followed

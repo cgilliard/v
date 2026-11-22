@@ -112,14 +112,19 @@ jobs:
         run: ./tools/ignored.sh
 
   # The program itself, run as whoever keeps a node runs it
-  # (tabminer/tests/binary.rs): nodes of the dev network that make
-  # blocks, pay each other at the prompt, go over to another branch,
-  # register names, vote, and pay through relays. Every block is proven
-  # and checked, so the tests whose nodes make blocks go one at a time.
+  # (tabminer/tests/binary.rs): what it says of itself, that it starts
+  # and stops, two nodes of the dev network that make blocks and take
+  # each other's, and a payment made at the prompt and mined. Every
+  # block is proven and checked, some minutes of every core, so the
+  # tests whose nodes make blocks go one at a time; the rest of them
+  # (a chain going over to another branch, names, relays, a vote) are
+  # an hour and more, and run nightly (program.yml). What they ask at
+  # the prompt is asked on every push of a chain in memory, by the unit
+  # tests.
   program:
     name: program (ubuntu-latest, release)
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: tabminer
@@ -133,7 +138,9 @@ jobs:
           rustc --version
 
       - name: Test
-        run: cargo test --locked --release --features dev --test binary
+        run: >
+          cargo test --locked --release --features dev --test binary --
+          help_is_no_failure a_node_starts two_nodes_make_blocks a_payment_is_made_at_the_prompt
 
   # The slow tests: those marked #[ignore] that are not benchmarks, a job
   # each, in a release build. One makes two blocks with the main
