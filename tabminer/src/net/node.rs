@@ -155,6 +155,15 @@ impl Counts {
 /// chunk is asked for by its object's name, and a part of the state
 /// takes reading back through the blocks since to make.
 const SERVED_BYTES: usize = 32 << 20;
+/// And so many of them at the most, however small: each is looked for
+/// among them all, for every chunk.
+const SERVED_MOST: usize = 256;
+/// How many states as of another block than those lately asked for are
+/// made in a second: for one host, and for all. Each is made by reading
+/// back through every block since; whoever takes a state asks for one,
+/// and for thousands of its parts.
+const PASTS_EACH: usize = 2;
+const PASTS: usize = 8;
 /// Chunks sent in one go before the node looks to what else there is.
 const SERVE_BATCH: usize = 256;
 
@@ -1053,6 +1062,13 @@ pub struct Worker<B: Backend + 'static, V> {
     serve: Serve,
     /// Objects lately made to be served, the latest first.
     served: VecDeque<(Object, Arc<Vec<u8>>)>,
+    /// The blocks whose states were last asked for, and who asked for
+    /// the state as of another, when ([`PASTS`]).
+    past_of: VecDeque<Digest>,
+    pasts: VecDeque<(std::net::Ipv4Addr, Micros)>,
+    /// The object last asked for could not be read, which is not to say
+    /// there is none.
+    unread: std::cell::Cell<bool>,
     fetches: Vec<Fetching>,
     /// The peers that were live when that was last looked to.
     was_live: Vec<SocketAddrV4>,
@@ -1163,6 +1179,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             unix: 0,
             due: now,
             served: VecDeque::new(),
+            past_of: VecDeque::new(),
+            pasts: VecDeque::new(),
+            unread: std::cell::Cell::new(false),
             fetches: Vec::new(),
             was_live: Vec::new(),
             grants: VecDeque::new(),
@@ -4467,7 +4486,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             self.served.push_front(hit);
             return Some(Arc::clone(&self.served[0].1));
         }
+        self.unread.set(false);
         let bytes = self.make(object)?;
+        // (What a name is of for good is kept: not the newest a wallet
+        // announced, nor the certificate it is a name by, which are
+        // another's tomorrow under the same name.)
+        if matches!(object, Object::Announce { seq: 0, .. } | Object::Alias(_)) {
+            return Some(Arc::new(bytes));
+        }
         #[cfg(test)]
         let bytes = if self.spoil {
             let mut b = bytes;
@@ -4485,7 +4511,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             kept += b.len();
             kept <= SERVED_BYTES
         });
-        let keep = fit.count().max(1);
+        let keep = fit.count().clamp(1, SERVED_MOST);
         self.served.truncate(keep);
         Some(Arc::clone(&self.served[0].1))
     }
@@ -4509,11 +4535,24 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 if self.chain.headers_from(from, &mut headers).ok()? != count as usize {
                     return None;
                 }
+                // (Read of the chain `on` was on a moment ago: if it is
+                // on it no longer, these may be another's.)
+                if self.on_chain(&on) != Some(top) {
+                    return None;
+                }
                 let mut bytes = Vec::with_capacity(count as usize * HEADER_SIZE);
                 headers.iter().for_each(|h| bytes.extend_from_slice(&h.to_bytes()));
                 Some(bytes)
             }
-            Object::Block(id) => self.chain.body(&id).ok().flatten(),
+            Object::Block(id) => match self.chain.body(&id) {
+                Ok(body) => body,
+                // (Not read is not "not here": said to be gone, the
+                // block would not be asked of this node again.)
+                Err(_) => {
+                    self.unread.set(true);
+                    None
+                }
+            },
             Object::Tx(id) => self.shared.pool().entry(&id).map(|e| e.bytes().to_vec()),
             Object::File(id) => self.chain.consensus_file_by_id(&id).ok().flatten(),
             // What a wallet announced: this node's own wallet's, by its
@@ -4571,7 +4610,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     fn past<T>(&self, block: &Digest, make: impl FnOnce(&crate::store::state::Past<'_, B>) -> Option<T>) -> Option<T> {
         let height = self.on_chain(block)?.height;
         let state = self.chain.whole().ok()?;
-        make(&state.past(height).ok()?)
+        // (The state as of that block, and of no other the chain went
+        // over to at that height meanwhile.)
+        let past = state.past(height).ok()?;
+        (past.tip() == (height, *block)).then(|| make(&past)).flatten()
     }
 
     /// Fetches `object`, of `most` bytes at the most, from `from`: what
@@ -4716,7 +4758,37 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             match self.serve.next(now) {
                 Next::Send(x) => {
                     let SocketAddr::V4(to) = x.to else { continue };
-                    let bytes = Object::decode(x.name()).ok().and_then(|o| self.object(&o));
+                    let object = Object::decode(x.name()).ok();
+                    // The state as of another block than the last asked
+                    // for: so many a second, and what is over is not
+                    // answered now.
+                    if let Some(
+                        Object::Manifest(block)
+                        | Object::Roots { block, .. }
+                        | Object::Part { block, .. }
+                        | Object::Names { block, .. },
+                    ) = object
+                    {
+                        match self.past_of.iter().position(|b| *b == block) {
+                            Some(at) => self.past_of.swap(0, at),
+                            None => {
+                                self.pasts.retain(|p| now.saturating_sub(p.1) < crate::transport::SECOND);
+                                let own = self.pasts.iter().filter(|p| p.0 == *to.ip()).count();
+                                if !to.ip().is_loopback() && (own >= PASTS_EACH || self.pasts.len() >= PASTS) {
+                                    self.serve.cancel(x.to, x.transfer);
+                                    continue;
+                                }
+                                self.pasts.push_back((*to.ip(), now));
+                                self.past_of.push_front(block);
+                                self.past_of.truncate(crate::store::state::PASTS_KEPT);
+                            }
+                        }
+                    }
+                    let bytes = object.and_then(|o| self.object(&o));
+                    if bytes.is_none() && self.unread.get() {
+                        self.serve.cancel(x.to, x.transfer);
+                        continue;
+                    }
                     match bytes.as_deref().map(|b| chunk_of(b, x.index).map(|data| (b.len() as u32, data))) {
                         Some(Some((len, data))) => {
                             let chunk = Chunk { transfer: x.transfer, seq: x.seq, len, index: x.index, data };

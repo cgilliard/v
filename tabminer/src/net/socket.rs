@@ -299,6 +299,28 @@ where
     received
 }
 
+/// What comes on `queue` within `wait` microseconds. Where a wait is
+/// as long as the machine's clock ticks and no shorter (Windows: a
+/// sixty-fourth of a second, as a rule), one of a few hundred
+/// microseconds, which is what there is between two chunks served at
+/// their pace, is kept by looking again and again: slept through, the
+/// pace would be a burst a tick, a quarter of the rate.
+fn recv_within<T>(queue: &std::sync::mpsc::Receiver<T>, wait: u64) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    if cfg!(windows) && wait < 2_000 {
+        let until = Instant::now() + Duration::from_micros(wait);
+        loop {
+            match queue.try_recv() {
+                Ok(item) => return Ok(item),
+                Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
+                Err(TryRecvError::Empty) if Instant::now() >= until => return Err(RecvTimeoutError::Timeout),
+                Err(TryRecvError::Empty) => std::thread::yield_now(),
+            }
+        }
+    }
+    queue.recv_timeout(Duration::from_micros(wait))
+}
+
 /// The receiver: reads the port and hands each datagram to the worker
 /// `owner` says its sender is of.
 fn receive(
@@ -311,13 +333,29 @@ fn receive(
     // (Not for ever, where it may be told to stop: so that it is seen.)
     socket.set_read_timeout(stop.map(|_| Duration::from_millis(50)))?;
     let mut told: Option<Instant> = None;
+    let mut failed = 0u32;
     let mut item = Item::Datagram { from: SocketAddr::from(([0, 0, 0, 0], 0)), len: 0, bytes: [0u8; MAX_DATAGRAM + 1] };
     while !stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
         let Item::Datagram { from, len, bytes } = &mut item else { unreachable!() };
         // Nothing in time, or the machine's own complaint about a
         // datagram we sent, is no datagram.
-        let Ok((n, sender)) = socket.recv_from(bytes) else {
-            continue;
+        let (n, sender) = match socket.recv_from(bytes) {
+            Ok(read) => {
+                failed = 0;
+                read
+            }
+            Err(e) => {
+                use std::io::ErrorKind::{ConnectionRefused, ConnectionReset, Interrupted, TimedOut, WouldBlock};
+                // (A port that only fails, time after time, is not read
+                // as fast as it fails.)
+                if !matches!(e.kind(), WouldBlock | TimedOut | Interrupted | ConnectionReset | ConnectionRefused) {
+                    failed += 1;
+                    if failed > 16 {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                continue;
+            }
         };
         (*from, *len) = (sender, n as u16);
         let queue = &queues[owner(&sender)];
@@ -393,7 +431,7 @@ fn work<B: Backend + 'static, V: ProofVerifier + Sync>(
                 watch.heard(&heard, len as usize, now().saturating_sub(began));
             }
         };
-        match queue.recv_timeout(Duration::from_micros(wait)) {
+        match recv_within(&queue, wait) {
             Ok(item) => {
                 take(worker, item);
                 // And whatever else is waiting, before looking to the

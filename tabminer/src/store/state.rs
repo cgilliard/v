@@ -45,6 +45,7 @@
 //!   less those registered since, with the records replaced since as
 //!   they were.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -62,6 +63,9 @@ use crate::hash::Digest;
 use crate::hash::{digest_from_bytes, digest_to_bytes};
 use crate::name::{Key, Record as NameRecord};
 use crate::registry::state_root as compress;
+
+/// How many states as of earlier blocks are kept made ([`State::past`]).
+pub const PASTS_KEPT: usize = 4;
 
 /// Digests of an output's path to the state's root: the siblings in the
 /// outputs' tree, the lowest first, and then the names' root.
@@ -273,11 +277,13 @@ pub struct State<B: Backend + 'static> {
     /// The thread that rebuilds the file's map of free space, until it
     /// has been waited for.
     marking: Mutex<Option<JoinHandle<Result<(), io::ErrorKind>>>>,
-    /// The state as of an earlier block that was last asked for
-    /// ([`State::past`]), and the block the state was at when it was
-    /// made: it is the same for as long as the state is, and making it
-    /// reads the root of every part there is.
-    past: Mutex<Option<(Digest, Arc<PastThen>)>>,
+    /// The states as of earlier blocks that were last asked for
+    /// ([`State::past`]), [`PASTS_KEPT`] of them, and the block the
+    /// state was at when each was made: each is the same for as long as
+    /// the state is, and making one reads the root of every part there
+    /// is. (More than one: two nodes that take the state as of two
+    /// blocks ask for their parts turn about.)
+    past: Mutex<VecDeque<(Digest, Arc<PastThen>)>>,
     /// Tests: how long each step of the last block applied took (the
     /// outputs, the names and the window, the sweep, the commit).
     #[cfg(test)]
@@ -342,7 +348,7 @@ impl<B: Backend + 'static> State<B> {
             part_level: PART_LEVEL,
             name_level: NAME_PART_LEVEL,
             marking: Mutex::new(None),
-            past: Mutex::new(None),
+            past: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             times: Mutex::new([std::time::Duration::ZERO; 4]),
         }
@@ -423,15 +429,17 @@ impl<B: Backend + 'static> State<B> {
         // for the same one thousands of times. (The state, not the
         // file: headers go on arriving, each a root of the file's, and
         // none of them changes what a block's state was.)
-        let kept = self.past.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((tip, then)) = &*kept
-            && *tip == meta.tip
-            && then.height == height
-            && then.outputs.to_bytes() == meta.outputs.to_bytes()
-            && then.names.to_bytes() == meta.names.to_bytes()
-            && then.commits.to_bytes() == meta.commits.to_bytes()
-        {
-            return Ok(Past { pin, then: Arc::clone(then) });
+        let mut kept = self.past.lock().unwrap_or_else(|e| e.into_inner());
+        // (Those made of a state that is no more are of no use again.)
+        kept.retain(|(tip, then)| {
+            *tip == meta.tip
+                && then.outputs.to_bytes() == meta.outputs.to_bytes()
+                && then.names.to_bytes() == meta.names.to_bytes()
+                && then.commits.to_bytes() == meta.commits.to_bytes()
+        });
+        if let Some(at) = kept.iter().position(|(_, then)| then.height == height) {
+            kept.swap(0, at);
+            return Ok(Past { pin, then: Arc::clone(&kept[0].1) });
         }
         drop(kept);
         let oldest = meta.window.oldest().unwrap_or(meta.height + 1);
@@ -498,7 +506,10 @@ impl<B: Backend + 'static> State<B> {
             commits: meta.commits,
             commits_then,
         });
-        *self.past.lock().unwrap_or_else(|e| e.into_inner()) = Some((meta.tip, Arc::clone(&then)));
+        let mut kept = self.past.lock().unwrap_or_else(|e| e.into_inner());
+        kept.push_front((meta.tip, Arc::clone(&then)));
+        kept.truncate(PASTS_KEPT);
+        drop(kept);
         Ok(Past { pin, then })
     }
 

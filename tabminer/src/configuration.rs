@@ -308,12 +308,12 @@ is given (default 5)",
             Opt {
                 name: "serve-queue",
                 takes: Takes::Value("N"),
-                help: "requests for chunks that may wait (default 64)",
+                help: "requests for chunks that may wait (default 256)",
             },
             Opt {
                 name: "serve-queue-per-peer",
                 takes: Takes::Value("N"),
-                help: "of those, from one address (default 8)",
+                help: "of those, from one host (default 32)",
             },
         ],
     ),
@@ -1413,7 +1413,7 @@ mod tests {
         assert_eq!(wrong(&["--ping-seconds", "40"]), "--peer-live-seconds (65) is under two of --ping-seconds (40)");
         assert_eq!(wrong(&["--peer-drop-seconds", "30"]), "--peer-drop-seconds (30) is under --peer-live-seconds (65)");
         assert_eq!(wrong(&["--block-fetches", "4"]), "--block-fetches-per-peer (8) is over --block-fetches (4)");
-        assert_eq!(wrong(&["--serve-queue", "4"]), "--serve-queue-per-peer (8) is over --serve-queue (4)");
+        assert_eq!(wrong(&["--serve-queue", "4"]), "--serve-queue-per-peer (32) is over --serve-queue (4)");
         assert_eq!(wrong(&["--sync-point", "2000"]), "--sync-point (2000) is not under --max-undo-blocks (1008)");
         assert_eq!(
             wrong(&["--stat-summary-seconds", "5"]),

@@ -254,19 +254,43 @@ impl Logger {
     /// simply be given another name: it is copied in under the line.
     /// If that fails, nothing is lost: what there is of `aside` is
     /// removed and the log's file is left as it was.
-    fn set_aside(&self, aside: &Path, begun: u64) -> io::Result<()> {
-        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let copy = || -> io::Result<()> {
-            let mut to = OpenOptions::new().write(true).create_new(true).open(aside)?;
-            to.write_all(format!("{name}{}\n", Moment::of(begun).begun()).as_bytes())?;
-            io::copy(&mut std::fs::File::open(&self.path)?, &mut to)?;
-            to.sync_all()
-        };
-        if let Err(e) = copy() {
+    ///
+    /// In two steps. With the log held, the file is only given another
+    /// name ([`Logger::take_aside`]), which takes no time, and a new
+    /// one begun: whoever has a line to write waits for no more than
+    /// that. The copying, which is as long as the file is, is done
+    /// after ([`Logger::set_aside`]) by whoever found the file due,
+    /// with the log let go.
+    fn take_aside(&self, aside: &Path, begun: u64) -> io::Result<Aside> {
+        let held = held_of(aside);
+        // (The name is taken from here on, though nothing is in it yet.)
+        OpenOptions::new().write(true).create_new(true).open(aside)?;
+        if let Err(e) = std::fs::rename(&self.path, &held) {
             let _ = std::fs::remove_file(aside);
             return Err(e);
         }
-        std::fs::remove_file(&self.path)
+        Ok(Aside { held, aside: aside.to_path_buf(), begun })
+    }
+
+    /// The second step: the lines, under their first line, in the file
+    /// of the name they are put aside under. If that fails, they are
+    /// there without the line.
+    fn set_aside(&self, taken: &Aside) -> io::Result<()> {
+        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let copy = || -> io::Result<()> {
+            let mut to = OpenOptions::new().write(true).truncate(true).open(&taken.aside)?;
+            to.write_all(format!("{name}{}\n", Moment::of(taken.begun).begun()).as_bytes())?;
+            io::copy(&mut std::fs::File::open(&taken.held)?, &mut to)?;
+            to.sync_all()
+        };
+        match copy() {
+            Ok(()) => std::fs::remove_file(&taken.held),
+            Err(e) => {
+                let _ = std::fs::remove_file(&taken.aside);
+                std::fs::rename(&taken.held, &taken.aside)?;
+                Err(e)
+            }
+        }
     }
 
     /// Has each file this log puts aside told of in `main`, by the name
@@ -356,7 +380,9 @@ impl Logger {
         let now = (self.clock)();
         let mut inner = self.lock();
         if inner.written && self.aged(&inner, now) {
-            self.rotate_locked(&mut inner, now);
+            let taken = self.rotate_locked(&mut inner, now);
+            drop(inner);
+            self.finish(taken);
         }
     }
 
@@ -366,7 +392,22 @@ impl Logger {
     pub fn rotate(&self) -> Option<PathBuf> {
         let now = (self.clock)();
         let mut inner = self.lock();
-        self.rotate_locked(&mut inner, now)
+        let taken = self.rotate_locked(&mut inner, now);
+        drop(inner);
+        self.finish(taken)
+    }
+
+    /// What is left of putting a file aside, done with the log let go:
+    /// the name it was given.
+    fn finish(&self, taken: Option<Aside>) -> Option<PathBuf> {
+        let taken = taken?;
+        if let Err(e) = self.set_aside(&taken) {
+            self.failed("put aside", &e);
+        }
+        if let Some(tell) = &self.on_rotate {
+            tell(&taken.aside);
+        }
+        Some(taken.aside)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -389,9 +430,10 @@ impl Logger {
         // (A file with nothing in it is not put
         // aside: for its age there is nothing to keep, and a line too
         // long for any file goes into this one.)
-        if inner.written && (over || self.aged(&inner, now)) {
-            self.rotate_locked(&mut inner, now);
-        }
+        let taken = match inner.written && (over || self.aged(&inner, now)) {
+            true => self.rotate_locked(&mut inner, now),
+            false => None,
+        };
         if inner.file.is_none()
             && let Err(e) = self.begin(&mut inner, now)
         {
@@ -404,6 +446,8 @@ impl Logger {
             }
             Err(e) => self.failed("written to", &e),
         }
+        drop(inner);
+        self.finish(taken);
     }
 
     /// The name a file put aside at `moment` is given: the log's own,
@@ -416,32 +460,43 @@ impl Logger {
             let count = if count == 1 { String::new() } else { format!("_{count:02}") };
             self.path.with_file_name(format!("{stem}{}{count}{ending}", moment.rotated()))
         };
-        (1..).map(named).find(|p| !p.exists()).expect("some count is free")
+        (1..).map(named).find(|p| !p.exists() && !held_of(p).exists()).expect("some count is free")
     }
 
-    fn rotate_locked(&self, inner: &mut Inner, now: u64) -> Option<PathBuf> {
+    fn rotate_locked(&self, inner: &mut Inner, now: u64) -> Option<Aside> {
         if !inner.written {
             inner.since = now;
             return None;
         }
-        // Closed before it is removed: some systems will not remove a
-        // file that is open.
+        // Closed before it is given another name: some systems will not
+        // do that to a file that is open.
         inner.file = None;
         let aside = self.aside(&Moment::of(now));
-        let renamed = self.set_aside(&aside, inner.since);
-        if let Err(e) = &renamed {
+        let taken = self.take_aside(&aside, inner.since);
+        if let Err(e) = &taken {
             // The same file goes on being written to.
             self.failed("put aside", e);
         }
         if let Err(e) = self.begin(inner, now) {
             self.failed("opened", &e);
         }
-        let aside = renamed.ok().map(|()| aside)?;
-        if let Some(tell) = &self.on_rotate {
-            tell(&aside);
-        }
-        Some(aside)
+        taken.ok()
     }
+}
+
+/// A file being put aside: where its lines are meanwhile, the name they
+/// are put aside under, and when the file was begun.
+struct Aside {
+    held: PathBuf,
+    aside: PathBuf,
+    begun: u64,
+}
+
+/// Where a file's lines are while they are put aside under `aside`.
+fn held_of(aside: &Path) -> PathBuf {
+    let mut name = aside.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".moving");
+    aside.with_file_name(name)
 }
 
 #[cfg(test)]

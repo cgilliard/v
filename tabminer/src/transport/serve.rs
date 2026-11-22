@@ -53,24 +53,37 @@ pub struct Limits {
     pub rate: u32,
     /// Requests waiting, in all.
     pub waiting: usize,
-    /// Requests of one address waiting.
+    /// Requests of one host waiting: of every port of its address
+    /// together, but for this machine's own address, where each port is
+    /// its own. (A host has as many ports as it likes.)
     pub waiting_each: usize,
-    /// Chunks of one address waiting. Under a full window
+    /// Chunks of one host waiting. Under a full window
     /// ([`MAX_WINDOW`]) a fetch that has grown to one could never be
     /// answered whole.
     pub chunks_each: u32,
 }
 
 impl Default for Limits {
-    /// Sixty-four requests waiting, eight of one address, and two full
-    /// windows of chunks for it, at 8,192 chunks a second.
+    /// Two hundred and fifty-six requests waiting, thirty-two of one
+    /// host (more than a node asks one peer for at once, blocks and
+    /// runs of headers together), and two full windows of chunks for
+    /// it, at 8,192 chunks a second.
     fn default() -> Limits {
-        Limits { rate: 8192, waiting: 64, waiting_each: 8, chunks_each: 2 * MAX_WINDOW }
+        Limits { rate: 8192, waiting: 256, waiting_each: 32, chunks_each: 2 * MAX_WINDOW }
     }
 }
 
 /// Chunks sent at once after idleness, before the pace holds.
 pub const BURST: u64 = 32;
+
+/// The addresses that are one host with `a`: every port of its address,
+/// but of this machine's own address, where each port is its own.
+fn host(a: &SocketAddr) -> (SocketAddr, SocketAddr) {
+    match a.ip().is_loopback() {
+        true => (*a, *a),
+        false => (SocketAddr::new(a.ip(), 0), SocketAddr::new(a.ip(), u16::MAX)),
+    }
+}
 
 struct Job {
     to: SocketAddr,
@@ -177,6 +190,8 @@ pub struct Serve {
     jobs: usize,
     /// The address served last: the turn passes to the next after it.
     last: Option<SocketAddr>,
+    /// Chunks sent in all: whose turn it is among a host's addresses.
+    turns: u64,
     /// Microseconds a chunk.
     cost: Micros,
     /// The time the next chunk may go, were there no burst: it runs
@@ -203,6 +218,7 @@ impl Serve {
             queues: BTreeMap::new(),
             jobs: 0,
             last: None,
+            turns: 0,
             cost: (SECOND / limits.rate as u64).max(1),
             due: Default::default(),
         }
@@ -230,21 +246,26 @@ impl Serve {
             return Err(Refused::Token);
         }
         let l = self.limits;
-        let queue = self.queues.get_mut(&from);
-        let (mine, chunks) = queue.as_ref().map_or((0, 0), |q| (q.len(), q.iter().map(|j| j.left).sum::<u32>()));
+        let (first, last) = host(&from);
+        let (mine, chunks) = self
+            .queues
+            .range(first..=last)
+            .fold((0, 0), |(n, chunks), (_, q)| (n + q.len(), chunks + q.iter().map(|j| j.left).sum::<u32>()));
         if chunks + get.ranges.chunks() > l.chunks_each {
             return Err(Refused::Full);
         }
-        // More of what its address asked for last: one request with it,
-        // while there is room in that one.
-        if let Some(j) = queue.and_then(|q| q.back_mut())
-            && j.transfer == get.transfer
-            && j.name[..j.name_len as usize] == *get.name
+        // More of a fetch its address has a request waiting for: one
+        // request with it, while there is room in that one. (Whichever
+        // of its requests that is: a node fetches several things of a
+        // peer at once, and more of the first is asked for while the
+        // last waits.)
+        let same = |j: &&mut Job| j.transfer == get.transfer && j.name[..j.name_len as usize] == *get.name;
+        if let Some(j) = self.queues.get_mut(&from).and_then(|q| q.iter_mut().rev().find(same))
             && j.extend(get)
         {
             return Ok(());
         }
-        if self.jobs == l.waiting || mine == l.waiting_each {
+        if self.jobs >= l.waiting || mine >= l.waiting_each {
             return Err(Refused::Full);
         }
         let mut name = [0; MAX_NAME];
@@ -280,9 +301,15 @@ impl Serve {
 
     /// The address whose turn it is: the next after the one served
     /// last, in the order of addresses, and round again from the first.
+    /// (The next host's: a host that asks from many ports has one turn
+    /// among the hosts, which its ports take one after another.)
     fn turn(&self) -> Option<SocketAddr> {
-        let after = self.last.and_then(|last| self.queues.range((Bound::Excluded(last), Bound::Unbounded)).next());
-        after.or_else(|| self.queues.iter().next()).map(|(to, _)| *to)
+        let after =
+            self.last.and_then(|last| self.queues.range((Bound::Excluded(host(&last).1), Bound::Unbounded)).next());
+        let to = after.or_else(|| self.queues.iter().next()).map(|(to, _)| *to)?;
+        let (first, last) = host(&to);
+        let ports = self.queues.range(first..=last).count();
+        self.queues.range(first..=last).nth(self.turns as usize % ports).map(|(to, _)| *to)
     }
 
     /// What to send at `now`.
@@ -325,6 +352,7 @@ impl Serve {
             }
         }
         self.last = Some(to);
+        self.turns = self.turns.wrapping_add(1);
         Next::Send(send)
     }
 }
@@ -415,11 +443,12 @@ mod tests {
         // comes after it does not join what came before it.
         s.get(&tokens, addr(1), &get(&tokens, addr(1), 6, b"x", ranges(0..2))).unwrap();
         s.get(&tokens, addr(1), &get(&tokens, addr(1), 6, b"y", ranges(0..2))).unwrap();
+        // (More of the first, asked for after them, is of the first.)
         s.get(&tokens, addr(1), &get(&tokens, addr(1), 5, b"x", ranges([9]))).unwrap();
-        assert_eq!(s.waiting(), 4);
+        assert_eq!(s.waiting(), 3);
         let sent: Vec<(u64, u32)> = drain(&mut s).iter().map(|x| (x.1, x.2)).collect();
         let mut want: Vec<(u64, u32)> = (1..800).map(|i| (5, i)).collect();
-        want.extend([(5, 3), (5, 4), (6, 0), (6, 1), (6, 0), (6, 1), (5, 9)]);
+        want.extend([(5, 3), (5, 4), (5, 9), (6, 0), (6, 1), (6, 0), (6, 1)]);
         assert_eq!(sent, want);
         // Each chunk goes with the number of its ask: the request's, and
         // one more for each chunk after its first, over all its runs.
@@ -472,18 +501,42 @@ mod tests {
             let mine: Vec<u32> = sent.iter().filter(|x| x.0 == a).map(|x| x.2).collect();
             assert!(mine.is_sorted(), "{mine:?}");
         }
+        // A host that asks from four ports has one turn in two with a
+        // host that asks from one, not four in five.
+        for p in 0..4u16 {
+            let from = SocketAddr::from(([10, 0, 0, 7], 4000 + p));
+            s.get(&tokens, from, &get(&tokens, from, p as u64, b"x", ranges(0..5))).unwrap();
+        }
+        s.get(&tokens, addr(9), &get(&tokens, addr(9), 1, b"x", ranges(0..10))).unwrap();
+        let who: Vec<u8> = drain(&mut s).iter().map(|x| x.0).collect();
+        assert_eq!(who[..20].iter().filter(|a| **a == 9).count(), 10, "{who:?}");
+        assert_eq!(who.len(), 30);
     }
 
     #[test]
     fn what_waits_is_bounded() {
         let tokens = Tokens::new([1; 32]);
-        let mut s = Serve::new(1000);
+        let l = Limits { rate: 1000, waiting: 64, waiting_each: 8, ..Limits::default() };
+        let mut s = Serve::with(l);
         // Requests of one address.
-        let l = Limits::default();
         for i in 0..l.waiting_each as u64 {
             assert_eq!(s.get(&tokens, addr(1), &get(&tokens, addr(1), i, b"x", ranges(0..1))), Ok(()));
         }
         assert_eq!(s.get(&tokens, addr(1), &get(&tokens, addr(1), 99, b"x", ranges(0..1))), Err(Refused::Full));
+        // Nor from another port of its address: a host is one, however
+        // many ports it asks from. (But on this machine, where each
+        // port is another node.)
+        let port = |host: [u8; 4], port: u16| SocketAddr::from((host, port));
+        let other = port([10, 0, 0, 1], 4001);
+        assert_eq!(s.get(&tokens, other, &get(&tokens, other, 99, b"x", ranges(0..1))), Err(Refused::Full));
+        for p in 0..2 * l.waiting_each as u16 {
+            let here = port([127, 0, 0, 1], 5000 + p);
+            assert_eq!(s.get(&tokens, here, &get(&tokens, here, 1, b"x", ranges(0..1))), Ok(()));
+        }
+        assert_eq!(drain(&mut s).len(), 3 * l.waiting_each);
+        for i in 0..l.waiting_each as u64 {
+            assert_eq!(s.get(&tokens, addr(1), &get(&tokens, addr(1), i, b"x", ranges(0..1))), Ok(()));
+        }
         // Chunks of one address: two windows, and not one more.
         let window = ranges(0..MAX_WINDOW);
         assert_eq!(s.get(&tokens, addr(2), &get(&tokens, addr(2), 1, b"x", window)), Ok(()));

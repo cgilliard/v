@@ -300,7 +300,7 @@ mod tests {
         assert_eq!((s.sync_point, s.parts, s.snapshot_attempts), (144, 32, 4));
         assert_eq!((s.leaves_retry, s.leaves_tries), (2 * SECOND, 16));
         assert_eq!((c.serve.rate, c.serve.token_life), (8192, 600 * SECOND));
-        assert_eq!((c.serve.waiting, c.serve.waiting_each, c.serve.chunks_each), (64, 8, 4096));
+        assert_eq!((c.serve.waiting, c.serve.waiting_each, c.serve.chunks_each), (256, 32, 4096));
         // What it hands the transport is what the transport would take.
         let _ = crate::transport::serve::Serve::with(c.serve.limits());
     }

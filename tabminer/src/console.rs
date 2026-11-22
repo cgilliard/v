@@ -2234,9 +2234,12 @@ mod tests {
         assert!(bumped.starts_with(&format!("payment sent {id} sped up: transaction ")), "{bumped}");
         assert!(bumped.contains("with a fee of 0.000035\n") && bumped.ends_with(BUMPED), "{bumped}");
         assert!(said(&payer, "mempool").contains("fee 0.000035  (50,000 a unit)"));
-        assert_eq!(wrong(&payer, "bump 00"), "no payment sent with an id that starts 00");
+        // (An id no payment has: not how this one's begins, whatever
+        // that is.)
+        let no = if id.starts_with("00") { "ff" } else { "00" };
+        assert_eq!(wrong(&payer, &format!("bump {no}")), format!("no payment sent with an id that starts {no}"));
         assert_eq!(wrong(&payer, "cancel zz"), "no payment begun or sent with an id that starts zz");
-        assert_eq!(wrong(&payer, "resend 00"), "no payment sent with an id that starts 00");
+        assert_eq!(wrong(&payer, &format!("resend {no}")), format!("no payment sent with an id that starts {no}"));
         assert_eq!(wrong(&payer, "bump"), "bump: not what it takes (see help)");
         // Taken back: the same outputs spent to the wallet itself.
         let sent = said(&payer, "sent");

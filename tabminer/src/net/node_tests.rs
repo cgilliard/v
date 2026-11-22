@@ -699,13 +699,18 @@ fn sockets_sync(workers: usize) {
     let mut cfg = small_runs();
     cfg.tick = 50 * MILLI;
     cfg.workers = workers;
+    // (Fewer blocks unoptimized, where checking one takes the better
+    // part of a second, more on a machine that runs every other test
+    // meanwhile: the time allowed is for a fault to show in, not for
+    // the checking of blocks.)
+    let blocks: u32 = if cfg!(debug_assertions) { 25 } else { 45 };
     let chains = vec![chain_of(easy()), chain_of(easy())];
-    grow(&chains[0], 45, 1);
+    grow(&chains[0], blocks as usize, 1);
     let tip = chains[0].tip().unwrap();
     let sockets: Vec<UdpSocket> = (0..2).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
     let SocketAddr::V4(first) = sockets[0].local_addr().unwrap() else { unreachable!() };
     let stop = Arc::new(AtomicBool::new(false));
-    let behind = Arc::clone(&chains[1]);
+    let (ahead, behind) = (Arc::clone(&chains[0]), Arc::clone(&chains[1]));
     let threads: Vec<_> = sockets
         .into_iter()
         .zip(chains)
@@ -737,9 +742,14 @@ fn sockets_sync(workers: usize) {
         }
         assert!(
             start.elapsed() < SOCKETS_WITHIN,
-            "at {} of {}: its headers were in after {headers:?}, its first block after {first:?}",
+            "at {} of {}: its headers were in after {headers:?}, its first block after {first:?}; \
+             the highest body it has is of block {:?}",
             behind.tip().unwrap().height,
-            tip.height
+            tip.height,
+            (1..=tip.height).rev().find(|h| {
+                let id = ahead.header_at(*h).unwrap().unwrap().hash();
+                behind.body(&id).is_ok_and(|b| b.is_some())
+            })
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -748,10 +758,14 @@ fn sockets_sync(workers: usize) {
     std::thread::sleep(Duration::from_millis(300));
     stop.store(true, Ordering::Relaxed);
     let counts: Vec<Counts> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-    // Five runs of headers and forty-five bodies, the blocks applied on
-    // a thread of their own.
-    assert_eq!((counts[1].fetched, counts[1].headers, counts[1].fetches_failed), (50, 45, 0));
-    assert_eq!((counts[1].blocks, counts[1].blocks_refused), (45, 0));
+    // The runs of headers, ten to a run, and a body for each block, the
+    // blocks applied on a thread of their own.
+    let runs = blocks.div_ceil(10);
+    assert_eq!(
+        (counts[1].fetched as u32, counts[1].headers as u32, counts[1].fetches_failed),
+        (runs + blocks, blocks, 0)
+    );
+    assert_eq!((counts[1].blocks as u32, counts[1].blocks_refused), (blocks, 0));
 }
 
 /// The request log's line: who, how long, what was asked and what was
