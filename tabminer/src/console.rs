@@ -11,12 +11,12 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::prover::ChainVerifier;
 use crate::chain::params::{COIN, DECIMALS};
+use crate::hash::digest_to_bytes;
 use crate::logger::fmt::commas;
 use crate::name::NameOp;
 use crate::net::node::Handle;
-use crate::hash::digest_to_bytes;
+use crate::prover::ChainVerifier;
 use crate::store::Backend;
 use crate::wallet::names::{NameStage, Registry};
 use crate::wallet::{Fee, Slate, State, Wallet, follow};
@@ -897,7 +897,9 @@ impl<B: Backend + 'static, W: Backend> Console<B, W> {
             None => Ok(Fee::PerUnit(floor)),
             Some(text) => match text.strip_suffix("/unit") {
                 Some(rate) => match rate.parse().map_err(|_| format!("'{text}' is not a fee"))? {
-                    rate if rate < floor => Err(format!("this node takes nothing that pays less than {floor} a unit of weight")),
+                    rate if rate < floor => {
+                        Err(format!("this node takes nothing that pays less than {floor} a unit of weight"))
+                    }
                     rate => Ok(Fee::PerUnit(rate)),
                 },
                 None => Ok(Fee::Total(parse_coins(text).ok_or_else(|| format!("'{text}' is not a fee"))?)),

@@ -1,0 +1,212 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Every push is tested: runs of the same branch go side by side, and none
+# cancels another.
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The code is formatted as rustfmt formats it (tabminer/rustfmt.toml).
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable) with rustfmt
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+          rustup default stable
+          cargo fmt --version
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      # Windows cannot hold a file named for one of its devices (aux, con,
+      # nul, prn, com1...), whatever its extension, nor some characters,
+      # nor a name ending in a dot or a space, nor two names that differ
+      # only by case: with one such file the repository cannot be checked
+      # out there at all. Linux holds them all, so it is checked here.
+      - name: Check that Windows can hold every file
+        working-directory: .
+        run: |
+          bad=$(git ls-files | grep -iE '(^|/)(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.[^/]*)?$' || true)
+          bad="$bad$(git ls-files | grep -E '[<>:"|?*\\]|[ .]$' || true)"
+          bad="$bad$(git ls-files | tr 'A-Z' 'a-z' | sort | uniq -d)"
+          if [ -n "$bad" ]; then echo "names Windows cannot hold:"; echo "$bad"; exit 1; fi
+
+  test:
+    name: test (${{ matrix.os }}, debug)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # One platform failing does not stop the others: each reports.
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04-arm is Linux on arm64; macos-latest is arm64 too.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      # The runners come with rustup; no third-party action is needed.
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      # The debug test suite: a debug build, so overflow checks and debug
+      # assertions are on (the release build has its own job below). The
+      # tests that prove blocks are too slow unoptimized and are left to
+      # that job. Built for the runner's CPU (tabminer/.cargo/config.toml):
+      # the field's multiplication by the processor's own instruction on
+      # the x86-64 runners, the portable one on the arm64 ones.
+      - name: Test
+        run: cargo test --locked
+
+  # The same tests in a release build: the optimized code a node runs,
+  # without debug assertions or overflow checks, and the tests that prove
+  # blocks. Built with the dev feature, which no other job builds.
+  test-release:
+    name: test (ubuntu-latest, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TABMINER_FUZZ_SCALE: 10
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked --release --features dev
+
+      # Every test marked #[ignore] is run somewhere: by the benchmarks,
+      # by a job of its own below, or when the setup is made.
+      - name: Check that no ignored test is forgotten
+        run: ./tools/ignored.sh
+
+  # The slow tests: those marked #[ignore] that are not benchmarks, a job
+  # each, in a release build. The one there is makes two blocks with the
+  # main network's setup as the program has it built in, and has a chain
+  # take them: a change to a circuit fails it until the setup is made
+  # again (setup.yml).
+  slow:
+    name: slow (${{ matrix.test }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          # slow-tests:begin
+          - prover::tests::main_network_block_timing
+          # slow-tests:end
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked --release --features dev --lib -- --ignored --exact --nocapture ${{ matrix.test }}
+
+      - name: Check that nothing kept was changed
+        working-directory: .
+        run: git diff --exit-code
+
+  # Code coverage of the tests, with the toolchain's own LLVM tools
+  # (tabminer/tools/coverage.sh, which runs the same locally). The table is
+  # shown on the run's summary page; the source annotated line by line is
+  # the coverage-html artifact.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable, with llvm-tools)
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Measure coverage
+        run: ./tools/coverage.sh
+
+      - name: Show the table on the run's page
+        run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the annotated source
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: tabminer/target/coverage/html
+          retention-days: 14
+
+  # The benchmarks: the timing tests marked #[ignore], built with --release
+  # (tabminer/tools/bench.sh, which runs the same locally). The figures are
+  # shown on the run's summary page and kept as the bench artifact. A
+  # shared runner's timings vary from run to run.
+  bench:
+    name: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Run the benchmarks
+        run: ./tools/bench.sh
+
+      - name: Show the figures on the run's page
+        run: cat target/bench/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the figures
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: tabminer/target/bench/bench.txt
+          retention-days: 90

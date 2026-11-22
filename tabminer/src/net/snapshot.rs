@@ -32,9 +32,9 @@
 
 use crate::error::Error;
 use crate::hash::Digest;
+use crate::hash::{digest_from_bytes, digest_to_bytes};
 use crate::name::Record as NameRecord;
 use crate::output::{MEMO_BYTES, memo_from_bytes, memo_to_bytes};
-use crate::hash::{digest_from_bytes, digest_to_bytes};
 use crate::registry::state_root as compress;
 use crate::store::backend::Backend;
 use crate::store::names::{self, PART_LEVEL as NAME_PART_LEVEL};

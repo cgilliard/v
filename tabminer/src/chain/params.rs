@@ -16,10 +16,10 @@
 //! [`block_work`].
 
 use crate::block::{Block, Body, Header};
-use crate::difficulty::Schedule;
-use crate::pow::PowParams;
 use crate::chain_proof::Statement;
+use crate::difficulty::Schedule;
 use crate::hash::{Digest, EMPTY};
+use crate::pow::PowParams;
 use crate::store::state::empty_state;
 use crate::u256::U256;
 
@@ -40,6 +40,27 @@ pub const MAINNET_EMISSION: &[(u32, u64)] = &[
     (BLOCKS_PER_YEAR * 7 / 2, 500 * COIN),
     (BLOCKS_PER_YEAR * 1000, 7 * COIN),
 ];
+
+/// The 32 bytes `hex` writes, as 64 digits: a hash as it is shown. The
+/// program is not built of anything else.
+const fn unhex(hex: &str) -> [u8; 32] {
+    const fn digit(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("a hash is written in the digits 0 to 9 and a to f"),
+        }
+    }
+    let hex = hex.as_bytes();
+    assert!(hex.len() == 64, "a hash is 64 digits");
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = digit(hex[2 * i]) << 4 | digit(hex[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
 
 /// Consensus parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,9 +114,9 @@ impl ChainParams {
     pub const MAINNET: ChainParams = ChainParams {
         pow: PowParams::MAINNET,
         genesis_timestamp: crate::genesis::TIMESTAMP,
-        genesis_nonce: crate::genesis::BITCOIN_HASH,
+        genesis_nonce: unhex(crate::genesis::BITCOIN_HASH_HEX),
         genesis_mix: None,
-        program: crate::genesis::PROGRAM,
+        program: crate::prover::MAINNET_PROGRAM,
         genesis_target: U256(crate::genesis::TARGET),
         max_target: U256([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 8]), // 2^248 - 1
         max_block_size: 2_000_000,
@@ -116,7 +137,7 @@ impl ChainParams {
         genesis_timestamp: 1_767_225_600, // 2026-01-01
         genesis_nonce: *b"tabminer dev network, direct....",
         genesis_mix: None,
-        program: crate::genesis::PROGRAM,
+        program: crate::prover::MAINNET_PROGRAM,
         genesis_target: U256([0, 0, 0, 1 << 36]), // 2^20 hashes, about a second on 12 cores
         max_target: ChainParams::MAINNET.max_target,
         max_block_size: 2_000_000,
@@ -332,6 +353,8 @@ mod tests {
         println!("the main network's genesis: {}", hex(&digest_to_bytes(&g.header.hash())));
         assert_eq!(g.header.timestamp, crate::genesis::TIMESTAMP);
         assert_eq!(hex(&g.header.nonce), crate::genesis::BITCOIN_HASH_HEX);
+        let digits = "00ff10abcdef0000000000000000000000000000000000000000000000000001";
+        assert_eq!(hex(&unhex(digits)), digits);
         assert!(crate::genesis::BITCOIN_TIME <= g.header.timestamp, "the Bitcoin block must come first");
         assert_eq!((g.header.height, g.header.state_root), (0, empty_state()));
         assert_eq!(g.header.statement, Statement::genesis().digest());

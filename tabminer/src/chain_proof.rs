@@ -459,7 +459,11 @@ mod tests {
         assert!(proof.holds && proof.verifies());
         let digest = |x: &[F]| -> Digest { [x[0].0.to_le_bytes(), x[1].0.to_le_bytes()].concat().try_into().unwrap() };
         let work = [digest(&work.1[0..]), digest(&work.1[2..]), digest(&work.1[4..])];
-        (proof, stated, crate::block_proof::Statement { work, ..crate::block_proof::Statement::of(&record, pays, &set) })
+        (
+            proof,
+            stated,
+            crate::block_proof::Statement { work, ..crate::block_proof::Statement::of(&record, pays, &set) },
+        )
     }
 
     #[test]

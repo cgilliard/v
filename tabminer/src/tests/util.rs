@@ -67,7 +67,6 @@ impl Drop for Quiet {
     }
 }
 
-
 /// Tests: a fuzzer's iterations and seed: `TABMINER_FUZZ_ITERS`, else
 /// `iters` times `TABMINER_FUZZ_SCALE` (1 by default; the nightly run,
 /// `fuzz.yml`, sets it), and `TABMINER_FUZZ_SEED`, else `seed`. Prints

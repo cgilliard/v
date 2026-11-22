@@ -36,8 +36,8 @@ use super::trie::{self, Child, Edits, FLAT_BYTES, Fault, Part, Tree};
 use crate::block::HEADER_SIZE;
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::name::key_of;
 use crate::hash::{digest_from_bytes, digest_to_bytes};
+use crate::name::key_of;
 use crate::u256::U256;
 
 /// Bytes of the chain's own in the root record.

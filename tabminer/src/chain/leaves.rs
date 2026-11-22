@@ -270,11 +270,8 @@ mod tests {
     /// applied.
     fn extend(chain: &TestChain, aux: [u8; 32]) -> Header {
         let parent = chain.tip().unwrap();
-        let out = crate::block::BlockOutput {
-            commitment: [parent.height as u8 + 1; 32],
-            memo: [0; 20],
-            amount: 1500 * COIN,
-        };
+        let out =
+            crate::block::BlockOutput { commitment: [parent.height as u8 + 1; 32], memo: [0; 20], amount: 1500 * COIN };
         let body = Body { outputs: vec![out], ..Body::default() };
         let bytes = body.to_bytes();
         let (state_root, statement) = chain.header_after(&BodyRef::from_bytes(&bytes).unwrap()).unwrap();

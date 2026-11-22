@@ -28,10 +28,10 @@ use super::{
 };
 use crate::codec::{Reader, Writer};
 use crate::hash::Digest;
+use crate::hash::digest_to_bytes;
 use crate::mempool::Policy;
 use crate::name::{self, NameOp, Record, commit_hash, name_hash};
 use crate::output::{Key, memo_slot, pubkey_hash, slot_parts};
-use crate::hash::digest_to_bytes;
 use crate::store::Backend;
 use crate::store::state::Snapshot;
 use crate::transaction::UnsignedTransaction;
@@ -621,14 +621,8 @@ impl<B: Backend> Wallet<B> {
             if t.commits.contains_key(&id) {
                 return;
             }
-            let entry = PendingCommit {
-                commit: *commit,
-                nonce,
-                name: None,
-                value: [0; 32],
-                created: now,
-                recovered: true,
-            };
+            let entry =
+                PendingCommit { commit: *commit, nonce, name: None, value: [0; 32], created: now, recovered: true };
             t.commits.insert(id, entry);
             commits += 1;
         })?;

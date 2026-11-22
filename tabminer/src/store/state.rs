@@ -59,8 +59,8 @@ use super::trie::Part;
 use super::window::{BlockRecord, Window};
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::name::{Key, Record as NameRecord};
 use crate::hash::{digest_from_bytes, digest_to_bytes};
+use crate::name::{Key, Record as NameRecord};
 use crate::registry::state_root as compress;
 
 /// Digests of an output's path to the state's root: the siblings in the
@@ -704,10 +704,7 @@ impl<'a, B: Backend + 'static> Session<'a, B> {
         let made = block.outputs.len().checked_sub(block.commits.len()).expect("the commits are among the outputs");
         for (i, hash) in block.commits.iter().enumerate() {
             let output = &block.outputs[made + i];
-            assert!(
-                output.commitment == *hash && output.height == block.height,
-                "a commit's output is its leaf"
-            );
+            assert!(output.commitment == *hash && output.height == block.height, "a commit's output is its leaf");
             meta.commits.add(&*txn, first_new + (made + i) as u64, Commit { hash: *hash, height: block.height })?;
         }
         let record = BlockRecord {
@@ -1574,7 +1571,11 @@ mod tests {
                     for (position, record) in past.part(*index).unwrap().into_iter().step_by(37) {
                         let (shown, path) = past.prove(position).unwrap().expect("it was unspent then");
                         assert_eq!(shown, record);
-                        assert_eq!(root_of_state_path(position, &record.leaf(), &path), root, "{position} as of {height}");
+                        assert_eq!(
+                            root_of_state_path(position, &record.leaf(), &path),
+                            root,
+                            "{position} as of {height}"
+                        );
                     }
                 }
                 assert_eq!(past.prove(past.next()).unwrap(), None);
@@ -1906,10 +1907,7 @@ mod tests {
             assert_eq!(all.len() as u64, snap.commits().count);
             for (position, commit) in &all {
                 assert_eq!(snap.commits().position_of(snap.pages(), &commit.hash).unwrap(), Some(*position));
-                assert_eq!(
-                    snap.output(*position).unwrap().unwrap().0.commitment,
-                    commit.hash
-                );
+                assert_eq!(snap.output(*position).unwrap().unwrap().0.commitment, commit.hash);
             }
             all.into_iter().map(|(p, c)| (p, c.height)).collect::<Vec<_>>()
         };

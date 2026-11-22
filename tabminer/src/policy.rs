@@ -85,8 +85,8 @@
 use core::fmt;
 
 use crate::codec::{DIGEST_BYTES, read_digest, read_u32, read_u64};
-use crate::error::Error;
 use crate::conditions;
+use crate::error::Error;
 use crate::hash::{DOM_COND, DOM_COVERED, DOM_OUT_ITEM, DOM_POLICY_LEAF, DOM_SIGNERS};
 use crate::hash::{Digest, EMPTY, digest_from_bytes, digest_to_bytes, hash_domain};
 use crate::output::{Commitment, MEMO_LEN, Memo, Output, OutputList, key_commitment, pubkey_hash};

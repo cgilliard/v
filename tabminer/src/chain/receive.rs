@@ -468,9 +468,15 @@ mod tests {
         // kept.
         let mut other = blocks[5][..crate::block::HEADER_SIZE].to_vec();
         other.extend_from_slice(&blocks[4][crate::block::HEADER_SIZE..]);
-        assert_eq!(node.check_state_block(&BlockRef::from_bytes(&other).unwrap(), 6, &roots), Err(Error::BadBodyCommitment));
+        assert_eq!(
+            node.check_state_block(&BlockRef::from_bytes(&other).unwrap(), 6, &roots),
+            Err(Error::BadBodyCommitment)
+        );
         let stranger = grow(&ahead, 1, 9);
-        assert_eq!(node.check_state_block(&BlockRef::from_bytes(&stranger[0]).unwrap(), 7, &roots), Err(Error::UnknownParent));
+        assert_eq!(
+            node.check_state_block(&BlockRef::from_bytes(&stranger[0]).unwrap(), 7, &roots),
+            Err(Error::UnknownParent)
+        );
     }
 
     /// A node that stops while it is taking a state is, when it starts

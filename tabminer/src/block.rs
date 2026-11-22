@@ -86,6 +86,7 @@
 use core::fmt;
 
 use crate::codec::{POSITION_BYTES, read_digest, read_position, read_u32, read_u64, write_position};
+use crate::difficulty::Target;
 use crate::error::Error;
 use crate::hash::{DOM_BLOCK_BODY, DOM_HEADER_REST, Digest, EMPTY, digest_to_bytes, hash_domain};
 use crate::ledger::{inputs_next, ops_next, outputs_next};
@@ -93,7 +94,6 @@ use crate::name::{BlockNameOp, OpKind, count_ops};
 use crate::output::OUTPUT_CAPACITY;
 pub use crate::output::{BLOCK_OUTPUT_SIZE, BlockOutput};
 use crate::pow::{self, ItemSource, Nonce, PowOutput};
-use crate::difficulty::Target;
 
 pub const HEADER_SIZE: usize = 32 + 4 + 8 + 32 + 32 + 32 + 32 + 32 + 32;
 pub const COMMITMENT_SIZE: usize = 32;

@@ -53,8 +53,8 @@ use super::trie::Part;
 use super::window::Window;
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::name::{KEY_BITS, Key, Record as NameRecord};
 use crate::hash::{digest_from_bytes, digest_to_bytes};
+use crate::name::{KEY_BITS, Key, Record as NameRecord};
 use crate::registry::state_root as compress;
 
 /// The root record while receiving: what it begins with, the block's
@@ -793,7 +793,8 @@ mod tests {
             });
             made.push((height, next + outputs.len() as u64 - 1));
             let commits = vec![commit];
-            let mut block = Block { id, spends, outputs, names, commits, commits_spent, root: crate::hash::EMPTY, next: 0 };
+            let mut block =
+                Block { id, spends, outputs, names, commits, commits_spent, root: crate::hash::EMPTY, next: 0 };
             block.root = state.apply(&BlockEdit { state_root: None, ..block.edit(height) }).unwrap();
             live.extend(next..next + block.outputs.len() as u64 - 1);
             next += block.outputs.len() as u64;

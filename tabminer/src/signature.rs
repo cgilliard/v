@@ -178,15 +178,7 @@ pub fn check_into(cx: &Shared, chains: &mut Chains, pk: &PublicKey, msg: &Digest
     assert!(said_index.is(&index));
 
     // The entry: of the root reached.
-    let said = [
-        root[0].clone(),
-        root[1].clone(),
-        seed,
-        height_said,
-        message[0].clone(),
-        message[1].clone(),
-        index,
-    ];
+    let said = [root[0].clone(), root[1].clone(), seed, height_said, message[0].clone(), message[1].clone(), index];
     let values: Vec<F> = said.iter().map(Sym::value).collect();
     let (found, out) = hashed(DOM_SIGNED, &values);
     for (x, expect) in found.iter().zip(&said) {

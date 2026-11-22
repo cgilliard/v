@@ -20,8 +20,8 @@ use std::net::SocketAddrV4;
 use std::sync::Arc;
 
 use crate::hash::Digest;
-use crate::msg::{self, Announced};
 use crate::hash::digest_to_bytes;
+use crate::msg::{self, Announced};
 use crate::transport::{Micros, SECOND};
 use crate::{mldsa, mlkem};
 

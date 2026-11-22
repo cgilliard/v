@@ -562,7 +562,8 @@ mod tests {
         // Told to give up before it begins, it does.
         assert!(matches!(mine(&chain, setup, dataset, &reward, NOW, 0, &|_| {}, &|| true).unwrap(), Mined::Cancelled));
         let said = std::sync::atomic::AtomicU64::new(0);
-        let made = mine(&chain, setup, dataset, &reward, NOW, 3, &|_| _ = said.fetch_add(1, Ordering::Relaxed), &|| false);
+        let made =
+            mine(&chain, setup, dataset, &reward, NOW, 3, &|_| _ = said.fetch_add(1, Ordering::Relaxed), &|| false);
         let Mined::Block { block, header, .. } = made.unwrap() else { panic!("no block") };
         assert_eq!(said.load(Ordering::Relaxed), 1);
         assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
@@ -697,8 +698,8 @@ mod tests {
         let (count, each, fee) = (600u64, 1_000_000u64, 100_000_000u64);
         let mut outputs: Vec<Output> = (1..count).map(|i| Output::to_key_hash(&[i as u8; 32], each)).collect();
         outputs.push(Output::new(&pk, held - (count - 1) * each - fee));
-        let unsigned = UnsignedTransaction::with_ops(vec![], outputs, ops)
-            .with_policy_inputs(vec![policy.spend(0, held, 5)]);
+        let unsigned =
+            UnsignedTransaction::with_ops(vec![], outputs, ops).with_policy_inputs(vec![policy.spend(0, held, 5)]);
         let body = unsigned.body_hash();
         let mut tx = unsigned.sign(|_, _, _| Err::<crate::output::Sig, ()>(())).unwrap();
         tx.policy_inputs[0].witness[0] = CondWitness::Signatures(vec![

@@ -56,9 +56,9 @@
 //! [`MAX_REVEAL`]: crate::name::MAX_REVEAL
 
 use crate::block::{BlockRef, BodyRef, HEADER_SIZE, Header};
+use crate::chain_proof::Statement;
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::chain_proof::Statement;
 use crate::ledger::Emission;
 use crate::name::{BlockNameOp, Key, Record as NameRecord, expired, in_window};
 use crate::store::backend::Backend;

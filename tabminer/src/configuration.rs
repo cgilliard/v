@@ -189,16 +189,8 @@ is given (default 5)",
                 takes: Takes::Value("N"),
                 help: "what a commitment to a name weighs (default 3)",
             },
-            Opt {
-                name: "weight-reveal",
-                takes: Takes::Value("N"),
-                help: "what a name's reveal weighs (default 4)",
-            },
-            Opt {
-                name: "weight-update",
-                takes: Takes::Value("N"),
-                help: "what a name's update weighs (default 1)",
-            },
+            Opt { name: "weight-reveal", takes: Takes::Value("N"), help: "what a name's reveal weighs (default 4)" },
+            Opt { name: "weight-update", takes: Takes::Value("N"), help: "what a name's update weighs (default 1)" },
             Opt {
                 name: "max-tx-size",
                 takes: Takes::Value("SIZE"),
@@ -1195,7 +1187,8 @@ mod tests {
         assert_eq!(some, crate::mempool::Policy::set(crate::mempool::MIN_FEE_PER_UNIT, 12, 14, 0));
         assert!(read(&["--fee-half-life", "0"]).is_err() && read(&["--mempool-expiry", "0"]).is_err());
         // What a transaction's parts weigh, and the largest one taken.
-        let weighed = read(&["--weight-output", "5", "--weight-reveal", "9", "--max-tx-size", "300k"]).unwrap().net.policy;
+        let weighed =
+            read(&["--weight-output", "5", "--weight-reveal", "9", "--max-tx-size", "300k"]).unwrap().net.policy;
         let weights = crate::mempool::Weights { output: 5, reveal: 9, ..crate::mempool::Weights::DEFAULT };
         assert_eq!((weighed.weights, weighed.max_tx_size), (weights, 300 << 10));
         assert!(read(&["--weight-input", "0"]).is_err());

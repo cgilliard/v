@@ -34,15 +34,13 @@ use std::io;
 use super::backend::Backend;
 use super::pagefile::{PageFile, ReadPages, Txn};
 use super::sparse::{EMPTY, empty, level_up, root, root_with_path};
-use super::trie::{self, CHILD_BYTES, Child, Edits, Fault, LEAF_RECORDS, Part, Step, Tree};
 #[cfg(test)]
 use super::trie::Slot;
+use super::trie::{self, CHILD_BYTES, Child, Edits, Fault, LEAF_RECORDS, Part, Step, Tree};
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::output::{
-    Commitment, MEMO_BYTES, Memo, memo_from_bytes, memo_to_bytes, output_leaf,
-};
 use crate::hash::{digest_from_bytes, digest_to_bytes};
+use crate::output::{Commitment, MEMO_BYTES, Memo, memo_from_bytes, memo_to_bytes, output_leaf};
 
 /// Height of the outputs' tree: positions are below `2^HEIGHT`.
 pub const HEIGHT: u32 = 41;

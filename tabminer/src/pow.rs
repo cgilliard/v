@@ -1011,7 +1011,10 @@ mod tests {
         let good = std::fs::read(&path).unwrap();
         assert_eq!(good.len(), size);
         assert_eq!(&good[..8], FILE_MAGIC);
-        assert_eq!(good[FILE_HEADER + 32..size - CHECKSUM_BYTES], whole.items[..512].iter().flat_map(item_to_bytes).collect::<Vec<u8>>());
+        assert_eq!(
+            good[FILE_HEADER + 32..size - CHECKSUM_BYTES],
+            whole.items[..512].iter().flat_map(item_to_bytes).collect::<Vec<u8>>()
+        );
         assert_eq!(good[size - CHECKSUM_BYTES..], fnv1a64(&good[..size - CHECKSUM_BYTES]).to_le_bytes());
         let loaded = LazyDataset::open(&seed, 9, &path).unwrap();
         assert!(loaded.is_complete());

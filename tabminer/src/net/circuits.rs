@@ -18,9 +18,9 @@
 
 use std::net::SocketAddrV4;
 
-use crate::onion::{self as circuit, Hop, Opening};
 use crate::hash::Digest;
 use crate::mldsa;
+use crate::onion::{self as circuit, Hop, Opening};
 use crate::transport::{Micros, SECOND};
 
 /// What is sent along a way, from one node of it to the next.

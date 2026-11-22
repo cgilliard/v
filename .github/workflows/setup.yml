@@ -1,0 +1,47 @@
+name: setup
+
+# Makes the main network's setup: a block of each shape proven once, for
+# the list of shapes and the program of the chain's step
+# (resources/setup-mainnet.bin, which the program has built in). Run by
+# hand, when a circuit, the shapes, the emission or the proofs'
+# parameters change: the file it makes is this run's artifact, to be
+# committed; until it is, the slow job of test.yml fails. Half an hour
+# and more of proving.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  setup:
+    name: make the main network's setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        working-directory: tabminer
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          free -m
+          nproc
+
+      - name: Make the setup
+        run: cargo test --locked --release --lib -- --ignored --exact --nocapture prover::tests::write_the_main_network_s_setup
+
+      - name: Upload the setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-mainnet
+          path: resources/setup-mainnet.bin
+          retention-days: 90

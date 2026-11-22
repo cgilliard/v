@@ -35,8 +35,8 @@ use super::sparse::EMPTY;
 use super::trie::{self, Child, Edits, FLAT_BYTES, Fault, Part, Tree};
 use crate::error::Error;
 use crate::hash::Digest;
-use crate::name::key_of;
 use crate::hash::{digest_from_bytes, digest_to_bytes};
+use crate::name::key_of;
 
 fn corrupt(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
@@ -281,12 +281,7 @@ mod tests {
         assert_eq!(Commits::from_bytes(&commits.to_bytes()).unwrap(), commits);
         // One a block, far apart, as outputs come between them.
         let all: Vec<(u64, Commit)> = (1..=400u32)
-            .map(|h| {
-                (
-                    h as u64 * 50_000 + rng.next_u64() % 1000,
-                    Commit { hash: rng.digest(), height: h },
-                )
-            })
+            .map(|h| (h as u64 * 50_000 + rng.next_u64() % 1000, Commit { hash: rng.digest(), height: h }))
             .collect();
         for part in all.chunks(40) {
             let txn = file.begin().unwrap();

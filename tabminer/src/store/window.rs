@@ -41,8 +41,8 @@ use super::commits::Commit;
 use super::pagefile::{Extent, MAX_UNITS, PageFile, ReadPages, Txn, UNIT};
 use super::trie::Part;
 use crate::hash::Digest;
-use crate::name::{KEY_BITS, Key, Record as NameRecord};
 use crate::hash::{digest_from_bytes, digest_to_bytes};
+use crate::name::{KEY_BITS, Key, Record as NameRecord};
 
 /// Bytes of a name's key.
 const KEY_BYTES: usize = KEY_BITS / 8;

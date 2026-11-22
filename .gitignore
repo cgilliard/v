@@ -1,2 +1,3 @@
 tabminer/target/*
 tmp/*
+**/*.swp

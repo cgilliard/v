@@ -164,8 +164,7 @@ mod tests {
         // The chain goes on: blocks that make outputs, and one that
         // spends some of what it began with.
         grow(&chain, 2, 1);
-        let reward =
-            crate::block::BlockOutput { commitment: [9; 32], memo: [0; 20], amount: easy().subsidy(3) };
+        let reward = crate::block::BlockOutput { commitment: [9; 32], memo: [0; 20], amount: easy().subsidy(3) };
         extend_spending(&chain, &[0, 5, 50_000], &[reward]);
         let state = chain.state();
         let snap = state.snapshot().unwrap();

@@ -1,0 +1,3 @@
+resources/bip39-english.txt text eol=lf
+tabminer/tests/vectors/*.kat text eol=lf
+resources/setup-mainnet.bin binary

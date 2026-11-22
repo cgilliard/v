@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# Code coverage of the test suite, measured with the Rust toolchain's own
+# LLVM tools (no cargo plugin): builds the tests instrumented, runs them,
+# and writes under target/coverage:
+#
+#   report.txt   llvm-cov's table, per file (also printed)
+#   summary.txt  the same as a Markdown table with its columns lined up, to paste
+#   summary.md   that table and a copy of it in a code block, for the CI run's page
+#   html/        the source annotated line by line; open html/index.html
+#
+# Needs the llvm-tools component: rustup component add llvm-tools
+#
+# The figures include the tests' own code (the `mod tests` of each file),
+# which always runs; src/tests/util.rs, only ever test code, is left out.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+out=target/coverage
+host=$(rustc -vV | sed -n 's/^host: //p')
+bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+if [ ! -x "$bin/llvm-cov" ] || [ ! -x "$bin/llvm-profdata" ]; then
+    echo "llvm-cov not found in the toolchain: run 'rustup component add llvm-tools'" >&2
+    exit 1
+fi
+
+rm -rf "$out/prof" "$out/html"
+mkdir -p "$out/prof"
+
+# The code has two paths where it matters for speed: the processor's own
+# instructions (the field's multiplication, the hash) and a portable one.
+# A build has one or the other, so on x86-64 there are two builds, for
+# this CPU and for the plainest x86-64, and a line counts as covered if
+# a run of either reached it. Each build has its own target directory:
+# instrumented objects do not mix with ordinary ones, nor the two with
+# each other.
+case "$host" in
+    x86_64-*) variants="native x86-64" ;;
+    *) variants="native" ;;
+esac
+export LLVM_PROFILE_FILE="$PWD/$out/prof/%p-%m.profraw"
+
+# The tests are hash after hash, and an unoptimized, instrumented build of
+# them is many times slower than a debug build: too slow for CI's runners.
+# So this build is optimized, with debug assertions and overflow checks
+# still on (the test profile's), and the decoder fuzzers run a fraction
+# of their iterations: they reach their lines in the first few hundred,
+# and the test jobs run them in full. Being optimized, it also runs the
+# tests a debug build leaves to the release job (those ignored for being
+# slow unoptimized): every ignored test but the benchmarks, the slow
+# jobs' and the setup's, which tools/ignored.sh knows by the same lists.
+export CARGO_PROFILE_TEST_OPT_LEVEL=2
+export CARGO_PROFILE_DEV_OPT_LEVEL=2
+export TABMINER_FUZZ_ITERS="${TABMINER_FUZZ_ITERS:-500}"
+#
+# An instrumented build counts in memory every thread shares, and threads
+# that run the same hot code (every test hashes) spend their time taking
+# the counters from each other: measured, twelve threads on one test used
+# twelve times the processor time of one. So no two threads of a process
+# run tests here. The tests are dealt out among as many processes as
+# there are cores, each running its share one at a time with the crate's
+# own worker threads held to one: a process has its own counters.
+#
+# The tests that prove whole blocks (the prover's and the miner's) share
+# one setup, minutes of proving, where they are one process: they are
+# one, apart from the rest, with the crate's threads its own.
+#
+# The second build differs from the first only in the files that have two
+# paths (field.rs and blake3.rs), so it runs only the tests that reach
+# those: the whole suite twice is twice the time for the same lines.
+cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+# The tests that are ignored in every build.
+never=$( { sed -n '/^BENCHES=(/,/^)/p' tools/bench.sh | sed -n 's/^ \+\([a-z0-9_:]\+\)$/\1/p'
+           sed -n 's/^AFTER=\([a-z0-9_:]\+\)$/\1/p' tools/bench.sh
+           sed -n '/# slow-tests:begin/,/# slow-tests:end/p' ../.github/workflows/test.yml \
+               | sed -n 's/^ \+- \([a-z0-9_:]\+\)$/\1/p'
+           sed -n 's/.*--exact --nocapture \([a-z0-9_:]\+\)$/\1/p' ../.github/workflows/setup.yml; } )
+heavy='^(prover|miner)::tests::'
+objects=""
+for cpu in $variants; do
+    export RUSTFLAGS="-C instrument-coverage -C target-cpu=$cpu"
+    # What cargo built that can be run, as it names them: the test
+    # binaries, and the node itself, which the tests of the program run
+    # (its lines are counted too, but it is no test binary, and is not
+    # asked for a list of tests: it would take that for an option it
+    # does not know, and fail).
+    built=$(cargo test --locked --target-dir "$out/$cpu" --no-run --message-format=json \
+        | grep '"executable":"[^"]')
+    for binary in $(echo "$built" | grep -v '"profile":{[^}]*"test":true' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4); do
+        objects="$objects --object=$binary"
+    done
+    binaries=$(echo "$built" | grep '"profile":{[^}]*"test":true' | grep -o '"executable":"[^"]*"' | cut -d'"' -f4)
+    for binary in $binaries; do
+        objects="$objects --object=$binary"
+        # Every test, the ignored among them, but those never run here.
+        "$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p' | grep -vxF "$never" > "$out/all.txt"
+        if [ "$cpu" = native ]; then
+            grep -vE "$heavy" "$out/all.txt" > "$out/tests.txt" || true
+            grep -E "$heavy" "$out/all.txt" > "$out/heavy.txt" || true
+        else
+            grep -E '^(field|blake3|merkle|hash)::' "$out/all.txt" > "$out/tests.txt" || true
+            : > "$out/heavy.txt"
+        fi
+        total=$(wc -l < "$out/tests.txt")
+        [ "$total" -gt 0 ] || continue
+        echo "$binary: $total tests in $cores processes"
+        pids=""
+        if [ -s "$out/heavy.txt" ]; then
+            echo "$binary: $(wc -l < "$out/heavy.txt") tests that prove blocks, in one process"
+            # shellcheck disable=SC2046
+            "$binary" --include-ignored --test-threads=1 --exact $(cat "$out/heavy.txt") > "$out/shard.heavy.log" 2>&1 &
+            pids="$pids $!"
+        fi
+        for k in $(seq 0 $((cores - 1))); do
+            # Every cores-th test from the k-th: neighbours, which are of
+            # one module and cost alike, go to different processes.
+            awk -v n="$cores" -v k="$k" 'NR % n == k' "$out/tests.txt" > "$out/shard.$k.txt"
+            [ -s "$out/shard.$k.txt" ] || continue
+            # shellcheck disable=SC2046
+            TABMINER_THREADS=1 "$binary" --include-ignored --test-threads=1 --exact $(cat "$out/shard.$k.txt") \
+                > "$out/shard.$k.log" 2>&1 &
+            pids="$pids $!"
+        done
+        failed=0
+        for pid in $pids; do
+            wait "$pid" || failed=1
+        done
+        grep -h '^test result' "$out"/shard.*.log
+        if [ "$failed" -ne 0 ]; then
+            cat "$out"/shard.*.log
+            echo "a test failed" >&2
+            exit 1
+        fi
+        rm -f "$out"/shard.*
+        # The code that splits work among threads, with threads to split
+        # it among.
+        if [ "$cpu" = native ] && grep -q '^parallel::' "$out/tests.txt"; then
+            "$binary" parallel:: store::backend:: | grep '^test result'
+        fi
+    done
+done
+unset RUSTFLAGS
+
+"$bin/llvm-profdata" merge -sparse "$out"/prof/*.profraw -o "$out/coverage.profdata"
+
+# Only this crate's code: not the dependencies', nor the standard library's.
+ignore='(/\.cargo/|/rustc/|/src/tests/util\.rs$)'
+# shellcheck disable=SC2086
+"$bin/llvm-cov" report --instr-profile="$out/coverage.profdata" $objects \
+    --ignore-filename-regex="$ignore" > "$out/report.txt"
+# shellcheck disable=SC2086
+"$bin/llvm-cov" show --format=html --output-dir="$out/html" \
+    --instr-profile="$out/coverage.profdata" $objects --ignore-filename-regex="$ignore" > /dev/null
+
+# The table as Markdown. A row of the report is the file name, then for
+# regions, functions, lines and branches: the count, the missed, the percent.
+#
+# summary.txt is the table for pasting elsewhere: Markdown with its columns
+# lined up, so it reads as plain text and renders as a table where Markdown
+# does. summary.md shows the table, then summary.txt in a code block, which
+# GitHub gives a copy button.
+commit=$(git rev-parse --short HEAD 2>/dev/null || echo "no commit")
+awk -v commit="$commit" '
+    /^-+$/ || /^Filename/ || NF < 10 { next }
+    {
+        n++
+        cell[n, 1] = ($1 == "TOTAL") ? "Total" : $1
+        cell[n, 2] = $8; cell[n, 3] = $9; cell[n, 4] = $10; cell[n, 5] = $7; cell[n, 6] = $4
+        if ($1 == "TOTAL") lines = $10
+    }
+    END {
+        split("File,Lines,Missed,Line coverage,Function coverage,Region coverage", head, ",")
+        for (c = 1; c <= 6; c++) {
+            width[c] = length(head[c])
+            for (r = 1; r <= n; r++) if (length(cell[r, c]) > width[c]) width[c] = length(cell[r, c])
+        }
+        print "Code coverage: " lines " of lines (" commit ")\n"
+        line = "|"; rule = "|"
+        for (c = 1; c <= 6; c++) {
+            line = line sprintf(c == 1 ? " %-*s |" : " %*s |", width[c], head[c])
+            dashes = sprintf("%*s", width[c] + 1, ""); gsub(/ /, "-", dashes)
+            rule = rule (c == 1 ? dashes "-|" : dashes ":|")
+        }
+        print line; print rule
+        for (r = 1; r <= n; r++) {
+            line = "|"
+            for (c = 1; c <= 6; c++) line = line sprintf(c == 1 ? " %-*s |" : " %*s |", width[c], cell[r, c])
+            print line
+        }
+    }
+' "$out/report.txt" > "$out/summary.txt"
+
+{
+    sed -n '1s/^/## /p' "$out/summary.txt"
+    sed '1d' "$out/summary.txt"
+    printf '\nIncludes each file'"'"'s own tests. The annotated source is in the `coverage-html` artifact.\n'
+    printf '\n### To paste elsewhere\n\n```text\n'
+    cat "$out/summary.txt"
+    printf '```\n'
+} > "$out/summary.md"
+
+cat "$out/report.txt"
+echo
+cat "$out/summary.txt"
+echo
+echo "to paste: $out/summary.txt   annotated source: $out/html/index.html"

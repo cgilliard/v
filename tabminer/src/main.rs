@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use tabminer::prover::{ChainVerifier, Level, Setup};
 use tabminer::chain::Chain;
 use tabminer::chain::params::ChainParams;
 use tabminer::configuration::{Configuration, Network, hex};
@@ -26,6 +25,7 @@ use tabminer::miner::{self, HoldOff, Mined, Now};
 use tabminer::net::node::{Behind, Event, Handle, Node};
 use tabminer::net::socket::{self, Watch};
 use tabminer::pow::{Dataset, ItemSource, LazyDataset, SeedText};
+use tabminer::prover::{ChainVerifier, Level, Setup};
 use tabminer::store::backend::FileBackend;
 use tabminer::wallet::follow::follow_when;
 use tabminer::wallet::{Ask, Wallet, WalletError};
@@ -695,7 +695,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // something this build makes: every block carries a proof.)
     #[cfg(feature = "dev")]
     if c.debug_blocks.is_some() {
-        return Err("debug: this build makes no chain beforehand: its blocks are made one at a time, each proven".into());
+        return Err(
+            "debug: this build makes no chain beforehand: its blocks are made one at a time, each proven".into()
+        );
     }
     // A chain made under other rules than this build's is not gone on
     // with: nothing made here could build on it, and nothing of it

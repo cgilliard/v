@@ -130,10 +130,10 @@ use crate::hash::{
     DOM_STATE_LEAF, DOM_STATE_NODE, DOM_UPDATE, Digest,
 };
 use crate::ledger::{Input, Memo, OUTPUTS_HEIGHT, Output, Record, Transaction};
-use crate::registry::{self, MAX_COMMITS, MAX_REVEAL, MAX_REVEALS, MAX_SWEEPS, MAX_UPDATES};
 use crate::ntt::Domain;
 use crate::pcs::Params;
 use crate::reading::Reader;
+use crate::registry::{self, MAX_COMMITS, MAX_REVEAL, MAX_REVEALS, MAX_SWEEPS, MAX_UPDATES};
 use crate::signed;
 use crate::xmss::PublicKey;
 
@@ -895,10 +895,7 @@ pub fn circuit() -> Circuit {
                 &r.v,
                 &[
                     (&[LEAF, PSLEAF, RLEAF, SLEAF, TSTART, SETL, WEND1], nothing(8)),
-                    (
-                        &[NEW, NNEW, OLEAF, CLEAF, NLEAFR, NLEAFN, PSIG, PSKIP, MRG, WNODEL, WNODER],
-                        to(&out[..]),
-                    ),
+                    (&[NEW, NNEW, OLEAF, CLEAF, NLEAFR, NLEAFN, PSIG, PSKIP, MRG, WNODEL, WNODER], to(&out[..])),
                     (&[RSTART], to(&m[..8])),
                 ],
             );
@@ -1037,8 +1034,23 @@ pub fn circuit() -> Circuit {
             };
             for (at, is_first) in [(first, true), (last_row, false)] {
                 let chained: [&[Expr]; 17] = [
-                    &r.root, &r.isp, &r.osp, &r.id, &r.body, &r.counts, &r.next, &r.sum_in, &r.sum_out, &r.names,
-                    &r.caps, &r.sgn, &r.app, &r.phase, &r.cover, &r.covered, one(&r.take),
+                    &r.root,
+                    &r.isp,
+                    &r.osp,
+                    &r.id,
+                    &r.body,
+                    &r.counts,
+                    &r.next,
+                    &r.sum_in,
+                    &r.sum_out,
+                    &r.names,
+                    &r.caps,
+                    &r.sgn,
+                    &r.app,
+                    &r.phase,
+                    &r.cover,
+                    &r.covered,
+                    one(&r.take),
                 ];
                 for words in chained {
                     bind(s, words, at);
@@ -2808,7 +2820,8 @@ mod tests {
         // make them; the first run ends after `cut` of them.
         let made = |cut: usize, second: &Output| {
             let said = vec![fixed[0], fixed[1], free];
-            let tx = Transaction { inputs: vec![], outputs: said, ops: vec![], policy: vec![input.clone()], covered: 2 };
+            let tx =
+                Transaction { inputs: vec![], outputs: said, ops: vec![], policy: vec![input.clone()], covered: 2 };
             let makes = [fixed[0], *second, free];
             let mut outputs = tree.clone();
             let start = Record::start(&outputs, EMPTY, EMPTY, 100);
