@@ -61,7 +61,7 @@ use std::collections::VecDeque;
 
 use super::path::Path;
 use super::wire::{Chunk, Ranges};
-use super::{CHUNK_BYTES, LOSS_TOLERANCE, MAX_RETRIES, MAX_RETRY, MAX_WINDOW, Micros, REFILL, SECOND, chunk_count};
+use super::{CHUNK_BYTES, LOSS_TOLERANCE, MAX_RETRIES, MAX_RETRY, Micros, REFILL, SECOND, chunk_count};
 use crate::error::Error;
 
 /// What to do now.
@@ -206,11 +206,13 @@ impl Fetch {
             passed: Vec::new(),
             got: 0,
             slot: Vec::new(),
-            flight: VecDeque::with_capacity(MAX_WINDOW as usize),
+            // (Room as it is needed: a fetch begun at a stranger's word
+            // holds nothing before anything of it arrives.)
+            flight: VecDeque::new(),
             base: 0,
             flying: 0,
             highest: 0,
-            lost: VecDeque::with_capacity(MAX_WINDOW as usize),
+            lost: VecDeque::new(),
             fresh: 0,
             probe: 0,
             path,

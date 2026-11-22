@@ -347,6 +347,15 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
 /// Tokens of those that are no peers kept at the most
 /// ([`Worker::fetch_granted`]).
 const GRANTS: usize = 256;
+/// How many fetches begun at the word of whoever sent a datagram, with
+/// nothing to show it came from where it says (the opening of a way,
+/// a message offered to this node's wallet), go on at once: one more,
+/// and the oldest is given up. One that is what it says is done in the
+/// time a datagram takes there and back; those of a sender that is not
+/// there never are.
+const UNASKED: usize = 256;
+/// How many messages offered to be passed on are kept count of.
+const OFFERED: usize = 1024;
 /// The relays of a consensus file: each one's id, and where it is.
 type Relays = Vec<(Digest, Option<SocketAddrV4>)>;
 
@@ -379,7 +388,7 @@ const GIVERS: usize = 65_536;
 const SUSPECT_FOR: Micros = 60 * crate::transport::SECOND;
 /// How long a wallet has to say that a message sent down its way came,
 /// before whoever gave the message is told it did not.
-const DELIVERED_WITHIN: Micros = 3 * crate::transport::SECOND;
+const DELIVERED_WITHIN: Micros = 2 * crate::transport::SECOND;
 /// How long a way to one of a wallet's nodes may take to open before
 /// another of its nodes is tried meanwhile: less than the time a way
 /// that is not answered is given up after
@@ -1050,6 +1059,8 @@ pub struct Worker<B: Backend + 'static, V> {
     /// Tokens given to this node by those that are not its peers, to
     /// ask them for what they offered: the newest last.
     grants: VecDeque<(SocketAddrV4, u64)>,
+    /// The last fetches begun at a stranger's word ([`UNASKED`]).
+    unasked: VecDeque<(Object, SocketAddrV4)>,
     /// The time by the clock, as last told.
     now: Micros,
     /// What is to be said to whom when there is next a way to say it:
@@ -1155,6 +1166,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             fetches: Vec::new(),
             was_live: Vec::new(),
             grants: VecDeque::new(),
+            unasked: VecDeque::new(),
             now,
             to_say: Vec::new(),
             offered: Vec::new(),
@@ -1349,6 +1361,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let n = message.encode(self.network, &mut buf);
         self.counts.sent += 1;
         out(to, &buf[..n]);
+    }
+
+    /// [`Node::fetch_granted`], at the word of a sender that has shown
+    /// nothing of where it is: one of [`UNASKED`] at the most.
+    fn fetch_unasked(&mut self, now: Micros, object: Object, from: SocketAddrV4, most: u32, grant: u64) {
+        if self.unasked.len() >= UNASKED
+            && let Some((old, whom)) = self.unasked.pop_front()
+        {
+            self.fetches.retain(|f| !(f.object == old && f.from == whom));
+            if let Object::Step(name) = old {
+                self.carried.retain(|c| (c.0, c.1) != (name, whom));
+            }
+        }
+        self.unasked.push_back((object, from));
+        self.fetch_granted(now, object, from, most, grant);
     }
 
     /// Asks `from`, which is no peer but gave this node the token
@@ -2421,10 +2448,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let (to, answers) = (crate::msg::sealed_to(bytes), crate::msg::sealed_answers(bytes));
         let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(own) = wallet.as_ref().filter(|w| Some(w.id()) == to) {
-            if let Some(mut opened) = own.open(bytes, now) {
+            let mut mail = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut opened) = own.open(bytes, now)
+                && !mail.seen(id)
+            {
                 // (Its answer goes back by the node it came by.)
                 opened.by = Some(from);
-                self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).inbox.push(opened);
+                mail.inbox.push(opened);
                 self.shared.say(Event::Mail);
             }
             return;
@@ -2947,9 +2977,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 // it sent, which `to` then is.)
                 let awaited = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).awaited(&to).is_some();
                 if own == Some(to) || awaited {
-                    let known = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).seen(id);
+                    // (Come before only once it has come: one offered
+                    // and never had is offered again, and taken then.)
+                    let known = self.shared.letters.lock().unwrap_or_else(|e| e.into_inner()).has_seen(&id);
                     if !known && !fetching && len <= most {
-                        self.fetch_granted(now, object, from, len, grant);
+                        self.fetch_unasked(now, object, from, len, grant);
                     }
                 } else if self.cfg.relay && self.tokens.check(&SocketAddr::V4(from), token) && len <= most {
                     // (For a wallet that is here; or the answer to a
@@ -2960,6 +2992,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         true if fetching => {}
                         true => {
                             self.offered.retain(|o| o.0 != id);
+                            if self.offered.len() >= OFFERED {
+                                self.offered.remove(0);
+                            }
                             self.offered.push((id, to, from));
                             self.fetch_granted(now, object, from, len, grant);
                         }
@@ -2993,7 +3028,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 drop(relayed);
                 if wanted {
                     self.carried.push((name, from, circuit, kind, count));
-                    self.fetch_granted(now, Object::Step(name), from, len, grant);
+                    // (A way's opening is from anyone; the rest is of a
+                    // way that is here.)
+                    match kind {
+                        OPEN => self.fetch_unasked(now, Object::Step(name), from, len, grant),
+                        _ => self.fetch_granted(now, Object::Step(name), from, len, grant),
+                    }
                 } else if !known {
                     self.counts.unheard += 1;
                 }
@@ -4800,6 +4840,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if let Object::Step(name) = object {
             self.carried.retain(|c| (c.0, c.1) != (name, from));
             return;
+        }
+        // (A message offered to be passed on that never came is kept
+        // count of no longer.)
+        if let Object::Sealed(id) = object {
+            self.offered.retain(|o| !(o.0 == id && o.2 == from));
         }
         let claimed = match object {
             Object::Headers { .. } => l.aim.as_ref().is_none_or(|aim| aim.source == from),

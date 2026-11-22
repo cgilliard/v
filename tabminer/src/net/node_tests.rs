@@ -2234,6 +2234,30 @@ fn wallets_by_ways(loss: u64) {
     // A relay falls silent: what is sent still crosses, by the others,
     // and from then on as soon as before. (Each relay in turn, so that
     // whichever the wallets are reached at is among them.)
+    // Ways opened from nowhere, thousands of them to each relay, by
+    // whoever can write an address on a datagram: a relay goes after a
+    // few hundred at once and no more, and the ways of those that are
+    // there open as they did.
+    for k in 0..3000u32 {
+        let nowhere = SocketAddrV4::new([10, 9, (k >> 8) as u8, k as u8].into(), 9);
+        for relay in 2..7 {
+            let open = Message::Carry {
+                grant: k as u64,
+                name: k as u64,
+                circuit: k as u64,
+                kind: crate::net::circuits::OPEN,
+                count: 0,
+                len: crate::onion::HELLO_LEN as u32,
+            };
+            w.inject(nowhere, relay, &open);
+        }
+    }
+    w.run(SECOND / 100);
+    for relay in 2..7 {
+        let going = w.nodes[relay].fetches.len();
+        assert!((UNASKED..=UNASKED + 64).contains(&going), "{going} fetches");
+        assert!(w.nodes[relay].carried.len() <= UNASKED + 64);
+    }
     for silent in 2..7 {
         w.mute = vec![silent];
         let mut took = Vec::new();

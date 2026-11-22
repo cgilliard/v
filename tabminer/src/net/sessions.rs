@@ -42,6 +42,9 @@ impl Default for Limits {
     }
 }
 
+/// How many wallets are held at the end of one way.
+const EACH_WAY: usize = 2;
+
 /// Where a wallet a session is held for is: at an address, which it
 /// says so from; or at the far end of a way through relays that ends
 /// at this node, known by who is before this node on it
@@ -164,9 +167,14 @@ impl Sessions {
                     Where::Addr(addr) => Some(*addr.ip()),
                     Where::Way(..) => None,
                 };
+                // (And of one way: a wallet or two, as of one address a
+                // few. One way could else say it was every wallet the
+                // node has room for.)
                 let of_host = match host(&at) {
                     Some(ip) => self.held.values().filter(|s| host(&s.at) == Some(ip)).count(),
-                    None => 0,
+                    None => {
+                        self.held.values().filter(|s| s.at == at).count() * (self.limits.each_host / EACH_WAY).max(1)
+                    }
                 };
                 if self.held.len() >= self.limits.most || of_host >= self.limits.each_host {
                     return Err(Refused::Full);
@@ -787,6 +795,11 @@ impl Mail {
         own.or_else(|| self.passing.iter().find(|p| p.0 == *id).map(|p| Arc::clone(&p.2)))
     }
 
+    /// Whether the sealed message of id `id` has come before.
+    pub fn has_seen(&self, id: &Digest) -> bool {
+        self.seen.contains(id)
+    }
+
     /// Whether the sealed message of id `id` has come before; it has
     /// now.
     pub fn seen(&mut self, id: Digest) -> bool {
@@ -811,6 +824,29 @@ mod tests {
 
     fn wallet(seed: u8) -> Participant {
         Participant::new(mldsa::keygen(&[seed; 32]), &[seed; 64], 0)
+    }
+
+    /// One way is a wallet's, or two's: not every wallet's the node has
+    /// room for.
+    #[test]
+    fn one_way_is_not_every_wallet() {
+        let mut sessions = Sessions::new(Limits::default());
+        let way = Where::Way(at(1, 5000), 7);
+        let said = |seed: u8| {
+            let mut w = wallet(seed);
+            let seq = w.say(at(9, 3737), 9, 100, 0);
+            w.announced(seq).unwrap().to_vec()
+        };
+        let mut held = 0;
+        for seed in 1..=6u8 {
+            match sessions.admit(said(seed), way, |bind| bind == 9, 100, 0) {
+                Ok(_) => held += 1,
+                Err(e) => assert_eq!(e, Refused::Full),
+            }
+        }
+        assert_eq!(held, EACH_WAY);
+        // (Another way has its own.)
+        assert!(sessions.admit(said(7), Where::Way(at(1, 5000), 8), |bind| bind == 9, 100, 0).is_ok());
     }
 
     /// A node holds a session for a wallet once it has its announcement,
