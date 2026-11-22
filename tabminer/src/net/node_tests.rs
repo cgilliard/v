@@ -2129,13 +2129,13 @@ fn a_transaction_crosses_the_network() {
     w.run(20 * SECOND);
     assert!((0..4).all(|i| w.live(i).len() == 3));
     // Spent, all but a fee, to the same key.
-    let mut tx = UnsignedTransaction::new(
+    let tx = UnsignedTransaction::new(
         vec![(key.public_key(), 1500 * COIN)],
         vec![Output::new(&key.public_key(), 1499 * COIN)],
     )
+    .at(&[position])
     .sign(|_, _, m| key.sign(m))
     .unwrap();
-    tx.set_positions(&[position]);
     let bytes = tx.to_bytes();
     let fetched: Vec<u64> = (0..4).map(|i| w.nodes[i].counts().fetched).collect();
     let id = w.nodes[2].hold().submit(&bytes, NOW).unwrap();
@@ -2155,9 +2155,9 @@ fn a_transaction_crosses_the_network() {
         vec![(key.public_key(), 1500 * COIN)],
         vec![Output::new(&other.public_key(), 1498 * COIN)],
     )
+    .at(&[position])
     .sign(|_, _, m| other.sign(m));
-    let mut forged = forged.unwrap();
-    forged.set_positions(&[position]);
+    let forged = forged.unwrap();
     assert_eq!(w.nodes[1].hold().submit(&forged.to_bytes(), NOW), Err(Reject::BadSignature));
 }
 

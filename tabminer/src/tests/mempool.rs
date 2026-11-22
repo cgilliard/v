@@ -63,9 +63,10 @@ fn spend_at(tag: u32, positions: &[u64], amount: u64, fee: u64, to: u32) -> Vec<
     let mut k = key(tag);
     let inputs = positions.iter().map(|_| (k.public_key(), amount)).collect();
     let total = amount * positions.len() as u64;
-    let mut tx =
-        UnsignedTransaction::new(inputs, vec![Output::new(&pk(to), total - fee)]).sign(|_, _, m| k.sign(m)).unwrap();
-    tx.set_positions(positions);
+    let tx = UnsignedTransaction::new(inputs, vec![Output::new(&pk(to), total - fee)])
+        .at(positions)
+        .sign(|_, _, m| k.sign(m))
+        .unwrap();
     tx.to_bytes()
 }
 
@@ -103,32 +104,36 @@ fn outputs_sharing_a_commitment_are_told_apart() {
     assert_eq!(other.insert(&spend_at(1, &[1, 1], 500, 5, 101), &state, 1, 0), Err(Reject::Malformed));
 }
 
-/// A reorganization that replays an output at a new position: the
-/// transaction spending it leaves the pool for the shelf, and comes
-/// back spending it where it now is.
+/// A reorganization that takes an output away: the transaction
+/// spending it leaves the pool for the shelf. It comes back when the
+/// output is where it was again, and not for the same output made
+/// somewhere else: what was signed is of the place.
 #[test]
-fn shelved_transactions_follow_their_outputs() {
+fn shelved_transactions_come_back_with_their_outputs() {
     let mut state = Fake::default();
     state.fund(0, 1, 1000);
     let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
     let id = pool.insert(&spend(1, 1000, 5), &state, 1, 0).unwrap();
     // The block that made it is replaced: the output is gone from
-    // position 0, and nothing says where it is.
+    // position 0.
     let made = state.outputs.remove(&0).unwrap();
     let (moved, created) = none();
     assert_eq!(pool.revalidate(&state, 1, &moved, &created, 0), Ok((1, 0)));
     assert!(pool.is_empty());
-    // The new branch makes it again at position 2.
+    // The new branch makes it again at position 2: another output, to
+    // what was signed.
     state.outputs.insert(2, made);
-    let moved = HashMap::from([(made.0, vec![2u64])]);
-    assert!(pool.take_returned().is_empty());
+    let elsewhere = HashMap::from([(made.0, vec![2u64])]);
+    assert_eq!(pool.revalidate(&state, 1, &elsewhere, &created, 0), Ok((0, 0)));
+    assert!(pool.is_empty() && pool.take_returned().is_empty());
+    // And at position 0: the same.
+    state.outputs.insert(0, made);
     assert_eq!(pool.revalidate(&state, 1, &moved, &created, 0), Ok((0, 1)));
     // What comes back is said, once, for whoever is to tell of it.
     assert_eq!(pool.take_returned(), [(id, pool.entry(&id).unwrap().size())]);
     assert!(pool.take_returned().is_empty());
     let back: Vec<u64> = pool.get(&id).unwrap().spent_positions().collect();
-    assert_eq!(back, [2]);
-    // Its id and its signature are what they were.
+    assert_eq!(back, [0]);
     assert!(pool.get(&id).unwrap().verify_signatures());
     assert_eq!(pool.get(&id).unwrap().txid(), id);
 }
@@ -478,10 +483,10 @@ fn name_operations_are_checked_claimed_and_selected() {
         let mut k = key(tag);
         let ops = vec![NameOp::Reveal { record, salt, commit }];
         let outputs = vec![Output::new(&pk(100), 999_000)];
-        let mut tx = UnsignedTransaction::with_ops(vec![(k.public_key(), 1_000_000)], outputs, ops)
+        let tx = UnsignedTransaction::with_ops(vec![(k.public_key(), 1_000_000)], outputs, ops)
+            .at(&[u64::from(tag) - 1])
             .sign(|_, _, m| k.sign(m))
             .unwrap();
-        tx.set_positions(&[u64::from(tag) - 1]);
         tx.to_bytes()
     };
     let mut pool = Mempool::with_policy(1 << 20, Policy::NONE);
@@ -562,10 +567,10 @@ fn throughput() {
         let fee = policy.min_fee(ins, outs) * (2 + i as u64 % 49);
         let each = (amount * ins as u64 - fee) / outs as u64;
         let outputs = (0..outs).map(|_| Output::new(&to, each)).collect();
-        let mut tx = UnsignedTransaction::new(vec![(k.public_key(), amount); ins], outputs)
+        let tx = UnsignedTransaction::new(vec![(k.public_key(), amount); ins], outputs)
+            .at(&positions)
             .sign(|_, _, m| signer.sign(m))
             .unwrap();
-        tx.set_positions(&positions);
         tx.to_bytes()
     };
     for i in 0..n {

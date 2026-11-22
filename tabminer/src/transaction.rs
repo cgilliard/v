@@ -60,7 +60,7 @@ use core::fmt;
 
 use crate::codec::read_u32;
 use crate::error::Error;
-use crate::hash::{DOM_BODY_IN, DOM_BODY_OP, DOM_BODY_OUT, DOM_OUT_ITEM, Digest, hash_domain};
+use crate::hash::{DOM_BODY_OP, DOM_BODY_OUT, DOM_OUT_ITEM, Digest, hash_domain};
 use crate::ledger::{absorb, body_head};
 use crate::name::NameOp;
 use crate::output::{
@@ -106,17 +106,17 @@ fn covered_agree(covered: impl Iterator<Item = (u8, u8)> + Clone) -> bool {
 fn body_hash(
     n: &Counts,
     covered: u32,
-    inputs: impl Iterator<Item = (PublicKey, u64)>,
-    policy_inputs: impl Iterator<Item = (Digest, u64)>,
+    inputs: impl Iterator<Item = (PublicKey, u64, u64)>,
+    policy_inputs: impl Iterator<Item = (Digest, u64, u64)>,
     outputs: impl Iterator<Item = (Commitment, u64, Digest)>,
     ops: impl Iterator<Item = Digest>,
 ) -> Digest {
     let mut id = body_head(n.inputs + n.policy_inputs, n.outputs + n.ops, covered);
-    for (pk, amount) in inputs {
-        id = absorb(DOM_BODY_IN, &id, &commitment(&pk, amount));
+    for (pk, amount, position) in inputs {
+        id = crate::ledger::absorb_input(&id, &commitment(&pk, amount), position);
     }
-    for (policy, amount) in policy_inputs {
-        id = absorb(DOM_BODY_IN, &id, &key_commitment(&policy, amount));
+    for (policy, amount, position) in policy_inputs {
+        id = crate::ledger::absorb_input(&id, &key_commitment(&policy, amount), position);
     }
     for (commitment, _, slot) in outputs {
         let mut item = [0u8; 64];
@@ -346,8 +346,8 @@ impl<'a> TransactionRef<'a> {
         body_hash(
             &self.counts,
             self.covered(),
-            self.inputs().map(|i| (i.pubkey, i.amount)),
-            self.policy_inputs().map(|p| (p.policy(), p.amount())),
+            self.inputs().map(|i| (i.pubkey, i.amount, i.position)),
+            self.policy_inputs().map(|p| (p.policy(), p.amount(), p.position())),
             self.outputs.iter().map(|o| (o.commitment, o.amount, o.slot())),
             self.ops().map(|op| op.digest()),
         )
@@ -440,36 +440,6 @@ impl fmt::Debug for TransactionRef<'_> {
     }
 }
 
-/// Sets, in the encoded transaction `bytes`, where each input's output is
-/// in the UTXO set, in input order (plain inputs, then policy inputs).
-/// Positions are not signed, so the signatures and the transaction id are
-/// unchanged. Returns whether `bytes` are a transaction with one input per
-/// position; if not, nothing is written.
-pub fn set_positions(bytes: &mut [u8], positions: &[u64]) -> bool {
-    let Ok(tx) = TransactionRef::from_bytes(bytes) else { return false };
-    let n = tx.counts();
-    if positions.len() != n.inputs + n.policy_inputs {
-        return false;
-    }
-    let (plain, policy) = positions.split_at(n.inputs);
-    // Each item's size is read before its position is written, so the
-    // walk never holds the bytes it changes.
-    let mut at = 4;
-    for p in plain {
-        let (_, rest) = Input::read(&bytes[at..]).expect("checked above");
-        let size = bytes.len() - at - rest.len();
-        bytes[at + Input::POSITION_AT..][..8].copy_from_slice(&p.to_le_bytes());
-        at += size;
-    }
-    at += 4;
-    for p in policy {
-        let size = PolicyInputRef::read(&bytes[at..]).expect("checked above").0.size();
-        bytes[at + PolicyInputRef::POSITION_AT..][..8].copy_from_slice(&p.to_le_bytes());
-        at += size;
-    }
-    true
-}
-
 // ---------------------------------------------------------------------------
 // Owned forms: for building
 // ---------------------------------------------------------------------------
@@ -491,6 +461,10 @@ pub struct Transaction {
 pub struct UnsignedTransaction {
     /// Revealed key and amount of each output being spent.
     pub inputs: Vec<(PublicKey, u64)>,
+    /// Where each of those outputs lies in the state: signed, with the
+    /// policy inputs' own ([`UnsignedTransaction::at`]). Zero until
+    /// said.
+    pub positions: Vec<u64>,
     /// Policy spends, with or without their witnesses yet.
     pub policy_inputs: Vec<PolicyInput>,
     pub outputs: Vec<Output>,
@@ -510,7 +484,7 @@ macro_rules! owned_body {
             &n,
             covered_count($tx.policy_inputs.iter().map(|p| p.covered)),
             $inputs,
-            $tx.policy_inputs.iter().map(|p| (p.policy(), p.amount)),
+            $tx.policy_inputs.iter().map(|p| (p.policy(), p.amount, p.position)),
             $tx.outputs.iter().map(|o| (o.commitment, o.amount, o.slot())),
             $tx.ops.iter().map(NameOp::digest),
         )
@@ -520,12 +494,28 @@ macro_rules! owned_body {
 impl UnsignedTransaction {
     /// A transaction without name operations.
     pub fn new(inputs: Vec<(PublicKey, u64)>, outputs: Vec<Output>) -> UnsignedTransaction {
-        UnsignedTransaction { inputs, policy_inputs: vec![], outputs, ops: vec![] }
+        let positions = vec![0; inputs.len()];
+        UnsignedTransaction { inputs, positions, policy_inputs: vec![], outputs, ops: vec![] }
     }
 
     /// A transaction carrying name operations.
     pub fn with_ops(inputs: Vec<(PublicKey, u64)>, outputs: Vec<Output>, ops: Vec<NameOp>) -> UnsignedTransaction {
-        UnsignedTransaction { inputs, policy_inputs: vec![], outputs, ops }
+        let positions = vec![0; inputs.len()];
+        UnsignedTransaction { inputs, positions, policy_inputs: vec![], outputs, ops }
+    }
+
+    /// Says where each input's output lies in the state, in input order
+    /// (plain inputs, then policy inputs): before anything is signed,
+    /// since the body hash is of them. A signature spends the output at
+    /// its place and no other of the same key and amount.
+    pub fn at(mut self, positions: &[u64]) -> UnsignedTransaction {
+        assert_eq!(positions.len(), self.inputs.len() + self.policy_inputs.len(), "one position per input");
+        let (plain, policy) = positions.split_at(self.inputs.len());
+        self.positions = plain.to_vec();
+        for (i, p) in self.policy_inputs.iter_mut().zip(policy) {
+            i.position = *p;
+        }
+        self
     }
 
     /// Adds policy spends. Their body-mode signatures are over the body
@@ -537,23 +527,24 @@ impl UnsignedTransaction {
 
     /// The body hash every input must sign; equals the final transaction id.
     pub fn body_hash(&self) -> Digest {
-        owned_body!(self.inputs.iter().copied(), self, body_hash)
+        let placed = self.inputs.iter().zip(&self.positions).map(|((pk, amount), at)| (*pk, *amount, *at));
+        owned_body!(placed, self, body_hash)
     }
 
     /// Signs every input. `signer` is called once per input, in order, with
     /// the input index, its public key and the body hash to sign, and must
     /// return a signature made with the matching secret key. Using a closure
-    /// lets one key sign several inputs. Positions start at zero; see
-    /// [`Transaction::set_positions`].
+    /// lets one key sign several inputs. The positions are those said
+    /// ([`UnsignedTransaction::at`]).
     pub fn sign<E>(
         self,
         mut signer: impl FnMut(usize, &PublicKey, &Digest) -> Result<Sig, E>,
     ) -> Result<Transaction, E> {
         let msg = self.body_hash();
         let mut inputs = Vec::with_capacity(self.inputs.len());
-        for (i, (pubkey, amount)) in self.inputs.into_iter().enumerate() {
+        for (i, ((pubkey, amount), position)) in self.inputs.into_iter().zip(self.positions).enumerate() {
             let signature = signer(i, &pubkey, &msg)?;
-            inputs.push(Input { pubkey, amount, position: 0, signature });
+            inputs.push(Input { pubkey, amount, position, signature });
         }
         Ok(Transaction { inputs, policy_inputs: self.policy_inputs, outputs: self.outputs, ops: self.ops })
     }
@@ -632,7 +623,7 @@ impl Transaction {
 
     /// Hash of the body, excluding signatures.
     pub fn body_hash(&self) -> Digest {
-        owned_body!(self.inputs.iter().map(|i| (i.pubkey, i.amount)), self, body_hash)
+        owned_body!(self.inputs.iter().map(|i| (i.pubkey, i.amount, i.position)), self, body_hash)
     }
 
     /// Transaction id: the body hash.
@@ -644,6 +635,7 @@ impl Transaction {
     pub fn unsigned(&self) -> UnsignedTransaction {
         UnsignedTransaction {
             inputs: self.inputs.iter().map(|i| (i.pubkey, i.amount)).collect(),
+            positions: self.inputs.iter().map(|i| i.position).collect(),
             policy_inputs: self.policy_inputs.clone(),
             outputs: self.outputs.clone(),
             ops: self.ops.clone(),
@@ -688,8 +680,10 @@ impl Transaction {
     }
 
     /// Sets where each input's output is in the UTXO set, in input order
-    /// (plain inputs, then policy inputs). Leaves the signatures and the
-    /// transaction id unchanged.
+    /// (plain inputs, then policy inputs). The id is of the positions:
+    /// what was signed before is signed no longer, and this is for
+    /// what is signed after, or not at all
+    /// ([`UnsignedTransaction::at`] is the way otherwise).
     pub fn set_positions(&mut self, positions: &[u64]) {
         assert_eq!(positions.len(), self.inputs.len() + self.policy_inputs.len(), "one position per input");
         let (plain, policy) = positions.split_at(self.inputs.len());
@@ -948,17 +942,21 @@ mod tests {
     fn serialization_roundtrip() {
         let mut ka = key(9);
         let kb = key(10).public_key();
-        let mut tx = UnsignedTransaction::new(
+        let tx = UnsignedTransaction::new(
             vec![(ka.public_key(), 7), (ka.public_key(), 8)],
             vec![Output::new(&kb, 9), Output::new(&kb, u64::MAX)],
         )
+        .at(&[1 << 39, 12345])
         .sign_with(&mut ka)
         .unwrap();
-        // Positions are carried but not signed.
-        let id = tx.txid();
-        tx.set_positions(&[1 << 39, 12345]);
-        assert_eq!((tx.txid(), tx.spent_positions()), (id, vec![1 << 39, 12345]));
+        // Positions are carried, and signed: at others, the transaction
+        // is another, which nobody signed.
+        assert_eq!(tx.spent_positions(), vec![1 << 39, 12345]);
         assert!(tx.verify_signatures());
+        let mut moved = tx.clone();
+        moved.set_positions(&[1 << 39, 12346]);
+        assert_ne!(moved.txid(), tx.txid());
+        assert!(!moved.verify_signatures());
 
         let bytes = tx.to_bytes();
         assert_eq!(bytes.len(), tx.size());
@@ -1015,7 +1013,8 @@ mod tests {
         ];
         let unsigned =
             UnsignedTransaction::with_ops(vec![(ka.public_key(), 40), (tall.public_key(), 5)], outputs.clone(), ops)
-                .with_policy_inputs(vec![spend.clone()]);
+                .with_policy_inputs(vec![spend.clone()])
+                .at(&[5, 6, 7]);
         let body = unsigned.body_hash();
         // The policy input's signatures: over the body, or over the
         // rebindable message with the state as each key's leaf.
@@ -1030,7 +1029,6 @@ mod tests {
         };
         let mut tx = unsigned.sign(|i, _, m| if i == 0 { ka.sign(m) } else { tall.sign(m) }).unwrap();
         tx.policy_inputs[0].witness[0] = CondWitness::Signatures(vec![signer(0, kb), signer(1, kc)]);
-        tx.set_positions(&[5, 6, 7]);
         tx
     }
 
@@ -1143,39 +1141,6 @@ mod tests {
         assert_eq!(none.body_hash(), crate::ledger::Transaction::default().id());
     }
 
-    /// Positions are rewritten in the bytes, in input order, without the
-    /// id or any signature changing; bytes that are no transaction, or
-    /// another number of positions, are left alone.
-    #[test]
-    fn positions_are_set_in_place() {
-        for rebindable in [false, true] {
-            let tx = full(rebindable);
-            let mut bytes = tx.to_bytes();
-            let before = bytes.clone();
-            assert!(set_positions(&mut bytes, &[1 << 40, 2, (1 << 41) - 1]));
-            let view = TransactionRef::from_bytes(&bytes).unwrap();
-            assert_eq!(view.spent_positions().collect::<Vec<_>>(), vec![1 << 40, 2, (1 << 41) - 1]);
-            assert_eq!(view.txid(), tx.txid());
-            assert!(view.verify_signatures());
-            assert_eq!(view.check_policy_inputs(1000, |p| (p == (1 << 41) - 1).then_some(0)), Ok(()));
-            let mut moved = tx.clone();
-            moved.set_positions(&[1 << 40, 2, (1 << 41) - 1]);
-            assert_eq!(moved.to_bytes(), bytes);
-            // Only the positions changed: setting them back gives the bytes back.
-            assert_ne!(bytes, before);
-            assert!(set_positions(&mut bytes, &[5, 6, 7]));
-            assert_eq!(bytes, before);
-            for wrong in [&[][..], &[1, 2], &[1, 2, 3, 4]] {
-                let mut b = before.clone();
-                assert!(!set_positions(&mut b, wrong));
-                assert_eq!(b, before);
-            }
-            let mut cut = before[..before.len() - 1].to_vec();
-            assert!(!set_positions(&mut cut, &[1, 2, 3]));
-            assert_eq!(cut, &before[..before.len() - 1]);
-        }
-    }
-
     /// Bytes that are not a transaction are refused: an item of any kind
     /// cut short or malformed, a count of more items than there are, bytes
     /// after the last.
@@ -1238,9 +1203,6 @@ mod tests {
                 let _ = (view.verify_signatures(), view.weight(), view.balance());
                 let _ = view.check_policy_inputs(100, |p| Some(p as u32 & 0xff));
                 let _ = (view.spent_positions().count(), view.spent_commitments().count());
-                let mut copy = view.as_bytes().to_vec();
-                let n = view.counts();
-                assert!(set_positions(&mut copy, &vec![3; n.inputs + n.policy_inputs]));
                 Some(view.as_bytes().to_vec())
             })
         });

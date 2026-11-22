@@ -1497,9 +1497,10 @@ pub(crate) mod tests {
         let (half, fee) = (first.amount / 2, 1000);
         let outputs =
             vec![Output::to_key_hash(&[1; 32], half), Output::to_key_hash(&[2; 32], first.amount - half - fee)];
-        let mut tx =
-            UnsignedTransaction::new(vec![(key.public_key(), first.amount)], outputs).sign_with(&mut key).unwrap();
-        tx.set_positions(&[0]);
+        let tx = UnsignedTransaction::new(vec![(key.public_key(), first.amount)], outputs)
+            .at(&[0])
+            .sign_with(&mut key)
+            .unwrap();
         let txs = [tx];
         // The signature is proven with no block in mind.
         let proven = setup.sign(&txs[0].signings()).unwrap();

@@ -66,7 +66,7 @@ use crate::name::{Key, MAX_REVEAL, MAX_SWEEPS, NameOp, OpKind, Record, commit_ha
 use crate::output::Commitment;
 use crate::store::backend::Backend;
 use crate::store::state::Snapshot;
-use crate::transaction::{TransactionRef, set_positions};
+use crate::transaction::TransactionRef;
 
 /// What the pool asks of the chain's state.
 pub trait Ledger {
@@ -1167,11 +1167,14 @@ impl Mempool {
         self.shelf.drain(..first);
         let mut back = 0;
         let mut keep = Vec::with_capacity(self.shelf.len());
-        for mut e in std::mem::take(&mut self.shelf) {
+        for e in std::mem::take(&mut self.shelf) {
             let mut ok = !self.txs.contains_key(&e.txid);
-            let mut positions: Vec<u64> = e.tx().spent_positions().collect();
+            let positions: Vec<u64> = e.tx().spent_positions().collect();
             let commitments: Vec<Commitment> = e.tx().spent_commitments().collect();
-            let mut relocated = false;
+            // (An output made again elsewhere is another output to what
+            // was signed, which is of where it lay: the transaction
+            // comes back only if its outputs are where they were.)
+            let _ = moved;
             // (A state that cannot be read holds nothing: the entry stays
             // on the shelf.)
             let there = |p: u64, c: &Commitment| holds(ledger, p, c).unwrap_or(false);
@@ -1181,28 +1184,12 @@ impl Mempool {
                 }
                 let p = positions[i];
                 ok = there(p, c) && !self.spends.contains_key(&p);
-                if !ok && let Some(candidates) = moved.get(c) {
-                    // The same output, replayed at a new position.
-                    for &q in candidates {
-                        if !positions.contains(&q) && !self.spends.contains_key(&q) && there(q, c) {
-                            positions[i] = q;
-                            relocated = true;
-                            ok = true;
-                            break;
-                        }
-                    }
-                }
             }
-            if ok && relocated {
-                let mut bytes = e.bytes.clone();
-                // A policy input's timelocks count from its output's
-                // creation, which the move may have changed.
-                ok = set_positions(&mut bytes, &positions)
-                    && TransactionRef::from_bytes(&bytes)
-                        .is_ok_and(|tx| tx.check_policy_inputs(height, |p| made_at(ledger, p)).is_ok());
-                if ok {
-                    e.bytes = bytes;
-                }
+            // A policy input's timelocks count from its output's
+            // creation, which may be another on the branch it is on
+            // now.
+            if ok && e.tx().counts().policy_inputs > 0 {
+                ok = e.tx().check_policy_inputs(height, |p| made_at(ledger, p)).is_ok();
             }
             if ok && e.tx().counts().ops > 0 {
                 ok =

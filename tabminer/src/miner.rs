@@ -805,13 +805,13 @@ mod tests {
         {
             let state = chain.whole().unwrap();
             let snap = state.snapshot().unwrap();
-            let mut tx = UnsignedTransaction::new(
+            let tx = UnsignedTransaction::new(
                 vec![(key.public_key(), paid)],
                 vec![Output::new(&key.public_key(), paid - fee)],
             )
+            .at(&[0])
             .sign(|_, _, m| key.sign(m))
             .unwrap();
-            tx.set_positions(&[0]);
             pool.insert(&tx.to_bytes(), &snap, 2, NOW).unwrap();
         }
         // Nothing is chosen for a miner that is to prove no signatures.
@@ -891,10 +891,10 @@ mod tests {
         let alice = Record::new(b"alice", pubkey_hash(&owner.public_key()), [1; 32], [2; 32]).unwrap();
         let salt = [9; 32];
         let ops = vec![NameOp::Commit { commit: commit_hash(&alice.name.hash(), &salt, &alice.owner), memo: [3; 20] }];
-        let mut tx = UnsignedTransaction::with_ops(vec![(pk, held)], vec![Output::new(&pk, held - fee)], ops)
+        let tx = UnsignedTransaction::with_ops(vec![(pk, held)], vec![Output::new(&pk, held - fee)], ops)
+            .at(&[0])
             .sign_with(&mut key)
             .unwrap();
-        tx.set_positions(&[0]);
         held -= fee;
         let block = next(&mut pool, vec![tx.to_bytes()]);
         let view = BlockRef::from_bytes(&block).unwrap();
@@ -907,8 +907,7 @@ mod tests {
         let policy = Policy::new(vec![Leaf::new(vec![Cond::Thresh { mode: Mode::Body, m: 2, keys }])]);
         let ops = vec![NameOp::Reveal { record: alice, salt, commit: 3 }];
         let outputs = vec![Output::to_key_hash(&policy.root(), held - fee)];
-        let mut tx = UnsignedTransaction::with_ops(vec![(pk, held)], outputs, ops).sign_with(&mut key).unwrap();
-        tx.set_positions(&[2]);
+        let tx = UnsignedTransaction::with_ops(vec![(pk, held)], outputs, ops).at(&[2]).sign_with(&mut key).unwrap();
         held -= fee;
         next(&mut pool, vec![tx.to_bytes()]);
         {
@@ -975,8 +974,8 @@ mod tests {
                 let count = counts[position as usize];
                 let mut outputs: Vec<Output> = (1..count).map(|i| Output::to_key_hash(&[i as u8; 32], each)).collect();
                 outputs.push(Output::new(&pk, held - (count - 1) * each - fee));
-                let mut tx = UnsignedTransaction::new(vec![(pk, held)], outputs).sign_with(&mut key).unwrap();
-                tx.set_positions(&[position]);
+                let tx =
+                    UnsignedTransaction::new(vec![(pk, held)], outputs).at(&[position]).sign_with(&mut key).unwrap();
                 pool.insert(&tx.to_bytes(), &snap, 3, NOW).unwrap();
             }
         }

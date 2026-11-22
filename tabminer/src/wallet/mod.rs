@@ -1614,14 +1614,20 @@ impl<B: Backend> Wallet<B> {
             }
             keys.push(key);
         }
-        let mut tx = unsigned.sign(|i, pk, msg| {
+        // (Where each output lies is signed: what is signed spends that
+        // output, and no other of the same key and amount.)
+        let mut unsigned = unsigned;
+        if unsigned.positions.len() != positions.len() {
+            return Err(WalletError::BadSlate("an input for each output spent"));
+        }
+        unsigned.positions = positions;
+        let tx = unsigned.sign(|i, pk, msg| {
             let key = &mut keys[i];
             if key.public_key() != *pk {
                 return Err(WalletError::BadSlate("input key is not the wallet's"));
             }
             key.sign(msg).map_err(|_| WalletError::Exhausted)
         })?;
-        tx.set_positions(&positions);
         for c in inputs {
             if let Some(o) = t.outputs.get_mut(&digest_to_bytes(c)) {
                 o.state = State::Spent;
@@ -2132,20 +2138,20 @@ impl<B: Backend> Wallet<B> {
         self.replace(t, sent, unsigned, fee, now)
     }
 
-    /// A sent transaction as it was signed, to send again: its inputs at
-    /// the positions this wallet now knows for their outputs (a
-    /// reorganization may have moved them; positions are not signed).
+    /// A sent transaction as it was signed, to send again. Where its
+    /// inputs' outputs lie is signed: if the chain has gone over to a
+    /// branch on which one of them lies elsewhere, what was signed
+    /// spends nothing there, and the payment is to be made again.
     pub fn resend(&self, txid: &Commitment) -> Result<Transaction> {
         let sent = self.t.sent.get(&digest_to_bytes(txid)).cloned().ok_or(WalletError::Unknown)?;
-        let mut tx = sent.tx;
-        let mut positions = tx.spent_positions();
+        let tx = sent.tx;
+        let positions = tx.spent_positions();
         if sent.inputs.len() == positions.len() {
-            for (p, c) in positions.iter_mut().zip(&sent.inputs) {
-                if let Some(q) = self.owned(c).and_then(|o| o.position) {
-                    *p = q;
+            for (p, c) in positions.iter().zip(&sent.inputs) {
+                if self.owned(c).and_then(|o| o.position).is_some_and(|q| q != *p) {
+                    return Err(WalletError::BadSlate("an output it spends has moved: it is to be made again"));
                 }
             }
-            tx.set_positions(&positions);
         }
         Ok(tx)
     }
