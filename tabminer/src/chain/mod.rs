@@ -207,6 +207,16 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         &self,
         change: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        // (A state orders its own writers: nothing is taken from those
+        // who read the chain while this waits for a block being applied,
+        // as it would be were the store asked for whole: whoever waits
+        // to write it keeps every reader that comes after waiting too.)
+        {
+            let store = self.store();
+            if let Store::Whole(state) = &*store {
+                return state.write_blocks(change);
+            }
+        }
         match &mut *self.store_mut() {
             Store::Whole(state) => state.write_blocks(change),
             Store::Receiving(receiving) => receiving.write_blocks(change),

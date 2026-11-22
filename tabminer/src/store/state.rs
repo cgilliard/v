@@ -258,6 +258,12 @@ pub struct BlockEdit<'a> {
 pub struct State<B: Backend + 'static> {
     file: Arc<PageFile<B>>,
     meta: Mutex<Meta>,
+    /// Held by whoever changes the state or the blocks, from before
+    /// what it starts from is read until what it made is what the next
+    /// starts from: the file orders those who write it only until one
+    /// is durable, and another that began then from what was there
+    /// before would undo it.
+    writing: Mutex<()>,
     /// Blocks whose records the window keeps.
     keep: usize,
     /// The level of the outputs' parts.
@@ -331,6 +337,7 @@ impl<B: Backend + 'static> State<B> {
         State {
             file,
             meta: Mutex::new(meta),
+            writing: Mutex::new(()),
             keep,
             part_level: PART_LEVEL,
             name_level: NAME_PART_LEVEL,
@@ -497,6 +504,7 @@ impl<B: Backend + 'static> State<B> {
         &self,
         change: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
         let txn = self.file.begin()?;
         let mut meta = self.meta().clone();
         let done = change(&txn, &mut meta.blocks)?;
@@ -571,6 +579,7 @@ impl<B: Backend + 'static> State<B> {
         &self,
         work: impl FnOnce(&mut Txn<'_, B>, Outputs, Names, &Commits) -> Result<T, Error>,
     ) -> Result<T, Error> {
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
         let mut txn = self.file.begin()?;
         let meta = self.meta().clone();
         work(&mut txn, meta.outputs, meta.names, &meta.commits)
@@ -585,6 +594,7 @@ impl<B: Backend + 'static> State<B> {
     /// What the session has done is read back through it; nothing else
     /// sees any of it until it is all done.
     pub fn session<T>(&self, change: impl FnOnce(&mut Session<'_, B>) -> Result<T, Error>) -> Result<T, Error> {
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
         let txn = self.file.begin()?;
         let meta = self.meta().clone();
         let mut session = Session {

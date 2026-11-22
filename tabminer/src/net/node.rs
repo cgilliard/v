@@ -211,6 +211,12 @@ enum Job {
     /// and in full later, or vouched for by a proof
     /// ([`Chain::accept_headers`]).
     Headers { first: u32, headers: Vec<Header>, from: SocketAddrV4, unix: u64, defer: Option<u32> },
+    /// The work of the headers from the height `from` to `best`, to
+    /// check in full where it was left to a proof
+    /// ([`Chain::confirm_work`]): for the state to be taken as of
+    /// `target`, if for one. It is as many headers' work as lie between,
+    /// and is not done by whoever holds what the workers share.
+    Confirm { best: Header, from: u32, target: Option<Digest> },
     /// The block a state is to be taken as of, to check by its proof.
     Check { block: Vec<u8>, next: u64, roots: (Digest, Digest) },
     /// A state to begin to receive, as of the block of `target`.
@@ -244,6 +250,11 @@ enum Outcome {
         /// How many were new, and what stopped the run, if anything.
         new: usize,
         error: Option<Error>,
+    },
+    /// The headers' work was checked in full: whether it held.
+    Confirmed {
+        target: Option<Digest>,
+        held: bool,
     },
     Checked {
         target: Digest,
@@ -296,6 +307,9 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
         Job::Headers { first, headers, from, unix, defer } => {
             let (new, error) = chain.accept_headers_above(&headers, unix, defer);
             Outcome::Headers { first, count: headers.len() as u32, last: headers.last()?.hash(), from, new, error }
+        }
+        Job::Confirm { best, from, target } => {
+            Outcome::Confirmed { target, held: matches!(chain.confirm_work(&best, from), Ok(Ok(_))) }
         }
         Job::Check { block, next, roots } => {
             let view = BlockRef::from_bytes(&block).ok()?;
@@ -435,6 +449,12 @@ pub(crate) struct Join {
     /// of where its outputs end; or is being.
     checked: bool,
     checking: bool,
+    /// The best header when it was chosen, and whether the work of the
+    /// headers from the block to that one has been checked in full: no
+    /// proof to come vouches for it, and nothing of the state is
+    /// believed before.
+    best: Header,
+    worked: bool,
     /// The roots of the parts of each range fetched so far.
     roots: BTreeMap<u32, Vec<(u64, Digest)>>,
     /// The chain has begun to receive the state; or is beginning to.
@@ -537,6 +557,9 @@ pub(crate) struct List {
     /// A chain ahead of ours is being caught up with: said when it is
     /// begun, and when it has been.
     syncing: bool,
+    /// The work of headers is being checked in full, by whoever does
+    /// what takes time ([`Job::Confirm`]): one such at a time.
+    confirming: bool,
 }
 
 impl List {
@@ -555,6 +578,7 @@ impl List {
             fetching: Vec::new(),
             views: vec![View::default(); workers],
             syncing: false,
+            confirming: false,
         }
     }
 }
@@ -3811,6 +3835,23 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     }
                     owner => self.shared.post(owner, Notice::Announced { header, len, from, verdict }),
                 },
+                Outcome::Confirmed { target, held } => {
+                    l.confirming = false;
+                    if let Some(join) = l.join.as_mut().filter(|j| Some(j.id) == target) {
+                        if held {
+                            join.worked = true;
+                            self.advance_join(l, now);
+                        } else {
+                            // Headers that were nobody's work: they are
+                            // the best no longer, and nothing is taken
+                            // as of a block under them.
+                            l.join = None;
+                            self.fetches.retain(|f| !of_state(&f.object));
+                            l.fetching.retain(|f| !of_state(&f.0));
+                            self.join_failed(l, now);
+                        }
+                    }
+                }
                 Outcome::Checked { target, result } => self.state_block_checked(l, now, target, result),
                 Outcome::Begun { target, result } => {
                     if let Some(join) = l.join.as_mut().filter(|j| j.id == target) {
@@ -4152,7 +4193,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // (And the work of what it waits for is checked in full, if
             // any of it was left to a proof: headers that are nobody's
             // work are the best no longer.)
-            let _ = self.chain.confirm_work(&best, height.saturating_add(1));
+            if !l.confirming {
+                l.confirming = true;
+                self.work(l, Job::Confirm { best, from: height.saturating_add(1), target: None });
+            }
             return false;
         }
         // A state that was being received already (the node stopped
@@ -4165,12 +4209,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         {
             target = same;
         }
-        let height = target.height;
-        // The work of that header and of those after it in full: no
-        // proof to come vouches for it.
-        if !matches!(self.chain.confirm_work(&best, height), Ok(Ok(_))) {
-            return false;
-        }
+        // (The work of that header and of those after it is checked in
+        // full before anything of the state is believed: the first step
+        // of taking it, [`Node::advance_join`].)
         l.syncing = true;
         l.join = Some(Join {
             id: target.hash(),
@@ -4179,6 +4220,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             manifest: None,
             checked: false,
             checking: false,
+            best,
+            worked: false,
             roots: BTreeMap::new(),
             begun: false,
             beginning: false,
@@ -4251,12 +4294,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
 
     /// The steps of taking a state that follow from what is in hand.
     fn advance_join(&mut self, l: &mut List, now: Micros) {
+        // The work of the headers from its block on, in full: no proof
+        // to come vouches for it.
+        if let Some((best, from, id)) = l.join.as_ref().filter(|j| !j.worked).map(|j| (j.best, j.target.height, j.id))
+            && !l.confirming
+        {
+            l.confirming = true;
+            self.work(l, Job::Confirm { best, from, target: Some(id) });
+        }
         let Some(join) = l.join.as_mut() else {
             return;
         };
         // The block and the top of its state: the block's proof, held to
         // where the manifest says its outputs end.
-        if !join.checked
+        if join.worked
+            && !join.checked
             && !join.checking
             && let (Some((block, _)), Some((manifest, _))) = (&join.block, &join.manifest)
         {
