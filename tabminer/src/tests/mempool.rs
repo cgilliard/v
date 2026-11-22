@@ -174,6 +174,50 @@ fn a_replacement_s_fee_comes_before_its_signatures_and_the_shelf_is_bounded() {
     assert_eq!(pool.shelf.len(), 3);
 }
 
+/// Why the pool refuses a transaction is said in words, each its own.
+#[test]
+fn a_refusal_says_why() {
+    let all = [
+        Reject::Known,
+        Reject::Expired,
+        Reject::NoInputs,
+        Reject::TooLarge(9),
+        Reject::NegativeFee,
+        Reject::FeeTooLow { min: 7 },
+        Reject::Dust { min: 5 },
+        Reject::Malformed,
+        Reject::BadSignature,
+        Reject::Policy(Error::Malformed("policy")),
+        Reject::TooManyRows(70_000),
+        Reject::UnknownInput(3),
+        Reject::ReplacementFee { min: 11 },
+        Reject::Full,
+        Reject::Name(NameReject::NoCommit),
+        Reject::NameConflict,
+        Reject::Store(Error::Receiving),
+    ];
+    let said: Vec<String> = all.iter().map(Reject::to_string).collect();
+    let mut once = said.clone();
+    once.sort();
+    once.dedup();
+    assert_eq!(once.len(), all.len());
+    assert!(said.iter().all(|why| !why.is_empty() && !why.ends_with('.')));
+    assert_eq!(said[3], "9 bytes exceeds the transaction size limit");
+    assert_eq!(said[10], "a policy's input of 70000 rows is more than a run of a proof holds");
+    assert_eq!(said[11], "spends an output that is not unspent (position 3)");
+    // And why the registry refuses what a transaction does to a name.
+    let names = [
+        NameReject::NoCommit,
+        NameReject::Expired(4),
+        NameReject::Registered,
+        NameReject::NotRegistered,
+        NameReject::BadOwner,
+    ];
+    let said: Vec<String> = names.iter().map(NameReject::to_string).collect();
+    assert_eq!((said[0].as_str(), said[1].as_str()), ("no such commit", "the commit at height 4 is past its window"));
+    assert!(said.iter().enumerate().all(|(i, why)| said[..i].iter().all(|other| other != why)));
+}
+
 /// A transaction that has waited its time is dropped, and its id is
 /// refused for as long again.
 #[test]

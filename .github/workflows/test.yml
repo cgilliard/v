@@ -141,7 +141,7 @@ jobs:
         run: >
           cargo test --locked --release --features dev --test binary --
           help_is_no_failure a_node_starts two_nodes_make_blocks a_payment_is_made_at_the_prompt
-          blocks_filled_and_unproven a_chain_made_beforehand
+          blocks_filled_and_unproven a_chain_made_beforehand a_wallet_is_asked_at_the_prompt
 
   # The program at the size of a chain that has run for years, in small:
   # a state of 2,000,000 outputs, full blocks applied on it, and a new

@@ -431,7 +431,7 @@ impl core::fmt::Display for Reject {
             Reject::Malformed => f.write_str("malformed transaction"),
             Reject::BadSignature => f.write_str("invalid signature"),
             Reject::Policy(e) => write!(f, "policy input: {e}"),
-            Reject::TooManyRows(n) => write!(f, "{n} trace rows exceeds a segment: too many signatures"),
+            Reject::TooManyRows(n) => write!(f, "a policy's input of {n} rows is more than a run of a proof holds"),
             Reject::UnknownInput(p) => write!(f, "spends an output that is not unspent (position {p})"),
             Reject::ReplacementFee { min } => {
                 write!(f, "conflicts with a pooled transaction; a replacement must pay at least {min}")

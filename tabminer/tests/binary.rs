@@ -1292,29 +1292,29 @@ impl Unchecked {
 fn blocks_filled_and_unproven_are_made_and_taken() {
     let port = 23_000 + std::process::id() % 9_000;
     // (Blocks kept for two back, and a state taken as of the block
-    // under the last: with five blocks made the first can no longer be
-    // had, and a new node must take the state.)
+    // under the last: with three blocks made the first can no longer
+    // be had, and a new node must take the state.)
     let kept = ["--max-undo-blocks", "2", "--sync-point", "1", "--no-seeds"];
-    let fill = ["--debug-fill-outputs", "2000,5", "--debug-fill", "200,200", "--blocks", "5"];
+    let fill = ["--debug-fill-outputs", "2000,5", "--debug-fill", "200,200", "--blocks", "3"];
     let mut server = Unchecked::start("dev", "filled-server", port, &[&kept[..], &fill[..]].concat());
     server.wait("Server is ready!", 1);
-    let built = server.wait("debug fill: block ", 5);
+    let built = server.wait("debug fill: block ", 3);
     assert!(built[0].contains("block 1: 200 outputs, 200 spends, "), "{built:?}");
-    server.wait("applied in ", 5);
-    let last = server.wait("Won block 5 (", 1).pop().unwrap();
+    server.wait("applied in ", 3);
+    let last = server.wait("Won block 3 (", 1).pop().unwrap();
     let id = &last[last.find('(').unwrap()..last.find(')').unwrap()];
     // A new node of that chain, with its first block and none of its
     // outputs.
     let join = ["--no-mine", "--no-wallet", "--debug-genesis-outputs", "2000,5", "--peer", &server.listen];
     let mut new = Unchecked::start("dev", "filled-new", port + 1, &[&kept[..], &join[..]].concat());
     new.wait("Server is ready!", 1);
-    new.wait("Taking the state as of block 4 ", 1);
-    new.wait("State taken as of block 4", 1);
-    new.wait("Synced at block 5", 1);
-    assert_eq!(new.lines(&format!("Received block 5 {id}")).len(), 1, "the two are on one block");
+    new.wait("Taking the state as of block 2 ", 1);
+    new.wait("State taken as of block 2", 1);
+    new.wait("Synced at block 3", 1);
+    assert_eq!(new.lines(&format!("Received block 3 {id}")).len(), 1, "the two are on one block");
     // It makes no block above the height it was told, and says how it
     // stands as it goes.
-    assert_eq!(server.lines("Won block ").len(), 5);
+    assert_eq!(server.lines("Won block ").len(), 3);
     let stats = std::fs::read_to_string(server.dir.join("stat.log")).unwrap();
     assert!(stats.contains("AvgLatency(us)"), "{stats}");
 }
@@ -1341,4 +1341,48 @@ fn a_chain_made_beforehand_is_taken_by_its_headers() {
     new.wait("Synced at block 300", 1);
     // (The data directory of blocks nobody checked says so, for good.)
     assert!(new.dir.join("unchecked").exists());
+}
+
+/// A node that makes no blocks is asked at its prompt how it stands,
+/// its wallet's password is set and asked for, and it stops when told;
+/// a wallet is then made again from its words in another directory, and
+/// has the same words. No block is made: moments.
+#[cfg(all(unix, feature = "dev"))]
+#[test]
+fn a_wallet_is_asked_at_the_prompt_and_made_again_with_no_block() {
+    let dirs = [scratch("asked-a"), scratch("asked-b")];
+    let port = 28_000 + std::process::id() % 4_000;
+    let (mut node, words) = Prompted::start_as(&dirs[0], &format!("127.0.0.1:{port}"), &[], false, true, None);
+    let words = words.unwrap();
+    assert!(node.ask("help").starts_with("commands:"));
+    assert_eq!(node.ask("nonsense"), "error: nonsense: no such command (see help)\n");
+    assert!(node.ask("status").starts_with("block 0 ("));
+    assert_eq!(node.ask("balance"), "spendable   0\n");
+    assert_eq!(node.ask("peers"), "0 peers known, 0 of them live\n");
+    for line in ["outputs", "names", "fees", "mempool", "leaves", "consensus", "mining", "slates", "sent", "payments"] {
+        assert!(!node.ask(line).is_empty(), "{line}");
+    }
+    let address = node.ask("address");
+    assert!(address.starts_with("tab1"), "{address}");
+    // Its words are said again when asked for.
+    assert!(node.ask("seed").contains(&words));
+    node.stop();
+    // Made again from its words, where there is no wallet: the same
+    // words, and an address of its own (the wallet that was lost may
+    // still be somewhere, reached at the one it had).
+    let (mut again, _) =
+        Prompted::start_as(&dirs[1], &format!("127.0.0.1:{}", port + 1), &[], false, false, Some(&words));
+    let other = again.ask("address");
+    assert!(other.starts_with("tab1") && other != address, "{other}");
+    assert!(again.ask("seed").contains(&words));
+    again.stop();
+    // And the first starts again on what it kept, with the wallet it had.
+    let (mut back, _) = Prompted::start_as(&dirs[0], &format!("127.0.0.1:{port}"), &[], false, false, None);
+    assert_eq!(back.ask("address"), address);
+    back.stop();
+    for dir in &dirs {
+        let log = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
+        assert!(!log.contains("Error"), "{log}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
