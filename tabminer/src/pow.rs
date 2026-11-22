@@ -1132,4 +1132,72 @@ mod tests {
         assert!(!verify(&seed, &h, &nonce, &bad_mix, &target));
         assert!(!verify(&seed, &h, &nonce, &out.mix, &Target::from_leading_zero_bits(200)));
     }
+
+    /// The table doubles each epoch, a year of blocks, up to its
+    /// ceiling: by epoch, and by the height of the block whose work it
+    /// is of. What a block is mined with and checked against follows.
+    #[test]
+    fn the_table_doubles_each_epoch_to_its_ceiling() {
+        let m = PowParams::MAINNET;
+        let year = 52_560u64;
+        assert_eq!(m.epoch_blocks as u64, year);
+        for (height, epoch) in
+            [(0, 0), (1, 0), (year - 1, 0), (year, 1), (2 * year - 1, 1), (5 * year, 5), (1007 * year, 1007)]
+        {
+            assert_eq!(m.epoch_of(height), epoch, "height {height}");
+        }
+        assert_eq!(m.epoch_of(u64::MAX), u32::MAX);
+        let gb = 1u64 << 30;
+        for (epoch, size) in [
+            (0, gb),
+            (1, 2 * gb),
+            (2, 4 * gb),
+            (3, 8 * gb),
+            (4, 16 * gb),
+            (5, 32 * gb),
+            (6, 32 * gb),
+            (1000, 32 * gb),
+            (u32::MAX, 32 * gb),
+        ] {
+            assert_eq!(table_bytes(m.log_items(epoch)), size, "epoch {epoch}");
+        }
+        for (height, size) in
+            [(0, gb), (year - 1, gb), (year, 2 * gb), (5 * year - 1, 16 * gb), (5 * year, 32 * gb), (u64::MAX, 32 * gb)]
+        {
+            assert_eq!(table_bytes(m.log_items_at(height)), size, "height {height}");
+            assert_eq!(table_bytes(SeedText::new(m).at(height).log_items()), size, "height {height}");
+        }
+        // The dev networks' table stays as it is.
+        assert_eq!(table_bytes(PowParams::DEV.log_items_at(u64::MAX)), 64 << 10);
+        // A table that grows: the work of a block is of the table of
+        // its height, and is no work against the one of the year
+        // before.
+        let growing = SeedText::new(GROWING);
+        let (first, later) = (0u64, GROWING.epoch_blocks as u64);
+        assert_eq!(GROWING.log_items_at(later), GROWING.log_items_at(first) + 1);
+        let (header, nonce) = ([3u8; 32], nonce_from_u64(5));
+        let (was, is) =
+            (hashimoto(&growing.at(first), &header, &nonce), hashimoto(&growing.at(later), &header, &nonce));
+        assert_ne!((was.mix, was.result), (is.mix, is.result));
+        // A table no epoch has is asked for by nobody.
+        for log_items in [GROWING.log_dataset_items - 1, GROWING.max_log_dataset_items + 1] {
+            assert!(std::panic::catch_unwind(|| growing.table(log_items)).is_err());
+        }
+    }
+
+    /// The items depend on every part of the text: a byte changed
+    /// anywhere, the first and the last included, changes items.
+    #[test]
+    fn items_depend_on_every_part_of_the_text() {
+        let base = SEED_TEXT_GZ.to_vec();
+        let a = SeedText::from_bytes(SMALL, &base);
+        let items: Vec<Item> = (0..64).map(|i| a.calc_dataset_item(i)).collect();
+        for at in [0usize, 30, SEED_TEXT_LEN / 2, SEED_TEXT_LEN - 30, SEED_TEXT_LEN - 1] {
+            let mut text = base.clone();
+            text[at] ^= 1;
+            let b = SeedText::from_bytes(SMALL, &text);
+            let changed = (0..64).filter(|&i| b.calc_dataset_item(i) != items[i]).count();
+            assert!(changed >= 1, "byte {at}: no item of 64 changed");
+        }
+    }
 }

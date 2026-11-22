@@ -738,10 +738,9 @@ fn a_wallet_is_made_again_from_its_words() {
 /// from it the leaves its blocks commit to and then the file itself;
 /// and when the votes of the first hundred and forty-four blocks are
 /// counted, both say the same file is in force, and the mode it names.
-#[cfg(all(unix, feature = "dev"))]
-#[cfg_attr(debug_assertions, ignore = "proves blocks; run with --release")]
 // (A vote is decided over 144 blocks, and every block here is proven:
 // an hour and more of every core. Run when asked for.)
+#[cfg(all(unix, feature = "dev"))]
 #[ignore = "proves 144 blocks; run with --release -- --ignored"]
 #[test]
 fn a_consensus_file_is_voted_for_and_followed() {

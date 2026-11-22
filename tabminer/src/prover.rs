@@ -1742,6 +1742,11 @@ pub(crate) mod tests {
         let mut other = bytes.clone();
         other[0] ^= 1;
         assert!(Parts::from_bytes(&other).is_none());
+        // Every count in it at the values of its bounds: read without
+        // failing, as itself or as nothing or as another.
+        let (fields, panicked, _) =
+            crate::codec::sweep_fields(&bytes, |b| Parts::from_bytes(b).map(|read| read != parts));
+        assert!(fields >= 4 && panicked.is_empty(), "{fields} counts: {panicked:#?}");
         // Sizes that are no sizes.
         let at = 8 + parts.shapes.len() * 32 * (1 + PROGRAMS) + 64;
         let mut other = bytes.clone();
@@ -1811,5 +1816,32 @@ pub(crate) mod tests {
         assert!(!verifier.verify(&of_other, &[]));
         let unchecked = verifier.unchecked();
         assert!(unchecked.is_unchecked() && unchecked.verify(&statement, &[]));
+    }
+
+    /// A block with as many of each operation on names as a block may
+    /// have, and as many sweeps, is one a run of the main network holds:
+    /// what the chain allows of them and what a proof has room for are
+    /// said in two places, and the first is not to pass the second. (And
+    /// the two places the chain's limits are written agree; each is a
+    /// count the circuit keeps as a bit of a word.)
+    #[test]
+    fn a_block_at_every_limit_fits_a_run() {
+        use crate::name::OpKind;
+        let limits = [OpKind::Commit, OpKind::Reveal, OpKind::Update, OpKind::Sweep].map(OpKind::cap);
+        let said = [crate::registry::MAX_COMMITS, crate::registry::MAX_REVEALS, crate::registry::MAX_UPDATES];
+        assert_eq!((limits[..3].to_vec(), limits[3]), (said.to_vec(), crate::registry::MAX_SWEEPS));
+        assert!(limits.iter().all(|limit| *limit < 32));
+        let ops: usize = limits[..3].iter().sum();
+        for log in Level::MAINNET.runs {
+            // By themselves, after the reward; and after transactions
+            // that fill runs before them, in a last run of their own.
+            let alone = grouped(u64::MAX >> 24, &[], ops, limits[3], 1 << log).expect("a run holds them");
+            assert_eq!(alone.len(), 1, "a run of 2^{log} rows");
+        }
+        // They are less than half of the smallest: a block's last run
+        // has room for transactions beside them.
+        let tail = ops * (14 + signed::DEPTH + 2 * OUTPUTS_HEIGHT + 2 * crate::registry::HEIGHT)
+            + limits[3] * (2 + 2 * OUTPUTS_HEIGHT);
+        assert!(2 * tail < 1 << Level::MAINNET.runs[0], "{tail} rows");
     }
 }

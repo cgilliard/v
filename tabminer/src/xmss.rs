@@ -643,4 +643,34 @@ mod tests {
         // The same seed at another height is another key, root and all.
         assert_ne!(a.public_key().root, key(1, 3).public_key().root);
     }
+
+    /// A key whose every leaf has signed is stored and read as that:
+    /// it signs nothing more. And what is printed of a key, for whoever
+    /// looks into what went wrong, says nothing of its secret.
+    #[test]
+    fn a_key_used_up_stays_used_up_and_a_key_printed_keeps_its_secret() {
+        let mut sk = key(7, 2);
+        for i in 0..sk.leaves() {
+            sk.sign(&[i as u8; 32]).unwrap();
+        }
+        assert_eq!(sk.remaining(), 0);
+        let mut again = SecretKey::from_bytes(&sk.to_bytes()).unwrap();
+        assert_eq!((again.remaining(), again.next_index()), (0, 4));
+        assert_eq!(again.sign(b"one more"), Err(Error::KeyExhausted));
+        // (A leaf past the tree's last, by one or by many, is no key's.)
+        for next in [5u64, u64::MAX] {
+            let mut bad = sk.to_bytes();
+            bad[OUT_LEN + PUB_SEED_LEN..SecretKey::SIZE - 1].copy_from_slice(&next.to_le_bytes());
+            assert!(SecretKey::from_bytes(&bad).is_err(), "next leaf {next}");
+        }
+        let fresh = key(7, 2);
+        let text = format!("{fresh:?}");
+        assert!(text.contains("height: 2") && text.contains("next_index: 0") && text.contains("public_key"), "{text}");
+        assert!(!text.contains("sk_seed"), "{text}");
+        // (Nor its bytes, however they would be written.)
+        let secret = fresh.to_bytes()[..OUT_LEN].to_vec();
+        let listed = format!("{secret:?}");
+        let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!text.contains(&listed[1..listed.len() - 1]) && !text.contains(&hex), "{text}");
+    }
 }

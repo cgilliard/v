@@ -2531,6 +2531,33 @@ mod tests {
         }
     }
 
+    /// A proof comes from whoever cares to send one. Every count,
+    /// length and index its bytes hold is set in turn to the values at
+    /// its bounds: none of them makes the reading or the checking fail
+    /// otherwise than by refusing, and none gives another proof that
+    /// verifies.
+    #[test]
+    fn a_proof_s_counts_are_not_taken_on_trust() {
+        let (circuit, rows) = (blake3_circuit(), 128);
+        let params = Params::plain(variables(&circuit, rows), 2, 10, 4);
+        let domain = Domain::new(params.k(), true);
+        let (proof, _) = prove(&circuit, &params, &domain, witness(&circuit, rows));
+        let bytes = proof.to_bytes();
+        assert_eq!(Proof::from_bytes(&bytes).as_ref(), Some(&proof));
+        let (fields, panicked, accepted) = crate::codec::sweep_fields(&bytes, |b| {
+            let read = Proof::from_bytes(b)?;
+            Some(read != proof && verify(&circuit, &params, &domain, rows, &read).is_some())
+        });
+        assert!(fields > 4, "{fields} counts found");
+        assert!(panicked.is_empty(), "{panicked:#?}");
+        assert!(accepted.is_empty(), "{accepted:#?}");
+        // Cut short anywhere, or with more after it, it is no proof.
+        for cut in [0, 1, 31, 32, 36, bytes.len() / 2, bytes.len() - 1] {
+            assert!(Proof::from_bytes(&bytes[..cut]).is_none(), "cut at {cut}");
+        }
+        assert!(Proof::from_bytes(&[&bytes[..], &[0]].concat()).is_none());
+    }
+
     /// A circuit of multiplications: elements `x`, `y`, `z`, `w`, `v`
     /// and a word `t`, with `x y = z`, `(z of the row before + x) y = w`,
     /// `(x + C) D = v` for constants, and `x & y = t` on their low words.

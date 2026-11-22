@@ -259,4 +259,35 @@ mod tests {
         assert!(Reader(&w.0).digests().is_none());
         assert!(Reader(&[1, 0, 0]).u32().is_none());
     }
+
+    /// The tests' sweep finds every count a decoder reads and tries the
+    /// values at its bounds: a decoder that trusts one is found out.
+    #[test]
+    fn the_sweep_finds_a_trusted_count() {
+        let mut w = Writer::default();
+        w.digests(&[[1; 32], [2; 32], [3; 32]]);
+        w.u32(9);
+        let bytes = w.finish();
+        let fields = u32_fields(&bytes, |b| {
+            let mut r = Reader(b);
+            let _ = (r.digests(), r.u32());
+        });
+        assert_eq!(fields, vec![0, 100]);
+        // A careful decoder: nothing but the bytes it was given decodes.
+        let careful = |b: &[u8]| {
+            let mut r = Reader(b);
+            let (v, n) = (r.digests()?, r.u32()?);
+            (r.is_empty() && v.len() == 3 && n == 9).then_some(false)
+        };
+        let (found, panicked, accepted) = sweep_fields(&bytes, careful);
+        assert_eq!((found, panicked.len(), accepted.len()), (2, 0, 0));
+        // One that accepts any count, and one that indexes by it.
+        let (_, panicked, accepted) = sweep_fields(&bytes, |b| Reader(&b[100..]).u32().map(|_| true));
+        assert!(panicked.is_empty() && accepted.len() >= 10);
+        let (_, panicked, _) = sweep_fields(&bytes, |b| {
+            let n = Reader(&b[100..]).u32()? as usize;
+            Some([0u8; 16][n] == 1)
+        });
+        assert!(!panicked.is_empty());
+    }
 }
