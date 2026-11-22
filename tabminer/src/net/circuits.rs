@@ -81,8 +81,13 @@ pub const TAKEN: u8 = 15;
 pub const REPLY: u8 = 16;
 pub const ANSWER: u8 = 17;
 /// How long a way may leave what was said along it unanswered before
-/// it is taken to go nowhere any more: a relay of it is gone.
-pub const ANSWERED_WITHIN: Micros = 4 * SECOND;
+/// it is taken to go nowhere any more: a relay of it is gone. Several
+/// times what an answer takes there and back over three relays with a
+/// slow link among them (a hop by satellite is more than half a second
+/// each way): a way given up too soon is made again over the same
+/// links. What it costs is how soon a relay that is gone is known to
+/// be.
+pub const ANSWERED_WITHIN: Micros = 10 * SECOND;
 /// What whoever sends to a wallet says to a node that wallet is
 /// reached at: "what does the wallet of this id announce?", answered
 /// with the announcement, or with the id if the wallet is not there;
@@ -466,7 +471,7 @@ pub const OPENING: Micros = 10 * SECOND;
 /// And how long its first relay may take to answer: that is one
 /// asking and one answer, and a relay that leaves it so long is not
 /// there.
-pub const FIRST_ANSWER: Micros = 3 * SECOND;
+pub const FIRST_ANSWER: Micros = 5 * SECOND;
 
 /// The ways this node opened, and what has come back along them.
 #[derive(Default)]
