@@ -154,6 +154,8 @@ pub const MAX_TX_SIZE: usize = 2 << 20;
 pub const DEFAULT_CAPACITY: usize = 64 << 20;
 /// Shelved transactions kept, at most.
 const SHELF: usize = 1024;
+/// And, by their size, no more than this part of the pool's capacity.
+const SHELF_PART: usize = 4;
 /// Base units a unit of weight ([`Weights`]) that a transaction must pay
 /// to be pooled at all, by default: so that relaying a signature, and
 /// adding to the set of outputs every node keeps, costs something
@@ -985,13 +987,9 @@ impl Mempool {
         if claims.iter().any(|c| self.claims.get(c).is_some_and(|holder| !conflicts.contains(holder))) {
             return Err(Reject::NameConflict);
         }
-        // Signatures last: they are most of the cost, and an input naming
-        // an output the state does not hold, which anyone can sign with a
-        // key of their own, is turned away above for a lookup.
-        if !tx.verify_signatures() {
-            return Err(Reject::BadSignature);
-        }
-        tx.check_policy_inputs(height, |p| made_at(ledger, p)).map_err(Reject::Policy)?;
+        // What it pays to take the place of others, before its
+        // signatures are looked at: one that pays too little is turned
+        // away for an addition, however often it is sent.
         if !conflicts.is_empty() {
             let replaced: u64 = conflicts.iter().map(|id| self.txs[id].fee).sum();
             let min = replaced.saturating_add(self.policy.replacement_per_unit.saturating_mul(weight));
@@ -999,6 +997,17 @@ impl Mempool {
                 return Err(Reject::ReplacementFee { min });
             }
         }
+        // (And one the pool could never hold.)
+        if size > self.capacity {
+            return Err(Reject::Full);
+        }
+        // Signatures last: they are most of the cost, and an input naming
+        // an output the state does not hold, which anyone can sign with a
+        // key of their own, is turned away above for a lookup.
+        if !tx.verify_signatures() {
+            return Err(Reject::BadSignature);
+        }
+        tx.check_policy_inputs(height, |p| made_at(ledger, p)).map_err(Reject::Policy)?;
         self.next_order += 1;
         let entry = Entry { bytes: bytes.to_vec(), txid, fee, weight, arrived, order, claims };
         // Replaced transactions go first, so their room counts; they are
@@ -1107,7 +1116,12 @@ impl Mempool {
                     break;
                 }
             }
-            if out || (tx.counts().ops > 0 && check_ops(&tx, ledger, height).is_err()) {
+            // (And one whose policy's conditions the chain no longer
+            // meets, as it is now: a block could not hold it, and the
+            // choosing of every block would find that out anew.)
+            let unmet =
+                || tx.counts().policy_inputs > 0 && tx.check_policy_inputs(height, |p| made_at(ledger, p)).is_err();
+            if out || (tx.counts().ops > 0 && check_ops(&tx, ledger, height).is_err()) || unmet() {
                 gone.push(e.txid);
             }
         }
@@ -1136,6 +1150,17 @@ impl Mempool {
             let excess = self.shelf.len() - SHELF;
             self.shelf.drain(..excess);
         }
+        // (And no more of them, by their size, than a part of what the
+        // pool may hold: they are held beside it, and gone through at
+        // every block.)
+        let most = self.capacity / SHELF_PART;
+        let mut held: usize = self.shelf.iter().map(Entry::size).sum();
+        let mut first = 0;
+        while held > most && first < self.shelf.len() {
+            held -= self.shelf[first].size();
+            first += 1;
+        }
+        self.shelf.drain(..first);
         let mut back = 0;
         let mut keep = Vec::with_capacity(self.shelf.len());
         for mut e in std::mem::take(&mut self.shelf) {

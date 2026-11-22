@@ -113,6 +113,8 @@ pub struct Counts {
     /// Objects fetched whole, and fetches given up.
     pub fetched: u64,
     pub fetches_failed: u64,
+    /// Fetches given up for coming too slowly.
+    pub fetches_slow: u64,
     /// Headers kept that were new.
     pub headers: u64,
     /// Blocks that joined the chain here, and blocks refused.
@@ -135,6 +137,7 @@ impl Counts {
         self.forks_asked += o.forks_asked;
         self.fetched += o.fetched;
         self.fetches_failed += o.fetches_failed;
+        self.fetches_slow += o.fetches_slow;
         self.headers += o.headers;
         self.blocks += o.blocks;
         self.blocks_refused += o.blocks_refused;
@@ -516,6 +519,9 @@ pub(crate) struct List {
     /// not served asks again later and later, not as fast as it is told
     /// no.
     pub(crate) rejoin: (Micros, u32),
+    /// Until when no chain that leaves ours under where ours can be
+    /// undone to is gone into: one was, lately.
+    pub(crate) deep: Micros,
     /// What is being fetched, and of whom: whoever begins a fetch of
     /// something the node is after says so here, so that nobody else
     /// fetches the same, and so that how many are under way is known
@@ -542,6 +548,7 @@ impl List {
             held: Vec::new(),
             join: None,
             rejoin: (0, 0),
+            deep: 0,
             fetching: Vec::new(),
             views: vec![View::default(); workers],
             syncing: false,
@@ -3204,6 +3211,30 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             self.peers.failed(&from, now);
             return;
         }
+        // Nor a chain higher than any could be by now: what a peer says
+        // of its height is its own word, and the runs of headers to
+        // ask for are counted from it.
+        let params = self.chain.params();
+        let since = self.unix.saturating_add(params.max_future_drift).saturating_sub(params.genesis_timestamp);
+        let most = params.final_height().min(since.saturating_mul(8).min(u32::MAX as u64) as u32);
+        if tip.1 > most {
+            self.peers.failed(&from, now);
+            return;
+        }
+        // A chain that leaves ours under where ours can be undone to is
+        // one this node could only take whole, and its headers are kept
+        // whatever becomes of it: one such is gone into at a time, and
+        // not another for as long as a peer is passed over. (Headers
+        // from an old block cost whoever makes them next to nothing,
+        // and there is no end of them.)
+        let ours = self.chain.tip().map_or(0, |tip| tip.height);
+        if height.saturating_add(self.chain.keep() as u32) < ours {
+            if now < l.deep {
+                self.peers.failed(&from, now);
+                return;
+            }
+            l.deep = now.saturating_add(self.cfg.sync.pass_over);
+        }
         let run = self.cfg.sync.headers as u32;
         l.aim = Some(Aim {
             tip: tip.0,
@@ -3520,7 +3551,16 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 later.append(&mut self.tx_wanted);
                 break;
             }
-            if self.fetches.iter().any(|f| f.object == Object::Tx(id)) || self.shared.pool().contains(&id) {
+            if self.shared.pool().contains(&id) {
+                continue;
+            }
+            // Being fetched of another that said it had it: this one
+            // waits, and is asked if nothing the pool takes comes of
+            // that. (Whoever says first that it has a transaction, and
+            // then sends none, or one the pool refuses, would else be
+            // the only one ever asked for it.)
+            if self.fetches.iter().any(|f| f.object == Object::Tx(id)) {
+                later.push_back((id, from, len));
                 continue;
             }
             if self.fetches.iter().filter(fetching).filter(|f| f.from == from).count() >= TX_FETCHES_EACH {
@@ -4254,15 +4294,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // The block's body is its header's, but its proof is not
             // under the header, and where its outputs end is the
             // manifest's word: one of the two failed, and which is not
-            // known. Both are asked for again, of others, and both who
-            // served them are struck: one peer's fault, unless one
-            // after another fails the same way.
+            // known. Both are asked for again, of others. Whoever
+            // served both is struck, the fault being its own; where two
+            // served them neither is, for one of them did nothing
+            // wrong, and a peer that served one false piece would else
+            // have those that served the true ones struck beside it,
+            // time after time, until they were refused.
             Err(_) => {
                 let mut served: Vec<SocketAddrV4> = join.manifest.take().map(|(_, from)| from).into_iter().collect();
                 served.extend(join.block.take().map(|(_, from)| from).filter(|from| !served.contains(from)));
+                let alone = served.len() == 1;
                 for from in served {
                     join.unserved.push(from);
-                    self.tell(now, from, Notice::Strike(from));
+                    if alone {
+                        self.tell(now, from, Notice::Strike(from));
+                    }
                 }
                 join.refused += 1;
                 if join.refused >= self.cfg.sync.snapshot_attempts {
@@ -4474,6 +4520,37 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut i = 0;
         while i < self.fetches.len() {
             let (object, from) = (self.fetches[i].object, self.fetches[i].from);
+            // What is fetched for the chain, and comes too slowly, is
+            // given up as if nothing had come: asked of another, and
+            // this peer passed over.
+            let slow = {
+                let (rate, grace) = (self.cfg.sync.fetch_rate, self.cfg.sync.fetch_grace);
+                let fetch = &self.fetches[i].fetch;
+                let of_chain = matches!(
+                    object,
+                    Object::Headers { .. }
+                        | Object::Block(_)
+                        | Object::Manifest(_)
+                        | Object::Roots { .. }
+                        | Object::Part { .. }
+                        | Object::Names { .. }
+                );
+                of_chain && rate > 0 && fetch.age(now) >= grace && fetch.rate(now) < rate
+            };
+            if slow {
+                let l = &mut **held.get_or_insert_with(|| write(&list));
+                let failed = self.fetches.swap_remove(i);
+                fetched(&mut l.fetching, &object, &from);
+                self.peers.set_path(&from, failed.fetch.path());
+                self.counts.fetches_slow += 1;
+                // (Of a block or headers, passed over whether it said
+                // it had them or not: it began to send them.)
+                if matches!(object, Object::Headers { .. } | Object::Block(_)) {
+                    self.peers.failed(&from, now);
+                }
+                self.fetch_failed(l, now, object, from, false);
+                continue;
+            }
             match self.fetches[i].fetch.poll(now, &mut ranges) {
                 Poll::Ask(seq) => {
                     // Asked with the token the peer gave us: one that has

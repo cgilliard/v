@@ -284,6 +284,11 @@ impl Fetch {
         bytes * SECOND / now.saturating_sub(self.started).max(1)
     }
 
+    /// How long ago the peer was first asked.
+    pub fn age(&self, now: Micros) -> Micros {
+        now.saturating_sub(self.started)
+    }
+
     /// Takes up a fetch that is not finished, keeping what has arrived:
     /// with the same peer after it was given up for silence, or with
     /// another (whose `path` this is), under a new number. Chunks sent

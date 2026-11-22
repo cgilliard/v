@@ -120,6 +120,15 @@ pub struct Sync {
     pub sync_point: u32,
     /// Parts of that state fetched at once.
     pub parts: usize,
+    /// What is fetched for the chain (headers, a block, a piece of a
+    /// state) comes at this many bytes a second at the least, counted
+    /// once it has been asked for this long: slower, it is given up
+    /// and asked of another. A peer that says first that it has a
+    /// block, and then sends it a little at a time, would else be the
+    /// only one asked for it for as long as it cared to. Zero: however
+    /// slowly.
+    pub fetch_rate: u64,
+    pub fetch_grace: Micros,
     /// Attempts at taking a state before every block is applied
     /// instead.
     pub snapshot_attempts: u32,
@@ -181,6 +190,8 @@ impl Default for Sync {
             lookahead: 32,
             sync_point: 144,
             parts: 32,
+            fetch_rate: 4096,
+            fetch_grace: 30 * SECOND,
             snapshot_attempts: 4,
             leaves_retry: 2 * SECOND,
             leaves_tries: 16,
