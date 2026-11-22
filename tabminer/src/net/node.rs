@@ -417,8 +417,11 @@ const GIVERS: usize = 65_536;
 /// How long a relay that did not answer is not gone by.
 const SUSPECT_FOR: Micros = 60 * crate::transport::SECOND;
 /// How long a wallet has to say that a message sent down its way came,
-/// before whoever gave the message is told it did not.
-const DELIVERED_WITHIN: Micros = 2 * crate::transport::SECOND;
+/// before whoever gave the message is told it did not. Long enough for
+/// a way of three relays over slow links there and back (a hop by
+/// satellite is more than half a second each way): told too soon, the
+/// giver sends again by another node what had come.
+const DELIVERED_WITHIN: Micros = 5 * crate::transport::SECOND;
 /// How long a way to one of a wallet's nodes may take to open before
 /// another of its nodes is tried meanwhile: less than the time a way
 /// that is not answered is given up after
