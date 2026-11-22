@@ -3951,6 +3951,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if height > best.height {
             return false;
         }
+        // Never back: the chain here is on the best header's branch and
+        // at that block or past it. Its state is later than the one
+        // that would be taken, and what it lacks is the blocks after
+        // its own last, which it waits for. (A header whose block
+        // nobody has, announced by a node that then went away, would
+        // else send every node of a network back by that many blocks,
+        // each taking from the others the state they all had before.)
+        if !self.chain.receiving()
+            && let Ok(tip) = self.chain.tip()
+            && tip.height >= height
+            && matches!(self.chain.ancestor(&best, tip.height), Ok(Some(same)) if same.hash() == tip.hash())
+        {
+            return false;
+        }
         let Ok(Some(mut target)) = self.chain.ancestor(&best, height) else {
             return false;
         };

@@ -335,7 +335,7 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
     }
     let began = Instant::now();
     let state = chain.whole()?;
-    let (witness, start_at, chained) = {
+    let (witness, start_at, roots, next) = {
         let snap = state.snapshot()?;
         // (The state of the block being built on, or it has moved on.)
         // (The state before the first block is of no block.)
@@ -362,9 +362,14 @@ pub fn mine_with<B: Backend + 'static, S: ItemSource + Sync>(
             ops: [EMPTY; 2],
             done: [EMPTY; 2],
         };
-        (witness, record, before(chain, setup, &tip, &roots, next)?)
+        (witness, record, roots, next)
     };
     drop(state);
+    // (Asked of the chain once its state is let go of: to ask the
+    // chain while holding its state is to take what keeps it twice,
+    // which waits for ever on anyone waiting to write between the
+    // two.)
+    let chained = before(chain, setup, &tip, &roots, next)?;
     // The body, without its proof: what the header is of, and what the
     // proof is to state.
     let mut body = Body {

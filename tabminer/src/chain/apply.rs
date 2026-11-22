@@ -867,7 +867,8 @@ pub(crate) mod tests {
         let b2 = extend(&theirs, &Body { ops, ..body(&[], &[out(21, PAY)]) });
         let b3 = extend(&theirs, &body(&[], &[out(22, PAY)]));
         let b4 = extend(&theirs, &body(&[], &[out(23, PAY)]));
-        let before = (ours.tip().unwrap(), ours.state().root(), ours.state().file().space().0);
+        let space = ours.state().file().space().0;
+        let before = (ours.tip().unwrap(), ours.state().root(), space);
         assert_eq!(apply(&ours, &b1), Ok(Applied::Side));
         assert_eq!(apply(&ours, &b2), Ok(Applied::Side));
         // With the third the branch has more work, and is tried.

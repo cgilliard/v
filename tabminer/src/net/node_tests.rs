@@ -1341,6 +1341,36 @@ fn the_state_is_taken_only_when_blocks_cannot_be_had() {
     assert_eq!((tip(&w, 2).height, w.best(2).height, w.nodes[2].counts().states), (0, KEEP as u32 + 16, 0));
 }
 
+/// A header whose block nobody has sends no node back: nodes that are
+/// at the block before it, and hear of it from a node that then goes
+/// away, keep the state they have and wait. They do not take from each
+/// other the state as of a block under their own last.
+#[test]
+fn a_header_whose_block_nobody_has_sends_no_node_back() {
+    let first = chain_of(easy());
+    let made = grow_wide(&first, 30, 20, 1);
+    let second = chain_of(easy());
+    give(&second, &made);
+    // The header of a block after their last, which neither has.
+    let other = chain_of(easy());
+    give(&other, &made);
+    let next = next_block(&other, 7, true);
+    let header = *BlockRef::from_bytes(&next).unwrap().header();
+    for chain in [&first, &second] {
+        assert_eq!(chain.accept_header(&header, NOW), Ok(true));
+    }
+    let mut w = World::with(vec![first, second], &joining());
+    w.nodes[0].add_peer(at(1), false, 0);
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(60 * SECOND);
+    for i in 0..2 {
+        assert_eq!((tip(&w, i).height, w.best(i).height), (30, 31), "node {i}");
+        let c = w.nodes[i].counts();
+        assert_eq!((c.states, c.states_moved), (0, 0), "node {i}");
+        assert!(w.nodes[i].list().join.is_none() && !w.nodes[i].chain().receiving(), "node {i}");
+    }
+}
+
 /// A peer that serves pieces of the state that are not the state is
 /// struck for each, and the pieces come from another.
 #[test]

@@ -142,8 +142,9 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     }
 
     /// What the chain is kept in, to read.
-    pub(crate) fn store(&self) -> RwLockReadGuard<'_, Store<B>> {
-        self.store.read().unwrap_or_else(|e| e.into_inner())
+    pub(crate) fn store(&self) -> Held<'_, B> {
+        let once = Once::taking(&self.store as *const RwLock<Store<B>> as usize);
+        Held { guard: self.store.read().unwrap_or_else(|e| e.into_inner()), _once: once }
     }
 
     /// The same, to put another in its place.
@@ -292,7 +293,66 @@ impl<B: Backend + 'static> ReadPages for View<'_, B> {
 
 /// A chain's state, held to be read: while it is, the state is not
 /// given up for another.
-pub struct StateRef<'a, B: Backend + 'static>(RwLockReadGuard<'a, Store<B>>);
+pub struct StateRef<'a, B: Backend + 'static>(Held<'a, B>);
+
+/// A chain's store, held to be read.
+///
+/// A thread holds it once. To take it again while holding it (to ask
+/// the chain for something while holding its state, say) waits for ever
+/// on anyone who came to write between the two: the writer waits for
+/// the first to be let go of, and the second waits behind the writer.
+/// Nothing of that shows until a writer comes at that moment, so a
+/// build with debug assertions refuses the second taking outright.
+pub(crate) struct Held<'a, B: Backend + 'static> {
+    guard: RwLockReadGuard<'a, Store<B>>,
+    _once: Once,
+}
+
+impl<B: Backend + 'static> std::ops::Deref for Held<'_, B> {
+    type Target = Store<B>;
+
+    fn deref(&self) -> &Store<B> {
+        &self.guard
+    }
+}
+
+/// That this thread holds a store, by where the store is: for as long
+/// as this lives. Nothing, without debug assertions.
+struct Once(#[cfg(debug_assertions)] usize);
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static HELD: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Once {
+    #[cfg(debug_assertions)]
+    fn taking(store: usize) -> Once {
+        HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            assert!(!held.contains(&store), "a chain's store is taken to be read by a thread that holds it already");
+            held.push(store);
+        });
+        Once(store)
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn taking(_: usize) -> Once {
+        Once()
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for Once {
+    fn drop(&mut self) {
+        HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(at) = held.iter().rposition(|s| *s == self.0) {
+                held.swap_remove(at);
+            }
+        });
+    }
+}
 
 impl<B: Backend + 'static> std::ops::Deref for StateRef<'_, B> {
     type Target = State<B>;

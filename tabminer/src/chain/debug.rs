@@ -170,6 +170,8 @@ mod tests {
         let snap = state.snapshot().unwrap();
         assert!(!snap.is_unspent(5).unwrap() && snap.is_unspent(10).unwrap() && !snap.is_unspent(50_000).unwrap());
         assert_eq!(snap.tip().0, 3);
+        drop(snap);
+        drop(state);
         // A node with only the root is a node of the same chain, with
         // nothing in it.
         let other = open();

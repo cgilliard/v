@@ -349,7 +349,8 @@ mod tests {
         // branch from the first block up.
         assert!(!node.receiving());
         assert_eq!(node.tip().unwrap(), at);
-        assert_eq!((node.state().root(), node.state().tip()), (at.state_root, (20, at.hash())));
+        let root = node.state().root();
+        assert_eq!((root, node.state().tip()), (at.state_root, (20, at.hash())));
         for h in [1u32, 7, 20] {
             assert_eq!(node.header_at(h).unwrap(), Some(headers[h as usize - 1]));
         }
