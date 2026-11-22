@@ -676,6 +676,43 @@ impl Witness {
     }
 }
 
+/// Tests: the words of a witness that hold up nothing. Each word of the
+/// rows `tried` (a word a row, of the circuit's own: what a prover is
+/// free to write) has one bit changed, `bit(row, word)` of it, and every
+/// constraint and multiplication of that row and of the row after is
+/// held to what results: the row and word of each change that all of
+/// them still take. A word that can be changed so says nothing the
+/// circuit hears, on that row at the least; whether that is as meant
+/// (a word a kind of row has no use for) is for whoever reads the list.
+#[cfg(test)]
+pub(crate) fn freedoms(
+    circuit: &Circuit,
+    witness: &Witness,
+    fixed: &Fixed,
+    tried: &[usize],
+    bit: impl Fn(usize, usize) -> u32,
+) -> Vec<(usize, usize)> {
+    let (rows, wc) = (witness.rows, 1usize << circuit.log_cols);
+    let mut words = witness.words.clone();
+    let holds = |words: &[u32], i: usize| {
+        let at = circuit.words(words, fixed, i, rows);
+        circuit.constraints.iter().all(|[a, b, c]| a.eval(&at) & b.eval(&at) == c.eval(&at))
+            && circuit.products.iter().all(|[x, y, z]| x.eval(&at) * y.eval(&at) == z.eval(&at))
+    };
+    let mut free = Vec::new();
+    for &i in tried {
+        assert!(holds(&words, i) && holds(&words, (i + 1) % rows), "row {i} of a witness that does not hold");
+        for col in 0..circuit.cols {
+            words[i * wc + col] ^= 1 << (bit(i, col) % 32);
+            if holds(&words, i) && holds(&words, (i + 1) % rows) {
+                free.push((i, col));
+            }
+            words[i * wc + col] ^= 1 << (bit(i, col) % 32);
+        }
+    }
+    free
+}
+
 /// Inputs of [`compress_row`]: the chaining value, the block, and the
 /// counter's two words, the block's length and the flags.
 pub const COMPRESS_INPUTS: usize = 28;

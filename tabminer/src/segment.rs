@@ -3087,4 +3087,57 @@ mod tests {
             p.proof.size() / 1000
         );
     }
+
+    /// No word of a run's rows holds up nothing, but one that is meant
+    /// to: a bit of each word of a row of every kind there is, in a run
+    /// of payments and in one of names, is changed, and some constraint
+    /// of that row or the next refuses it. A word that could be changed
+    /// unseen is one a prover may write as it likes: a rule that was
+    /// meant and is not there.
+    ///
+    /// The one word that may be: the key of a hash's domain, on a row
+    /// that goes on with the hash of the row before and has none.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow unoptimized")]
+    fn no_word_of_a_row_is_left_to_the_prover() {
+        let c = circuit();
+        let n = named();
+        let wc = 1usize << c.log_cols;
+        let runs = [run_of(&a_scene(), |_, _| {}).0, named_run(&n, true).0];
+        let mut kinds = std::collections::BTreeSet::new();
+        for run in runs {
+            let (rows, program, public) = run.finish(128);
+            let fixed = Fixed { program: &program, public: &public };
+            let w = Witness::new(&c, rows.len(), |c| self::run(c), |i| rows[i], &fixed);
+            assert!(w.holds());
+            // Where the domain's key is among a row's words: the word
+            // that changes with it.
+            let at = FRONT + KINDS;
+            let mut other = rows.clone();
+            other[0][at] ^= 1;
+            let changed = Witness::new(&c, rows.len(), |c| self::run(c), |i| other[i], &fixed);
+            let domain: Vec<usize> = (0..c.cols).filter(|col| changed.words[*col] != w.words[*col]).collect();
+            assert_eq!(domain.len(), 1);
+            // The first row of each kind.
+            let kind_of = |row: &[u32; INPUTS]| (0..KINDS).find(|k| row[FRONT + k] != 0).expect("a kind");
+            let mut first = std::collections::BTreeMap::new();
+            for (i, row) in rows.iter().enumerate() {
+                first.entry(kind_of(row)).or_insert(i);
+            }
+            kinds.extend(first.keys().copied());
+            let tried: Vec<usize> = first.values().copied().collect();
+            for bit in [0u32, 13, 31] {
+                for (i, col) in crate::circuit::freedoms(&c, &w, &fixed, &tried, |_, _| bit) {
+                    let kind = kind_of(&rows[i]);
+                    let meant = col == domain[0] && SPECS[kind].goes_on && SPECS[kind].domain.is_none();
+                    assert!(meant, "bit {bit} of word {col} of a row of kind {kind} (row {i}) holds up nothing");
+                }
+            }
+            // (And the words past a row's own are nobody's: of nothing.)
+            assert!(w.words.chunks(wc).all(|row| row[c.cols..].iter().all(|word| *word == 0)));
+        }
+        // Fifty and more of the kinds there are were among them: all
+        // but those of a policy's spend.
+        assert!(kinds.len() >= 50, "{} kinds", kinds.len());
+    }
 }
