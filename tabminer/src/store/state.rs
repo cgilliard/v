@@ -84,8 +84,8 @@ pub fn empty_state() -> Digest {
     compress(super::sparse::empty(super::sparse::HEIGHT), &super::names::empty_root())
 }
 
-/// How a root record of this making begins. (1 was of blocks kept as
-/// chains of pages, each naming the next: [`super::blob`].)
+/// How a root record of this making begins. (1 was of blocks and their records kept
+/// as chains of pages, each naming the next: [`super::blob`].)
 const VERSION: u8 = 3;
 /// What records of makings before this one began with.
 const OLDER: [u8; 1] = [1];

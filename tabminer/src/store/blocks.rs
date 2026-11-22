@@ -15,7 +15,7 @@
 //!   take, whose bodies are still to come.
 //! - The **bodies**: by height and id, a block's body and the leaves
 //!   its header's auxiliary bytes commit to. They are megabytes, kept as
-//!   chains of pages ([`super::blob`]), and dropped when the block is
+//!   pages and a list of them ([`super::blob`]), and dropped when the block is
 //!   older than any reorganisation reaches: freed space, used again.
 //! - The **files**: by SHA-256, the consensus files held.
 //! - A few bytes of the chain's own ([`CHAIN_BYTES`]), which the store

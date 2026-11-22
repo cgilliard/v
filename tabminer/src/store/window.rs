@@ -18,10 +18,13 @@
 //! The records are pages of the state's file like any others, written in
 //! the block's transaction and reached from the root record through one
 //! page that lists them. Only that list is held in memory (sixteen bytes
-//! a block); a record is read when its block is undone.
+//! a block); a record is read when its block is undone. A record too
+//! long for one page is cut into pages, and its first page lists them:
+//! a file opened finds a record's pages by one page read, and reads
+//! none of what is long.
 //!
 //! ```text
-//! record page := next page (6) | bytes
+//! first page  := 0 | record, if it fits; else 1 | page (6) ...
 //! record      := height (4) | block (32) | block before (32)
 //!                | first new position (8) | spends (4) | distance (varint) ...
 //!                | names registered (2) | key (16) ...
@@ -49,9 +52,13 @@ const KEY_BYTES: usize = KEY_BITS / 8;
 
 /// The most blocks a window holds: what one page lists.
 pub const MAX_BLOCKS: usize = (Extent::capacity(MAX_UNITS) - 2) / 10;
-/// Bytes of a record a page holds, after the next page's place.
-const CHUNK: usize = Extent::capacity(MAX_UNITS) - 6;
+/// Bytes of a record a page holds.
+const CHUNK: usize = Extent::capacity(MAX_UNITS);
 const NONE: Extent = Extent { start: 0, units: 0 };
+/// What a record's first page begins with: the record follows, whole.
+const WHOLE: u8 = 0;
+/// The same: the places of its pages follow.
+const LISTED: u8 = 1;
 
 fn corrupt(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
@@ -257,47 +264,59 @@ impl BlockRecord {
         })
     }
 
-    /// Writes the record as a chain of pages and returns the first.
+    /// Writes the record as pages and returns the first.
     fn write<B: Backend>(&self, txn: &mut Txn<'_, B>) -> io::Result<Extent> {
         let bytes = self.to_bytes();
-        // The last page first: each names the one after it.
-        let mut next = NONE;
-        let mut page = Vec::with_capacity(6 + CHUNK.min(bytes.len()));
-        for chunk in bytes.chunks(CHUNK).rev() {
-            page.clear();
-            put_extent(&mut page, next);
-            page.extend_from_slice(chunk);
-            next = txn.write(&page)?;
+        let mut first = Vec::with_capacity(1 + bytes.len().min(CHUNK));
+        if bytes.len() < CHUNK {
+            first.push(WHOLE);
+            first.extend_from_slice(&bytes);
+        } else {
+            first.push(LISTED);
+            assert!(bytes.len().div_ceil(CHUNK) <= (CHUNK - 1) / 6, "a block's record is not hundreds of megabytes");
+            for chunk in bytes.chunks(CHUNK) {
+                put_extent(&mut first, txn.write(chunk)?);
+            }
         }
-        Ok(next)
+        txn.write(&first)
     }
 
     /// Reads the record whose first page is `first`, and its pages.
     fn read(pages: &impl ReadPages, first: Extent) -> io::Result<(BlockRecord, Vec<Extent>)> {
-        let (mut bytes, mut chain) = (Vec::new(), Vec::new());
-        each_page(pages, first, &mut |e, data| {
-            chain.push(e);
-            bytes.extend_from_slice(data);
-        })?;
-        Ok((BlockRecord::from_bytes(&bytes)?, chain))
+        let mut bytes = Vec::new();
+        let places = places(pages, first, Some(&mut bytes))?;
+        Ok((BlockRecord::from_bytes(&bytes)?, places))
     }
 }
 
-/// Calls `f` with each page of the chain from `first`, and its bytes.
-fn each_page(pages: &impl ReadPages, first: Extent, f: &mut dyn FnMut(Extent, &[u8])) -> io::Result<()> {
+/// The pages of the record whose first page is `first`, that one
+/// among them; and the record's bytes, if `bytes` is given. With none,
+/// only the first page is read.
+fn places(pages: &impl ReadPages, first: Extent, bytes: Option<&mut Vec<u8>>) -> io::Result<Vec<Extent>> {
     let mut buf = vec![0u8; MAX_UNITS as usize * UNIT];
-    let mut at = first;
-    // A chain is a few pages: a record of a block.
-    for _ in 0..1024 {
-        let payload = pages.read_page(at, &mut buf)?;
-        let (next, data) = payload.split_at_checked(6).ok_or_else(|| corrupt("a record's page is not one"))?;
-        f(at, data);
-        at = get_extent(next);
-        if at.units == 0 {
-            return Ok(());
+    let payload = pages.read_page(first, &mut buf)?;
+    match payload.split_first() {
+        Some((&WHOLE, record)) => {
+            if let Some(bytes) = bytes {
+                bytes.extend_from_slice(record);
+            }
+            Ok(vec![first])
         }
+        Some((&LISTED, list)) if !list.is_empty() && list.len() % 6 == 0 => {
+            let mut places = vec![first];
+            places.extend(list.chunks_exact(6).map(get_extent));
+            if places.iter().any(|e| e.units == 0 || e.units > MAX_UNITS) {
+                return Err(corrupt("a record's page is not one"));
+            }
+            if let Some(bytes) = bytes {
+                for place in &places[1..] {
+                    bytes.extend_from_slice(pages.read_page(*place, &mut buf)?);
+                }
+            }
+            Ok(places)
+        }
+        _ => Err(corrupt("a record's first page is not one")),
     }
-    Err(corrupt("a record's pages do not end"))
 }
 
 /// The records of the last blocks, oldest first: the list in memory, the
@@ -364,18 +383,14 @@ impl Window {
             file.mark(list)?;
         }
         for (_, first) in &self.blocks {
-            let mut chain = Vec::new();
-            each_page(file, *first, &mut |e, _| chain.push(e))?;
-            chain.into_iter().try_for_each(|e| file.mark(e))?;
+            places(file, *first, None)?.into_iter().try_for_each(|e| file.mark(e))?;
         }
         Ok(())
     }
 
     /// Frees a record's pages.
     fn drop_record<B: Backend>(txn: &mut Txn<'_, B>, first: Extent) -> io::Result<()> {
-        let mut chain = Vec::new();
-        each_page(txn, first, &mut |e, _| chain.push(e))?;
-        chain.into_iter().for_each(|e| txn.free(e));
+        places(txn, first, None)?.into_iter().for_each(|e| txn.free(e));
         Ok(())
     }
 

@@ -43,7 +43,7 @@
 //! - [`names`]: the names, a trie over the keys of names, hashed by their
 //!   own rule.
 //! - [`window`]: what undoes each of the last blocks.
-//! - [`blob`]: bytes too many for a page, as a chain of pages.
+//! - [`blob`]: bytes too many for a page, as pages and a list of them.
 //! - [`blocks`]: the headers, the bodies kept and the chain by height,
 //!   in tries of the same file.
 //! - [`commits`]: which outputs are commits of names, and of what.
