@@ -1371,6 +1371,75 @@ fn a_header_whose_block_nobody_has_sends_no_node_back() {
     }
 }
 
+/// Nor does a branch whose blocks nobody has, that leaves the chain
+/// under its last block: the state that would be taken is as of a block
+/// of the chain's own, which it is past. Its only peer is behind it,
+/// and holds none of what it lacks.
+#[test]
+fn a_branch_whose_blocks_nobody_has_sends_no_node_back() {
+    let first = chain_of(easy());
+    let made = grow_wide(&first, 30, 20, 1);
+    let behind = chain_of(easy());
+    give(&behind, &made[..20]);
+    // Three blocks on the twenty-eighth, made where nobody sees them:
+    // their headers are known, and more work than the chain's.
+    let other = chain_of(easy());
+    give(&other, &made[..28]);
+    let branch = grow(&other, 3, 9);
+    let headers: Vec<Header> = branch.iter().map(|b| *BlockRef::from_bytes(b).unwrap().header()).collect();
+    assert_eq!(first.accept_headers(&headers, NOW, false), (3, None));
+    let mut w = World::with(vec![first, behind], &joining());
+    w.nodes[0].add_peer(at(1), false, 0);
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.run(60 * SECOND);
+    assert_eq!((tip(&w, 0).height, w.best(0).height), (30, 31));
+    let c = w.nodes[0].counts();
+    assert_eq!((c.states, c.states_moved), (0, 0));
+    assert!(w.nodes[0].list().join.is_none() && !w.nodes[0].chain().receiving());
+    // (And blocks are still made on it: it is behind by blocks that may
+    // never come, not by a state.)
+    assert_ne!(w.nodes[0].hold().behind(), Behind::State);
+    // The one behind it has its blocks from it meanwhile.
+    assert_eq!(tip(&w, 1).height, 30);
+}
+
+/// A peer asked for the headers of a chain another spoke of, which it
+/// has not, says so and is asked no more for them: it is not passed
+/// over for that. Only whoever spoke of a chain answers for it.
+#[test]
+fn a_peer_asked_for_another_s_chain_is_not_passed_over() {
+    let chains: Vec<_> = (0..3).map(|_| chain_of(easy())).collect();
+    grow(&chains[0], 12, 1);
+    grow(&chains[1], 12, 2);
+    let theirs = chains[1].tip().unwrap();
+    let mut w = World::with(chains, &small_runs());
+    // Node 1 says its chain is the most work there is: it is the one
+    // asked where the chains part, and the one aimed at. Node 0's is as
+    // long, and another.
+    w.nodes[1].boast = Some(U256::MAX);
+    w.nodes[2].add_peer(at(0), false, 0);
+    w.nodes[2].add_peer(at(1), false, 0);
+    w.nodes[2].cfg.sync.blocks = 0;
+    w.run(20 * SECOND);
+    let now = w.now;
+    assert_eq!(w.best(2), theirs);
+    assert!(w.nodes[2].table(&at(0)).may_ask(&at(0), now), "the peer on another branch is passed over");
+}
+
+/// The work of headers is left to a proof only far above the chain's
+/// last block: those near it are checked as they come.
+#[test]
+fn work_is_left_to_a_proof_only_far_above_the_chain() {
+    // A node that takes no state, or whose proofs vouch for no work:
+    // of none.
+    assert_eq!((super::defers(0, true, Some(0)), super::defers(144, false, Some(0))), (None, None));
+    // Else of those more than the sync point above the chain's last
+    // block: for a new node, all but the first of them.
+    assert_eq!((super::defers(144, true, Some(250)), super::defers(144, true, Some(0))), (Some(394), Some(144)));
+    // While a state is being received there is no last block.
+    assert_eq!(super::defers(144, true, None), Some(0));
+}
+
 /// A peer that serves pieces of the state that are not the state is
 /// struck for each, and the pieces come from another.
 #[test]

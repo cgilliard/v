@@ -250,6 +250,14 @@ fn the_aged_reserve_goes_to_the_longest_waiting() {
     assert_eq!(ids(pool.select(&state, 2, 0, 0, |_| true)), [high, low, old]);
     // Only while they fit.
     assert_eq!(ids(pool.select(&state, 2, 0, size, |chosen| chosen.len() <= 2)), [old, high]);
+    // One that no block has room for keeps out none of the others: not
+    // the best paying, and not the longest waiting.
+    for unfit in [high, old] {
+        let fits = |chosen: &[TransactionRef<'_>]| chosen.iter().all(|tx| tx.txid() != unfit);
+        let chosen = ids(pool.select(&state, 2, 0, size, fits));
+        assert_eq!(chosen.len(), 2, "without {unfit:?}");
+        assert!(!chosen.contains(&unfit) && chosen.contains(&low));
+    }
     assert_eq!(pool.reserve_wait(0), Some(1));
     // With no reserve nothing is promised to what waits.
     let none = Mempool::with_policy(1 << 20, Policy { reserve_percent: 0, ..Policy::NONE });

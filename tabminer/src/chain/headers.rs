@@ -437,13 +437,32 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
     /// ([`Status::WorkPending`]): checked now only that the mix it
     /// claims meets the target.
     pub fn accept_headers(&self, headers: &[Header], now: u64, defer_work: bool) -> (usize, Option<Error>) {
-        match self.accept_inner(headers, now, defer_work) {
+        self.accept_headers_above(headers, now, defer_work.then_some(0))
+    }
+
+    /// [`Chain::accept_headers`], the work left pending of the headers
+    /// above the height `defer_above`, if one is said, and checked in
+    /// full of the rest: a run that begins near the chain's last block
+    /// and goes on far above it is checked where it is near.
+    pub fn accept_headers_above(
+        &self,
+        headers: &[Header],
+        now: u64,
+        defer_above: Option<u32>,
+    ) -> (usize, Option<Error>) {
+        match self.accept_inner(headers, now, defer_above) {
             Ok(done) => done,
             Err(e) => (0, Some(e)),
         }
     }
 
-    fn accept_inner(&self, headers: &[Header], now: u64, defer_work: bool) -> Result<(usize, Option<Error>), Error> {
+    fn accept_inner(
+        &self,
+        headers: &[Header],
+        now: u64,
+        defer_above: Option<u32>,
+    ) -> Result<(usize, Option<Error>), Error> {
+        let deferred = |h: &Header| defer_above.is_some_and(|above| h.height > above);
         // What each header's rules need of the headers before it, and
         // whether it is kept already. `None` where the parent is neither
         // the header before in the run (itself with a known parent) nor
@@ -479,9 +498,8 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
         }
         let work_ok: Vec<bool> = crate::parallel::par_map_min(headers.len(), 1, |i| {
             let (h, Some(b)) = (&headers[i], before[i]) else { return false };
-            kept[i] || if defer_work { h.quick_pow_check(&b.target) } else { self.full_pow(h, &b.target) }
+            kept[i] || if deferred(h) { h.quick_pow_check(&b.target) } else { self.full_pow(h, &b.target) }
         });
-        let status = if defer_work { Status::WorkPending } else { Status::HeaderOnly };
         let tip_height = self.store().view()?.tip().0;
         let (mut new, mut stop) = (0, None);
         self.write_blocks(|txn, blocks| {
@@ -510,6 +528,7 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
                         };
                         match check(&self.params, h, &parent, b.median, &b.target, now, work_ok[i]) {
                             Ok(work) => {
+                                let status = if deferred(h) { Status::WorkPending } else { Status::HeaderOnly };
                                 let known = Known { header: *h, work, status };
                                 blocks.put_entry(txn, &known.entry())?;
                                 new += 1;
@@ -572,6 +591,11 @@ impl<B: Backend + 'static, V: Sync> Chain<B, V> {
                 h = parent;
             }
             pending.reverse();
+        }
+        // (Nothing pending: nothing to write. This is asked again and
+        // again by a node that waits for blocks.)
+        if pending.is_empty() {
+            return Ok(Ok(0));
         }
         let ok: Vec<bool> =
             crate::parallel::par_map_min(pending.len(), 1, |i| self.full_pow(&pending[i].0, &pending[i].1));
@@ -1048,6 +1072,20 @@ pub(crate) mod tests {
         let strict = open(hard());
         strict.accept_headers(&headers, NOW, false);
         assert_eq!(strict.accept_headers(&branch, NOW, false), (5, Some(Error::BadProofOfWork)));
+        // Kept with the work of those above a height left pending: the
+        // forgery is found if it is at that height or under it, and
+        // not if it is above.
+        let near = open(hard());
+        near.accept_headers(&headers, NOW, false);
+        let forged = branch[5].height;
+        assert_eq!(near.accept_headers_above(&branch, NOW, Some(forged)), (5, Some(Error::BadProofOfWork)));
+        let far = open(hard());
+        far.accept_headers(&headers, NOW, false);
+        assert_eq!(far.accept_headers_above(&branch, NOW, Some(forged - 1)), (12, None));
+        for (i, h) in branch.iter().enumerate() {
+            let want = if i >= 5 { Status::WorkPending } else { Status::HeaderOnly };
+            assert_eq!(far.known(&h.hash()).unwrap().unwrap().status, want, "header {i} of the branch");
+        }
         // Kept pending, all of it, and it is the best.
         assert_eq!(chain.accept_headers(&branch[..8], NOW, true), (8, None));
         assert_eq!(chain.accept_headers(&branch[8..], NOW, false), (4, None));

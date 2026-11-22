@@ -583,8 +583,9 @@ pub const WORKED: u32 = 16;
 ///
 /// With a table (`dataset`) every block's work is done. Without one a
 /// block's work is tens of milliseconds a try, from the seed's text,
-/// and a year of blocks most of a day: so only the last [`WORKED`] have
-/// their work done, and the rest claim work they have not, in a header
+/// and a year of blocks most of a day: so only the first and the last
+/// [`WORKED`] have their work done, and the rest claim work they have
+/// not, in a header
 /// that is otherwise what it should be; the chain is told to take
 /// their word while they are made ([`Chain::debug_trust_work`]). To a
 /// node that takes them as headers, leaving their work to a proof, and
@@ -628,7 +629,10 @@ pub fn extend_empty<B: Backend + 'static>(
             nonce: [0; 32],
         };
         let target = chain.expected_target(&tip)?;
-        let worked = dataset.is_some() || height + WORKED > blocks;
+        // (The first of them too: a node checks in full the work of the
+        // headers nearest its own last block, which for a new node are
+        // the chain's first.)
+        let worked = dataset.is_some() || height <= WORKED || height + WORKED > blocks;
         chain.debug_trust_work(!worked);
         let found = match (dataset, worked) {
             (Some(table), _) => solve(table, &header.pow_hash(), &target, height as u64, &|| false),

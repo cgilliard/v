@@ -226,6 +226,10 @@ impl Weights {
 /// it at the floor, so that nobody fills the set with outputs no one
 /// will spend.
 pub const DUST: u64 = MIN_FEE_PER_UNIT * Weights::DEFAULT.input;
+/// Transactions in a row that a block being chosen has no room for
+/// before it is taken to be full ([`Mempool::select`]).
+const MISFITS: usize = 32;
+
 /// Rows of a proof a policy's input may take
 /// ([`crate::segment::policy_rows`]): an input is within one run of a
 /// block's transactions, whatever else of its transaction is, and the
@@ -1237,6 +1241,7 @@ impl Mempool {
             true
         };
         let mut reserved = 0;
+        let mut misfits = 0;
         for e in self.by_age.values().map(|id| &self.txs[id]) {
             // One too large for the reserve at all waits on its fee, and
             // does not hold the others back.
@@ -1253,16 +1258,27 @@ impl Mempool {
             }
             chosen.push(tx);
             if !fits(&chosen) {
+                // (It, and not the others: one that no block holds, or
+                // that this block has no room left for, does not keep
+                // out those after it. Until so many in a row have not
+                // fitted that the block is taken to be full.)
                 chosen.pop();
                 counts = before;
-                break;
+                misfits += 1;
+                if misfits > MISFITS {
+                    break;
+                }
+                continue;
             }
+            misfits = 0;
             reserved += e.size();
             taken.insert(e.txid);
         }
         let mut entries: Vec<&Entry> = self.txs.values().filter(|e| !taken.contains(&e.txid)).collect();
         entries.sort_by(|a, b| b.rate().cmp(&a.rate()).then(a.age_key().cmp(&b.age_key())));
+        misfits = 0;
         for e in entries {
+            let before = counts;
             let tx = e.tx();
             if !admit(&tx, &mut counts) {
                 continue;
@@ -1270,8 +1286,14 @@ impl Mempool {
             chosen.push(tx);
             if !fits(&chosen) {
                 chosen.pop();
-                break;
+                counts = before;
+                misfits += 1;
+                if misfits > MISFITS {
+                    break;
+                }
+                continue;
             }
+            misfits = 0;
         }
         chosen
     }

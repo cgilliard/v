@@ -159,8 +159,20 @@ struct Fetching {
     fetch: Fetch,
 }
 
+/// The height above which the work of headers is left to a proof, if
+/// any is: where a node takes its state whole (`point` blocks under the
+/// best header, if not 0) and its blocks' proofs vouch for the work
+/// under them, those further above the chain's last block (`tip`; none
+/// while a state is being received) than a state is taken under the
+/// best.
+fn defers(point: u32, attests: bool, tip: Option<u32>) -> Option<u32> {
+    (point > 0 && attests).then(|| tip.map_or(0, |tip| tip.saturating_add(point)))
+}
+
 /// Announcements remembered: who said it had which block.
 const ANNOUNCED: usize = 256;
+/// Peers remembered to have said they lack a block they were asked for.
+const LACKING: usize = 256;
 /// Transactions being fetched at once by one worker, and of one peer:
 /// what a peer can have a node fetch by announcing is bounded by these.
 const TX_FETCHES: usize = 64;
@@ -189,7 +201,7 @@ enum Job {
     /// With `defer` their work is checked only by what each claims,
     /// and in full later, or vouched for by a proof
     /// ([`Chain::accept_headers`]).
-    Headers { first: u32, headers: Vec<Header>, from: SocketAddrV4, unix: u64, defer: bool },
+    Headers { first: u32, headers: Vec<Header>, from: SocketAddrV4, unix: u64, defer: Option<u32> },
     /// The block a state is to be taken as of, to check by its proof.
     Check { block: Vec<u8>, next: u64, roots: (Digest, Digest) },
     /// A state to begin to receive, as of the block of `target`.
@@ -273,7 +285,7 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
             Outcome::Block { header: *view.header(), len: (block.len() - HEADER_SIZE) as u32, from, result }
         }
         Job::Headers { first, headers, from, unix, defer } => {
-            let (new, error) = chain.accept_headers(&headers, unix, defer);
+            let (new, error) = chain.accept_headers_above(&headers, unix, defer);
             Outcome::Headers { first, count: headers.len() as u32, last: headers.last()?.hash(), from, new, error }
         }
         Job::Check { block, next, roots } => {
@@ -434,6 +446,10 @@ pub(crate) struct Join {
     told: Micros,
     /// Manifests that the block's proof refused.
     refused: u32,
+    /// Everyone that can serve it has failed to: when they are asked
+    /// again, and how many times that has come about.
+    again: Option<Micros>,
+    rounds: u32,
     /// Since when no peer has been able to serve it.
     orphaned: Option<Micros>,
 }
@@ -456,6 +472,11 @@ pub(crate) struct Aim {
     /// Who told us of it: asked for its headers though its last ping
     /// said its chain was shorter.
     source: SocketAddrV4,
+    /// Peers that said they have no such headers: not asked again for
+    /// this, and not held to blame for it. Their chains reach the
+    /// height, on another branch: only whoever told us of this one
+    /// answers for it.
+    refused: Vec<SocketAddrV4>,
 }
 
 /// What the node is after, and what is being done about it: the chain
@@ -487,6 +508,11 @@ pub(crate) struct List {
     pub(crate) held: Vec<(Digest, Vec<u8>, SocketAddrV4)>,
     /// The state being taken whole from others, if one is.
     pub(crate) join: Option<Join>,
+    /// When a state may next be begun to be taken, a taking having come
+    /// to nothing; and how many have, one after another. A node that is
+    /// not served asks again later and later, not as fast as it is told
+    /// no.
+    pub(crate) rejoin: (Micros, u32),
     /// What is being fetched, and of whom: whoever begins a fetch of
     /// something the node is after says so here, so that nobody else
     /// fetches the same, and so that how many are under way is known
@@ -512,6 +538,7 @@ impl List {
             sides: VecDeque::new(),
             held: Vec::new(),
             join: None,
+            rejoin: (0, 0),
             fetching: Vec::new(),
             views: vec![View::default(); workers],
             syncing: false,
@@ -1010,6 +1037,9 @@ pub struct Worker<B: Backend + 'static, V> {
     /// Who announced which block, and how long its body is: the newest
     /// last.
     announced: VecDeque<(Digest, SocketAddrV4, u32)>,
+    /// Who said it has not a block it was asked for, having never said
+    /// it had: not asked for that block again.
+    lacking: Vec<(Digest, SocketAddrV4)>,
     /// What came of the fetches asked for from outside
     /// ([`Node::fetch_object`]).
     inbox: Vec<(Object, SocketAddrV4, Option<Vec<u8>>)>,
@@ -1087,6 +1117,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             votes_turn: 0,
             list,
             announced: VecDeque::new(),
+            lacking: Vec::new(),
             inbox: Vec::new(),
             tx_wanted: VecDeque::new(),
             counts: Counts::default(),
@@ -3163,6 +3194,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             next: height + 1,
             keeping: false,
             source: from,
+            refused: Vec::new(),
         });
         l.syncing = true;
         self.shared.say(Event::HeadersWanted { from: height + 1, to: tip.1, peer: from });
@@ -3190,8 +3222,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             let idle = |addr: &SocketAddrV4| {
                 !self.fetches.iter().any(|f| f.from == *addr && matches!(f.object, Object::Headers { .. }))
             };
+            // Whoever told us of it first: it answers for the chain it
+            // spoke of. Then the others whose chains reach as high, but
+            // for those that have said theirs is another.
             let source = self.peers.get(&aim.source).filter(|p| self.peers.may_ask(&p.addr, now) && idle(&p.addr));
-            let Some(peer) = self.peers.reaching(aim.height, now).find(|p| idle(&p.addr)).or(source) else {
+            let others =
+                || self.peers.reaching(aim.height, now).find(|p| idle(&p.addr) && !aim.refused.contains(&p.addr));
+            let Some(peer) = source.or_else(others) else {
                 break;
             };
             aim.todo.remove(&from);
@@ -3210,9 +3247,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // most then. (Whoever told us of it is its own worker's to ask,
         // and so that worker's to give up on.)
         if !l.fetching.iter().any(|f| headers(&f.0)) && !aim.todo.is_empty() {
-            let (height, source) = (aim.height, aim.source);
+            let (height, source, refused) = (aim.height, aim.source, aim.refused.clone());
             self.view(l, now);
-            if !l.views.iter().any(|v| v.reaches(height)) && self.shared.owner(&source) == self.me {
+            // (Or nobody of this worker's that has not said it has no
+            // such chain, its source no longer to be asked.)
+            let nobody = !self.peers.may_ask(&source, now)
+                && self.peers.reaching(height, now).all(|p| refused.contains(&p.addr));
+            if (!l.views.iter().any(|v| v.reaches(height)) || nobody) && self.shared.owner(&source) == self.me {
                 l.aim = None;
             }
         }
@@ -3259,7 +3300,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // ([`Chain::confirm_work`]), or when its block is applied.
             // From the seed text a header's work is tens of
             // milliseconds, and a year of headers most of an hour.
-            let defer = self.cfg.sync.sync_point > 0 && self.chain.verifier().attests_work();
+            //
+            // Only of headers further above the chain here than a
+            // state is taken under the best: those are the ones a
+            // state taken, and the proof of its block, will vouch for.
+            // The work of headers nearer is checked as they come: they
+            // are what a node goes by from one block to the next, and
+            // headers whose work nobody did (a claim costs a sixtieth
+            // of the work) would else be its best for as long as their
+            // blocks did not come.
+            let tip = self.chain.tip().ok().map(|tip| tip.height);
+            let defer = defers(self.cfg.sync.sync_point, self.chain.verifier().attests_work(), tip);
             self.work(l, Job::Headers { first, headers, from, unix: self.unix, defer });
         }
     }
@@ -3503,7 +3554,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// where each is, which the pool holds against the state before it
     /// believes it: a transaction set aside when the chain went over to
     /// this branch may spend the same output where it is now.
-    fn pool_follows(&self, tip: &Header, taken: u32) {
+    ///
+    /// `over`: the chain went over to this branch, blocks undone. Only
+    /// then is anything where it was not: where the chain has only
+    /// gone on, what a transaction spent is spent, and an output made
+    /// since with the same commitment is another, which that
+    /// transaction (its signatures say nothing of where) is not to
+    /// spend in its turn.
+    fn pool_follows(&self, tip: &Header, taken: u32, over: bool) {
         let Ok(state) = self.chain.whole() else { return };
         let Ok(snapshot) = state.snapshot() else { return };
         let height = snapshot.tip().0 + 1;
@@ -3533,6 +3591,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             }
             end = first;
             header = h.height.checked_sub(1).and_then(|below| self.chain.header_at_of(&snapshot, below).ok().flatten());
+        }
+        if !over {
+            moved.clear();
         }
         let mut pool = self.shared.pool();
         let _ = pool.revalidate(&snapshot, height, &moved, &created, self.unix);
@@ -3593,7 +3654,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 .find(|(told, addr, _)| told == id && self.peers.may_ask(addr, now) && free(addr));
             let source = match told {
                 Some((_, addr, len)) => Some((*addr, Some(*len).filter(|l| *l > 0 && *l <= most))),
-                None => self.peers.holders(header.height, now).find(|p| free(&p.addr)).map(|p| (p.addr, None)),
+                None => self
+                    .peers
+                    .holders(header.height, now)
+                    .find(|p| free(&p.addr) && !self.lacking.contains(&(*id, p.addr)))
+                    .map(|p| (p.addr, None)),
             };
             // In order: a body nobody holds is not to be had, and those
             // above it could not join the chain without it.
@@ -3664,7 +3729,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         join.beginning = false;
                         match result {
                             Ok(()) => join.begun = true,
-                            Err(_) => l.join = None,
+                            Err(_) => {
+                                l.join = None;
+                                self.join_failed(l, now);
+                            }
                         }
                     }
                     self.advance_join(l, now);
@@ -3690,6 +3758,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         // another is begun when time is next looked to.)
                         let height = l.join.as_ref().map_or(0, |j| j.target.height);
                         l.join = None;
+                        match result.is_ok() {
+                            true => l.rejoin = (0, 0),
+                            false => self.join_failed(l, now),
+                        }
                         if result.is_ok() {
                             self.counts.states += 1;
                             self.shared.say(Event::StateTaken { height });
@@ -3728,7 +3800,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     _ => (0, 1),
                 };
                 self.shared.say(Event::Block { header, from, undone, taken });
-                self.pool_follows(&header, taken);
+                self.pool_follows(&header, taken, undone > 0);
                 // Caught up, if a chain ahead was being caught up with.
                 let mut first = [header];
                 if l.syncing
@@ -3815,7 +3887,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     fn sync_state(&mut self, l: &mut List, now: Micros) {
         self.view(l, now);
         if l.join.is_none() {
-            if !self.begin_join(l) {
+            if now < l.rejoin.0 || !self.begin_join(l) {
                 return;
             }
             if let Some(j) = &l.join {
@@ -3856,6 +3928,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // Those that have not failed us in this first, while there are.
         if servers.iter().any(|a| !join.unserved.contains(a)) {
             servers.retain(|a| !join.unserved.contains(a));
+        } else {
+            // Every one of them has: all are asked again, but later,
+            // and later each time. (Peers that say they can serve a
+            // state and do not would else be asked as fast as they
+            // answer, for ever.)
+            let wait = self.cfg.sync.header_wait.saturating_mul(1 << join.rounds.min(6)).min(self.cfg.sync.pass_over);
+            match *join.again.get_or_insert(now.saturating_add(wait)) {
+                at if now < at => return,
+                _ => {
+                    join.unserved.clear();
+                    join.again = None;
+                    join.rounds += 1;
+                }
+            }
         }
         // What is wanted now, in order of need.
         let id = join.id;
@@ -3918,6 +4004,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
     }
 
+    /// A taking of the state came to nothing: the next is not begun at
+    /// once, and each one after waits longer, up to as long as a peer
+    /// is passed over.
+    fn join_failed(&mut self, l: &mut List, now: Micros) {
+        let wait = self.cfg.sync.header_wait.saturating_mul(1 << l.rejoin.1.min(6)).min(self.cfg.sync.pass_over);
+        l.rejoin = (now.saturating_add(wait), l.rejoin.1.saturating_add(1));
+    }
+
     /// Chooses the block to take the state as of, if it is to be taken
     /// at all. True if one was chosen.
     fn begin_join(&mut self, l: &mut List) -> bool {
@@ -3951,23 +4045,28 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if height > best.height {
             return false;
         }
-        // Never back: the chain here is on the best header's branch and
-        // at that block or past it. Its state is later than the one
-        // that would be taken, and what it lacks is the blocks after
-        // its own last, which it waits for. (A header whose block
-        // nobody has, announced by a node that then went away, would
-        // else send every node of a network back by that many blocks,
-        // each taking from the others the state they all had before.)
-        if !self.chain.receiving()
-            && let Ok(tip) = self.chain.tip()
-            && tip.height >= height
-            && matches!(self.chain.ancestor(&best, tip.height), Ok(Some(same)) if same.hash() == tip.hash())
-        {
-            return false;
-        }
         let Ok(Some(mut target)) = self.chain.ancestor(&best, height) else {
             return false;
         };
+        // Never back: that block is the chain's own, at its last or
+        // under it. The state here is later than the one that would be
+        // taken, and what the chain lacks is the blocks after where the
+        // best header's branch leaves it, which it waits for. (A header
+        // whose block nobody has, announced by a node that then went
+        // away, would else send every node of a network back by that
+        // many blocks, each taking from the others the state they all
+        // had before.)
+        if !self.chain.receiving()
+            && let Ok(tip) = self.chain.tip()
+            && tip.height >= height
+            && matches!(self.chain.header_at(height), Ok(Some(ours)) if ours.hash() == target.hash())
+        {
+            // (And the work of what it waits for is checked in full, if
+            // any of it was left to a proof: headers that are nobody's
+            // work are the best no longer.)
+            let _ = self.chain.confirm_work(&best, height.saturating_add(1));
+            return false;
+        }
         // A state that was being received already (the node stopped
         // and started while it was): as of the same block, if that can
         // still be had, so that nothing received is asked for again.
@@ -4003,6 +4102,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             told: 0,
             refused: 0,
             orphaned: None,
+            again: None,
+            rounds: 0,
         });
         true
     }
@@ -4130,6 +4231,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 join.refused += 1;
                 if join.refused >= self.cfg.sync.snapshot_attempts {
                     l.join = None;
+                    self.join_failed(l, now);
                     return;
                 }
             }
@@ -4345,7 +4447,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         let l = &mut **held.get_or_insert_with(|| write(&list));
                         self.fetches.swap_remove(i);
                         fetched(&mut l.fetching, &object, &from);
-                        self.fetch_failed(l, now, object, from);
+                        self.fetch_failed(l, now, object, from, false);
                         continue;
                     };
                     let n = object.encode(&mut name);
@@ -4374,7 +4476,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     if why == Why::Bad {
                         self.strike(&from, now);
                     }
-                    self.fetch_failed(l, now, object, from);
+                    self.fetch_failed(l, now, object, from, why == Why::Gone);
                     continue;
                 }
             }
@@ -4483,7 +4585,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// A fetch from `from` was given up. Of headers or a body: the peer
     /// is passed over, and what was wanted is wanted again, of another.
     /// Of anything else: whoever asked for it is told, and decides.
-    fn fetch_failed(&mut self, l: &mut List, now: Micros, object: Object, from: SocketAddrV4) {
+    ///
+    /// `gone`: the peer said it does not have it. Of headers or a body
+    /// it never said it had (it was asked because its chain is as
+    /// long), that is no failing of its own: it is on another branch,
+    /// and is not asked for this again. Else one peer speaking of a
+    /// chain nobody has would have a node pass over every honest peer
+    /// it then asked.
+    fn fetch_failed(&mut self, l: &mut List, now: Micros, object: Object, from: SocketAddrV4, gone: bool) {
         self.counts.fetches_failed += 1;
         self.shared.work(self.me);
         // Of the state being taken: asked of another, and this peer
@@ -4508,8 +4617,26 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             self.carried.retain(|c| (c.0, c.1) != (name, from));
             return;
         }
-        if matches!(object, Object::Headers { .. } | Object::Block(_)) {
-            self.peers.failed(&from, now);
+        let claimed = match object {
+            Object::Headers { .. } => l.aim.as_ref().is_none_or(|aim| aim.source == from),
+            Object::Block(id) => self.announced.iter().any(|(told, addr, _)| *told == id && *addr == from),
+            _ => false,
+        };
+        match object {
+            Object::Headers { .. } | Object::Block(_) if claimed || !gone => self.peers.failed(&from, now),
+            Object::Headers { .. } => {
+                if let Some(aim) = l.aim.as_mut().filter(|aim| !aim.refused.contains(&from)) {
+                    aim.refused.push(from);
+                }
+            }
+            Object::Block(id) => {
+                // (No more remembered than could be asked about.)
+                if self.lacking.len() >= LACKING {
+                    self.lacking.remove(0);
+                }
+                self.lacking.push((id, from));
+            }
+            _ => {}
         }
         match (object, l.aim.as_mut()) {
             (Object::Headers { from: first, .. }, Some(aim)) => {
@@ -4725,7 +4852,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
     #[cfg(test)]
     pub(crate) fn pool_follows(&self, taken: u32) {
         if let Ok(tip) = self.workers[0].chain.tip() {
-            self.workers[0].pool_follows(&tip, taken);
+            self.workers[0].pool_follows(&tip, taken, false);
         }
     }
 
@@ -4947,7 +5074,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     /// node is behind nothing. Else whoever cared to say so could stop
     /// a node from making blocks.
     pub fn behind(&self) -> Behind {
-        if self.chain.receiving() || self.list.read().unwrap_or_else(|e| e.into_inner()).join.is_some() {
+        // (While a state is only being asked for the chain is still
+        // whole, and blocks are made on it: a node that asks, and is
+        // never served, is not to stand still for that.)
+        if self.chain.receiving() {
             return Behind::State;
         }
         // One block known of and not yet here is no reason to stop: it

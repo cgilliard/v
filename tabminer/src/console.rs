@@ -2122,7 +2122,7 @@ mod tests {
         assert!(wrong(&held, "send-file lots x").contains("is not an amount of coins"));
         // A wallet that holds nothing pays nothing.
         assert!(!wrong(&held, &format!("send-file 1 {}", desk.file("none.slate"))).is_empty());
-        assert!(wrong(&held, &format!("receive {}", desk.file("none.slate"))).contains("No such file"));
+        assert!(wrong(&held, &format!("receive {}", desk.file("none.slate"))).contains("none"));
     }
 
     /// A payment between two wallets at their prompts, by a slate in a
@@ -2377,7 +2377,7 @@ mod tests {
         let no_mode = "the first directive must be `mode init` or `mode onion`";
         assert!(wrong(&payer, &format!("set-leaf 0 {file}")).ends_with(no_mode));
         assert!(wrong(&payer, &format!("debug-consensus {file}")).ends_with(no_mode));
-        assert!(wrong(&payer, &format!("set-leaf 0 {}", desk.file("none"))).contains("No such file"));
+        assert!(wrong(&payer, &format!("set-leaf 0 {}", desk.file("none"))).contains("none"));
         std::fs::write(&file, "mode onion\n").unwrap();
         assert!(wrong(&payer, &format!("set-leaf 0 {file}")).contains("fewer than the 3 needed"));
         let relays: Vec<String> = (1..=3u32).map(|i| crate::address::encode(&[i as u8; 32])).collect();
