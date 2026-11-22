@@ -166,9 +166,33 @@ use crate::structure::LOG_W;
 const LOG_PACK: usize = 7;
 /// Rounds after the bit places' for which the operands stay as words.
 const FLY: usize = 2;
-/// The transcript's label.
-/// What the argument's transcript begins from.
+/// What the argument's transcript begins from, with what a proof is
+/// made to ([`label`]).
 pub const LABEL: &[u8] = b"tabminer argument";
+
+/// What the transcript of a proof made to `params`, of tables of these
+/// rows, begins from: the argument's name, the parameters and the rows.
+/// A proof made to others is of another transcript from its first
+/// challenge. (Every verifier holds its parameters and rows for itself,
+/// and none takes them from a proof; this is so that one that did would
+/// still not take a proof made to weaker ones.)
+pub fn label(params: &Params, rows: impl Iterator<Item = usize>) -> Vec<u8> {
+    let mut out = LABEL.to_vec();
+    let of = [
+        params.m,
+        params.log_inv_rate,
+        params.queries,
+        params.arity,
+        params.query_grinding,
+        params.round_bits,
+        params.blind as usize,
+        params.last,
+    ];
+    for x in of.into_iter().chain(rows) {
+        out.extend_from_slice(&(x as u64).to_le_bytes());
+    }
+    out
+}
 
 /// One table's part of a proof: everything but the opening, which the
 /// tables share.
@@ -1538,7 +1562,7 @@ fn prove_with(
     times.commit += t.elapsed();
     let root = com.tree.root();
     let packed_program: &[F] = program.map_or(&[], |p| &p.packed);
-    let mut tr = Challenger::new(LABEL);
+    let mut tr = Challenger::new(&label(params, sides.iter().map(|s| 1 << s.r_rows)));
     begin(&mut tr, &root, program.map(Program::root).as_ref(), sides.iter().map(|s| s.public));
 
     // Each table's constraints and multiplications.
@@ -1727,7 +1751,7 @@ fn prove_with(
         let tables: Vec<Table> =
             sides.iter().map(|s| Table { circuit: s.circuit, rows: 1 << s.r_rows, public: s.public }).collect();
         let program_root = program.map(Program::root);
-        let mut again = Challenger::new(LABEL);
+        let mut again = Challenger::new(&label(params, tables.iter().map(|t| t.rows)));
         let (_, target, equations) =
             hidden_front(params, &tables, program_root.as_ref(), &proof, &mut again, &mut crate::reading::Direct)
                 .expect("the prover's own checks hold");
@@ -1783,7 +1807,8 @@ pub fn verify_tables(
     program: Option<&Digest>,
     proof: &Proof,
 ) -> Option<Work> {
-    let (mut tr, mut opens) = (Challenger::new(LABEL), Batched::default());
+    let named = label(params, tables.iter().map(|t| t.rows));
+    let (mut tr, mut opens) = (Challenger::new(&named), Batched::default());
     check(params, domain, tables, program, proof, &mut tr, &mut opens)?;
     Some(Work { compressions: tr.compressions + opens.compressions })
 }
@@ -1805,7 +1830,8 @@ pub fn verify_logged(
     program: Option<&Digest>,
     proof: &Proof,
 ) -> Option<Replay> {
-    let (mut tr, mut opens) = (Challenger::recording(LABEL), Batched::default());
+    let named = label(params, tables.iter().map(|t| t.rows));
+    let (mut tr, mut opens) = (Challenger::recording(&named), Batched::default());
     let indices = check(params, domain, tables, program, proof, &mut tr, &mut opens)?.indices;
     let work = Work { compressions: tr.compressions + opens.compressions };
     Some(Replay { work, log: tr.log.unwrap_or_default(), indices })

@@ -2198,8 +2198,9 @@ impl Proved {
         reader: &mut impl Reader<Sym>,
     ) -> Option<(Vec<Sym>, Vec<Sym>)> {
         let domain = Domain::new(self.params.k(), false);
-        let (mut tr, mut opens) = (Hashed::new(argument::LABEL, cx), HashedOpens::new(cx));
         let tables = [Table { circuit, rows: self.rows, public: &self.public }];
+        let named = argument::label(&self.params, tables.iter().map(|t| t.rows));
+        let (mut tr, mut opens) = (Hashed::new(&named, cx), HashedOpens::new(cx));
         let program = Some(&self.program);
         let taken = argument::check_with::<Sym, _, _, _>(
             &self.params,

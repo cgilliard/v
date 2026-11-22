@@ -317,6 +317,10 @@ impl Deferred {
                     assert!(x.is(y));
                 }
             }
+            // (The claims are batched under the powers of one
+            // challenge, which errs by as many in `2^128` as there are
+            // claims: ground for what that is more than a round may.)
+            tr.grind(crate::pcs::grinding(crate::pcs::SECURITY + 1, claims.len()));
             let scales = crate::alg::powers(&tr.challenge(), claims.len());
             let mut claim = claims[0].2.clone() * scales[0].clone();
             for ((.., value), scale) in claims.iter().zip(&scales).skip(1) {

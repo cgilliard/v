@@ -315,8 +315,9 @@ impl Proved {
     /// it has made its rows.
     pub fn verify_into(&self, cx: &Shared, circuits: &Circuits, reader: &mut impl Reader<Sym>) -> Option<Vec<Sym>> {
         let domain = Domain::new(self.params.k(), false);
-        let (mut tr, mut opens) = (Hashed::new(argument::LABEL, cx), HashedOpens::new(cx));
         let tables = self.tables(circuits);
+        let named = argument::label(&self.params, tables.iter().map(|t| t.rows));
+        let (mut tr, mut opens) = (Hashed::new(&named, cx), HashedOpens::new(cx));
         let program = Some(&self.program);
         let taken = argument::check_with::<Sym, _, _, _>(
             &self.params,

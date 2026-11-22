@@ -519,6 +519,17 @@ impl Hashed {
         Hashed { tr: Challenger::recording(label), cx: cx.clone(), done: 0 }
     }
 
+    /// Grinds for `bits` before the next challenge, whoever makes the
+    /// rows finding the nonce: for a challenge drawn within a circuit,
+    /// of a round that errs by more than a round may. Nothing, for no
+    /// bits.
+    pub fn grind(&mut self, bits: usize) {
+        if bits > 0 {
+            let nonce = self.tr.clone().grind(bits);
+            assert!(Transcript::<Sym>::ground(self, bits, nonce));
+        }
+    }
+
     /// The steps made since the last call, as rows.
     fn rows(&mut self, data: bool, challenge: bool, low: bool, ground: usize) -> Vec<Stepped> {
         let log = self.tr.log.as_ref().expect("a recording transcript");
@@ -791,7 +802,8 @@ pub(crate) mod tests {
                 Table { circuit: &machine, rows: self.rows[1], public: &self.public },
             ];
             let domain = Domain::new(self.params.k(), false);
-            let (mut tr, mut opens) = (Hashed::new(argument::LABEL, cx), HashedOpens::new(cx));
+            let named = argument::label(&self.params, tables.iter().map(|t| t.rows));
+            let (mut tr, mut opens) = (Hashed::new(&named, cx), HashedOpens::new(cx));
             let program = Some(&self.program);
             let taken = argument::check::<Sym, _, _>(
                 &self.params,
