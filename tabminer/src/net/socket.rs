@@ -19,7 +19,7 @@
 //! it wakes whoever is to know.
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -277,13 +277,46 @@ where
     // The receiver is through: said to the workers, whatever stopped it.
     let done = AtomicBool::new(false);
     let done = &done;
+    // When each worker last looked up from what it was doing
+    // ([`RESTING`] while it waits for something to do): watched, so
+    // that one that waits for what is never let go is said.
+    let beats: Vec<AtomicU64> = workers.iter().map(|_| AtomicU64::new(RESTING)).collect();
+    let beats = &beats;
     let received = std::thread::scope(|scope| {
         for (k, (worker, queue)) in workers.iter_mut().zip(queues).enumerate() {
             // (The first of them says, now and then, how the node stands.)
             let gauge = (k == 0).then_some(gauge);
+            let beat = &beats[k];
             std::thread::Builder::new()
                 .name(format!("worker {k}"))
-                .spawn_scoped(scope, move || work(worker, queue, socket, stop, done, clock, unix, watch, gauge))
+                .spawn_scoped(scope, move || work(worker, queue, socket, stop, done, clock, unix, watch, gauge, beat))
+                .expect("a thread");
+        }
+        if let Some(main) = watch.main {
+            std::thread::Builder::new()
+                .name("watch".to_string())
+                .spawn_scoped(scope, move || {
+                    let mut said: Vec<Option<Instant>> = vec![None; beats.len()];
+                    while !done.load(Ordering::Relaxed) && !stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+                        std::thread::sleep(Duration::from_millis(200));
+                        let now = clock.elapsed().as_micros() as Micros;
+                        for (k, beat) in beats.iter().enumerate() {
+                            let Some(seconds) = stalled(beat.load(Ordering::Relaxed), now) else {
+                                said[k] = None;
+                                continue;
+                            };
+                            // (Said when it is found, and each minute
+                            // it goes on.)
+                            if said[k].is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                                said[k] = Some(Instant::now());
+                                main.log(&format!(
+                                    "Error: worker {k} has not looked up for {seconds} seconds: it waits for \
+                                     something another thread holds, or works at what does not end"
+                                ));
+                            }
+                        }
+                    }
+                })
                 .expect("a thread");
         }
         let received = receive(socket, stop, watch, |from| shared.worker_of(from), &senders);
@@ -297,6 +330,18 @@ where
     });
     shared.set_waker(None);
     received
+}
+
+/// What a worker's beat says while it waits for something to do.
+const RESTING: u64 = u64::MAX;
+/// How long a worker may go without looking up before it is said: far
+/// longer than anything it does between two looks takes.
+const STALLED: Micros = 60_000_000;
+
+/// For how many seconds a worker whose beat is `beat` has not looked
+/// up, at `now`, if that is too long.
+fn stalled(beat: u64, now: Micros) -> Option<u64> {
+    (beat != RESTING && now.saturating_sub(beat) >= STALLED).then(|| now.saturating_sub(beat) / 1_000_000)
 }
 
 /// What comes on `queue` within `wait` microseconds. Where a wait is
@@ -394,6 +439,7 @@ fn work<B: Backend + 'static, V: ProofVerifier + Sync>(
     unix: &(dyn Fn() -> u64 + Sync),
     watch: &Watch<'_>,
     gauge: Option<&Handle<B, V>>,
+    beat: &AtomicU64,
 ) {
     let now = || clock.elapsed().as_micros() as Micros;
     // A datagram that cannot be sent is a datagram lost, as any may be.
@@ -407,6 +453,7 @@ fn work<B: Backend + 'static, V: ProofVerifier + Sync>(
     let mut told: Option<Micros> = None;
     while !done.load(Ordering::Relaxed) && !stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
         let t = now();
+        beat.store(t, Ordering::Relaxed);
         let wake = worker.tick(t, unix(), &mut out);
         if let Some(gauge) = gauge
             && told.is_none_or(|at| t.saturating_sub(at) >= 1_000_000)
@@ -431,7 +478,10 @@ fn work<B: Backend + 'static, V: ProofVerifier + Sync>(
                 watch.heard(&heard, len as usize, now().saturating_sub(began));
             }
         };
-        match recv_within(&queue, wait) {
+        beat.store(RESTING, Ordering::Relaxed);
+        let came = recv_within(&queue, wait);
+        beat.store(now(), Ordering::Relaxed);
+        match came {
             Ok(item) => {
                 take(worker, item);
                 // And whatever else is waiting, before looking to the
@@ -520,5 +570,22 @@ mod tests {
         let said = std::fs::read_to_string(dir.join("tabernacle.log")).unwrap();
         assert_eq!(said.lines().filter(|l| l.ends_with(DROPPING)).count(), 1, "{said}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    /// A worker that waits for something to do is not one that has
+    /// stopped; one that began something a minute ago and has not
+    /// looked up since is.
+    #[test]
+    fn a_worker_that_does_not_look_up_is_said() {
+        let now = 500_000_000;
+        assert_eq!(stalled(RESTING, now), None);
+        assert_eq!(stalled(now - 59_000_000, now), None);
+        assert_eq!(stalled(now - 61_500_000, now), Some(61));
+        assert_eq!(stalled(now + 5, now), None);
     }
 }

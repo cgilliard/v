@@ -432,6 +432,11 @@ fn make_block(
         }
         _ => miner::mine_with(hold.chain(), setup(), &*dataset, &paid, unix, start, &pooled, &sweeps, &proved, &cancel),
     };
+    // (The table is let go with the work done: what follows waits for
+    // the block to be applied, minutes at the worst, and the table
+    // could not grow meanwhile, nor anyone begin to read it once it
+    // was waiting to.)
+    drop(dataset);
     // Kept, with its block's id, before the block is handed over; and
     // forgotten at once if there is no block.
     let kept = match &made {
