@@ -409,6 +409,21 @@ impl Blocks {
         Ok(())
     }
 
+    /// Says that no block is the chain's at any of the heights
+    /// `from..to`: in one pass over the table, as [`Blocks::set_many`].
+    pub fn clear_heights<B: Backend>(&mut self, txn: &Txn<'_, B>, from: u32, to: u32) -> Result<(), Error> {
+        let mut there = Vec::new();
+        let mut at = from;
+        while let Some(h) = trie::next_key::<HeightTree>(txn, self.heights, at as u128)?.filter(|h| *h < to as u128) {
+            there.push(h as u32);
+            at = h as u32 + 1;
+        }
+        match there.is_empty() {
+            true => Ok(()),
+            false => remove::<HeightTree, B>(txn, &mut self.heights, &there),
+        }
+    }
+
     /// The id of the planned branch's block at `height`.
     pub fn planned_at(&self, pages: &impl ReadPages, height: u32) -> io::Result<Option<Digest>> {
         Ok(trie::get::<HeightTree>(pages, self.planned, height as u128)?.map(|r| r.0))

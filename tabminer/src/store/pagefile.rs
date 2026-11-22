@@ -296,8 +296,16 @@ impl<B: Backend> PageFile<B> {
         let mut best: Option<Root> = None;
         for at in SLOTS {
             let mut raw = [0u8; UNIT];
-            if backend.read_at(at, &mut raw).is_ok()
-                && let Some(root) = Root::decode(&raw)
+            // (A slot that cannot be read is not a slot with nothing in
+            // it: it may hold the last root, and the one before it is
+            // of pages written over since. Only a file that ends
+            // before the slot has none there.)
+            match backend.read_at(at, &mut raw) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => continue,
+                Err(e) => return Err(e),
+            }
+            if let Some(root) = Root::decode(&raw)
                 && Root::slot(root.seq) == at
                 && best.is_none_or(|b| root.seq > b.seq)
             {
@@ -683,7 +691,12 @@ impl<B: Backend> Txn<'_, B> {
     pub fn commit(mut self, payload: &[u8]) -> io::Result<u64> {
         let last = {
             let mut p = self.inner();
-            debug_assert!(p.leaving.is_empty(), "every thread of the pass is done");
+            // (A batch that was not written, its error passed over by
+            // whoever made it: what is committed would reach pages that
+            // are not in the file.)
+            if !p.leaving.is_empty() {
+                return Err(io::Error::other("a batch of the transaction's pages was not written"));
+            }
             let batch = std::sync::Arc::new(std::mem::take(&mut p.open));
             p.leaving.push(batch.clone());
             batch

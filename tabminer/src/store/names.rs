@@ -38,6 +38,12 @@ fn empty(height: u32) -> &'static Digest {
     &registry::empty_roots()[height as usize]
 }
 
+/// The hash of a subtree of the names' tree, of `level` levels, with
+/// no names.
+pub fn empty_at(level: u32) -> Digest {
+    *empty(level)
+}
+
 /// The root of the names' tree with no names.
 pub fn empty_root() -> Digest {
     *empty(NameTree::HEIGHT)

@@ -113,11 +113,23 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
                         *store = Store::Whole(state);
                         return Err(e);
                     }
-                    Ok(()) => Receiving::replace(state, target, parts, name_parts).map(|r| (r, old_tip)),
+                    // The chain has no blocks but its first while it
+                    // has no state: what it had is the best header's
+                    // branch to fetch, or not. Said in the step the
+                    // state is given up in: a node that stopped between
+                    // the two would have a chain of blocks and no state
+                    // they were the blocks of.
+                    Ok(()) => Receiving::replace_with(state, target, parts, name_parts, |txn, blocks| {
+                        if old_tip > 0 {
+                            blocks.clear_heights(txn, 1, old_tip.saturating_add(1))?;
+                            self.plan(txn, blocks, &best)?;
+                        }
+                        Ok(())
+                    }),
                 }
             }
             Store::Receiving(receiving) => match receiving.retarget(target, parts, name_parts) {
-                Ok(r) => Ok((r, 0)),
+                Ok(r) => Ok(r),
                 Err((r, Error::PartRoot)) => {
                     *store = Store::Receiving(r);
                     return Err(Error::PartRoot);
@@ -128,18 +140,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
         };
         // (A failure past the checks is the file's: the store is gone,
         // and is to be opened again.)
-        let (mut receiving, old_tip) = began?;
-        // The chain has no blocks but its first while it has no state:
-        // what it had is the best header's branch to fetch, or not.
-        if old_tip > 0 {
-            receiving.write_blocks(|txn, blocks| {
-                for height in 1..=old_tip {
-                    blocks.set_at(txn, height, None)?;
-                }
-                self.plan(txn, blocks, &best)
-            })?;
-        }
-        *store = Store::Receiving(receiving);
+        *store = Store::Receiving(began?);
         Ok(())
     }
 
@@ -227,10 +228,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
             return Err(Error::PartsMissing);
         }
         let target = *receiving.target();
-        let state = receiving.finish(self.keep)?;
         // The chain is the block's branch, from the first block up: said
-        // of each height, and planned no more.
-        state.write_blocks(|txn, blocks| {
+        // of each height, and planned no more. In the step the state
+        // becomes whole in: a node that stopped between the two would
+        // have a state at a block its chain did not have.
+        let finished = receiving.finish_with(self.keep, |txn, blocks| {
             let known = self.known_in(txn, blocks, &target.block)?.ok_or_else(|| corrupt("the block is not kept"))?;
             // (All of them at once: a chain is as many heights as it
             // has blocks.)
@@ -248,9 +250,20 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Chain<B, V> {
             blocks.drop_planned(txn, 0, target.height.saturating_add(1))?;
             blocks.put_entry(txn, &Known { status: Status::Valid, ..known }.entry())?;
             blocks.put_body(txn, target.height, &target.block, body)
-        })?;
-        *store = Store::Whole(state);
-        Ok(())
+        });
+        match finished {
+            Ok(state) => {
+                *store = Store::Whole(state);
+                Ok(())
+            }
+            // (Refused before anything was the file's: it goes on
+            // being received.)
+            Err((Some(receiving), e)) => {
+                *store = Store::Receiving(*receiving);
+                Err(e)
+            }
+            Err((None, e)) => Err(e),
+        }
     }
 }
 

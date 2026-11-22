@@ -179,7 +179,20 @@ impl<B: Backend + 'static> Receiving<B> {
         parts: &[(u64, Digest)],
         name_parts: &[(u32, Part)],
     ) -> Result<Receiving<B>, Error> {
-        Receiving::replace_at(state, target, parts, name_parts, PART_LEVEL, NAME_PART_LEVEL)
+        Receiving::replace_with(state, target, parts, name_parts, |_, _| Ok(()))
+    }
+
+    /// The same, and `change` made to the blocks known of in the same
+    /// step: what is said of the chain's blocks goes with the state
+    /// they were the blocks of, or neither does.
+    pub fn replace_with(
+        state: State<B>,
+        target: Target,
+        parts: &[(u64, Digest)],
+        name_parts: &[(u32, Part)],
+        change: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<(), Error>,
+    ) -> Result<Receiving<B>, Error> {
+        Receiving::replace_at(state, target, parts, name_parts, PART_LEVEL, NAME_PART_LEVEL, change)
     }
 
     fn replace_at(
@@ -189,6 +202,7 @@ impl<B: Backend + 'static> Receiving<B> {
         name_parts: &[(u32, Part)],
         level: u32,
         name_level: u32,
+        change: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<(), Error>,
     ) -> Result<Receiving<B>, Error> {
         Self::check(&target, parts, name_parts, level, name_level)?;
         let (file, mut meta) = state.dissolve()?;
@@ -198,6 +212,7 @@ impl<B: Backend + 'static> Receiving<B> {
         meta.names.free(&txn)?;
         meta.commits.free(&txn)?;
         meta.window.clear(&mut txn)?;
+        change(&txn, &mut meta.blocks)?;
         let mut this = Receiving {
             file: file.clone(),
             target,
@@ -282,7 +297,13 @@ impl<B: Backend + 'static> Receiving<B> {
             && parts.last().is_none_or(|p| p.0 < target.next.div_ceil(1 << level))
             && name_parts.last().is_none_or(|p| (p.0 as u64) < 1 << (KEY_BITS as u32 - name_level))
             // (A part of the names' tree is never one name's leaf alone.)
-            && name_parts.iter().all(|p| !p.1.single);
+            && name_parts.iter().all(|p| !p.1.single)
+            // (Nor is a part listed that holds nothing: its root is what
+            // the tree has where there is no part, so the roots would
+            // hash to the state's all the same, and no outputs or
+            // names anyone sent would ever be it.)
+            && parts.iter().all(|p| p.1 != outputs::part_root(level, &[]))
+            && name_parts.iter().all(|p| p.1.hash != names::empty_at(name_level));
         if !ordered || !in_range {
             return Err(Error::PartRoot);
         }
@@ -352,7 +373,9 @@ impl<B: Backend + 'static> Receiving<B> {
         let before = self.blocks;
         let done = change(&txn, &mut self.blocks).inspect_err(|_| self.blocks = before);
         let done = done?;
-        txn.commit(&self.record())?;
+        // (What did not become the file's is not what the next change
+        // starts from: its pages are free again.)
+        txn.commit(&self.record()).inspect_err(|_| self.blocks = before)?;
         Ok(done)
     }
 
@@ -521,27 +544,50 @@ impl<B: Backend + 'static> Receiving<B> {
     /// on, at the block, with no block to undo. `keep` is the length of
     /// its window. [`Error::PartsMissing`] if parts are still to be put.
     pub fn finish(self, keep: usize) -> Result<State<B>, Error> {
+        self.finish_with(keep, |_, _| Ok(())).map_err(|(_, e)| e)
+    }
+
+    /// The same, and `change` made to the blocks known of in the same
+    /// step: the chain's blocks are said to be the state's block's
+    /// branch as the state becomes whole, or neither happens. Refused
+    /// before that step is the file's, what was being received is
+    /// handed back as it was, to go on with.
+    #[allow(clippy::type_complexity, clippy::result_large_err)]
+    pub fn finish_with(
+        self,
+        keep: usize,
+        change: impl FnOnce(&Txn<'_, B>, &mut Blocks) -> Result<(), Error>,
+    ) -> Result<State<B>, (Option<Box<Receiving<B>>>, Error)> {
         if !self.known || self.have != self.want || self.have_names != self.want_names {
-            return Err(Error::PartsMissing);
+            return Err((Some(Box::new(self)), Error::PartsMissing));
         }
         // Every part was checked, so this is the root unless the file
         // lost something since.
         if compress(&self.outputs.hash(), &self.names.hash()) != self.target.state_root {
-            return Err(corrupt("the state received is not the block's").into());
+            return Err((Some(Box::new(self)), corrupt("the state received is not the block's").into()));
         }
-        let meta = Meta {
-            height: self.target.height,
-            tip: self.target.block,
-            outputs: Outputs { next: self.target.next, ..self.outputs },
-            names: self.names,
-            window: Window::default(),
-            sweep: 0,
-            blocks: self.blocks,
-            commits: self.commits,
-        };
-        let txn = self.file.begin()?;
-        txn.commit(&meta.to_bytes())?;
-        Ok(State::of(self.file, meta, keep)?)
+        let file = self.file.clone();
+        let made = (|| {
+            let mut blocks = self.blocks;
+            let txn = file.begin()?;
+            change(&txn, &mut blocks)?;
+            let meta = Meta {
+                height: self.target.height,
+                tip: self.target.block,
+                outputs: Outputs { next: self.target.next, ..self.outputs },
+                names: self.names,
+                window: Window::default(),
+                sweep: 0,
+                blocks,
+                commits: self.commits,
+            };
+            txn.commit(&meta.to_bytes())?;
+            Ok::<_, Error>(meta)
+        })();
+        match made {
+            Ok(meta) => State::of(file, meta, keep).map_err(|e| (None, e.into())),
+            Err(e) => Err((Some(Box::new(self)), e)),
+        }
     }
 
     fn record(&self) -> [u8; RECORD] {
@@ -565,18 +611,22 @@ impl<B: Backend + 'static> Receiving<B> {
             true => self.outputs.part(&*self.file, self.level, index)?,
             false => Vec::new(),
         };
-        let removes: Vec<u64> =
-            held.iter().map(|h| h.0).filter(|p| outputs.binary_search_by_key(p, |o| o.0).is_err()).collect();
-        let puts: Vec<(u64, Record, bool)> = outputs
-            .iter()
-            .filter(|o| held.binary_search_by_key(&o.0, |h| h.0).is_err())
-            .map(|o| (o.0, o.1, false))
-            .collect();
+        // (The same output, not only the same place: held for a block of
+        // another branch, a place past where the two part has another
+        // output on each, and the one held would else stay for good.)
+        let same =
+            |a: &[(u64, Record)], p: u64, r: &Record| a.binary_search_by_key(&p, |x| x.0).is_ok_and(|i| a[i].1 == *r);
+        let held: Vec<(u64, Record)> = held.into_iter().map(|h| (h.0, h.1)).collect();
+        let removes: Vec<u64> = held.iter().filter(|h| !same(outputs, h.0, &h.1)).map(|h| h.0).collect();
+        let puts: Vec<(u64, Record, bool)> =
+            outputs.iter().filter(|o| !same(&held, o.0, &o.1)).map(|o| (o.0, o.1, false)).collect();
+        // (What does not become the file's is not what the next change
+        // starts from: its pages are free again.)
+        let before = (self.outputs, self.commits);
         let mut txn = self.file.begin()?;
-        self.outputs = self.outputs.exchange(&mut txn, &removes, &puts, self.target.next)?;
-        // The part's commits with it: those of what it held go.
-        let before = self.commits;
         let done = (|| {
+            self.outputs = self.outputs.exchange(&mut txn, &removes, &puts, self.target.next)?;
+            // The part's commits with it: those of what it held go.
             self.commits.remove_between(&txn, index << self.level, (index + 1) << self.level)?;
             for (position, hash) in commits {
                 let height = outputs[outputs.binary_search_by_key(position, |o| o.0).unwrap()].1.height;
@@ -584,11 +634,11 @@ impl<B: Backend + 'static> Receiving<B> {
             }
             Ok::<(), Error>(())
         })();
+        let done = done.and_then(|()| Ok(txn.commit(&self.record())?));
         if let Err(e) = done {
-            self.commits = before;
+            (self.outputs, self.commits) = before;
             return Err(e);
         }
-        txn.commit(&self.record())?;
         match self.want.get(&index).filter(|_| !outputs.is_empty()) {
             Some(root) => self.have.insert(index, *root),
             None => self.have.remove(&index),
@@ -613,9 +663,10 @@ impl<B: Backend + 'static> Receiving<B> {
         let removes: Vec<Key> = held.iter().filter(|h| !same(records, h)).map(|h| h.key()).collect();
         let puts: Vec<(Key, NameRecord, bool)> =
             records.iter().filter(|r| !same(&held, r)).map(|r| (r.key(), *r, false)).collect();
+        let before = self.names;
         let mut txn = self.file.begin()?;
         self.names = self.names.exchange(&mut txn, &removes, &puts)?;
-        txn.commit(&self.record())?;
+        txn.commit(&self.record()).inspect_err(|_| self.names = before)?;
         match self.want_names.get(&index).filter(|_| !records.is_empty()) {
             Some(part) => self.have_names.insert(index, *part),
             None => self.have_names.remove(&index),
@@ -1056,6 +1107,37 @@ mod tests {
         }
     }
 
+    /// A state was being received as of a block of one branch, and is
+    /// gone on with as of a block of another: where the two have
+    /// another output each at the same place, the one held goes. And a
+    /// part listed that holds nothing is no part, though the roots hash
+    /// to the state's with it or without.
+    #[test]
+    fn a_receiving_goes_on_for_a_block_of_another_branch() {
+        let ((one, chain), (other, branch)) = (serving(0x4e37, 6), serving(0x51aa, 6));
+        let past = one.past(6).unwrap();
+        let mut receiving = open(MemBackend::new(), target(&chain, 6), &past).unwrap();
+        fill(&mut receiving, &past, 1);
+        let image = receiving.file.backend().image(Lost::All);
+        drop(receiving);
+        let then = other.past(6).unwrap();
+        let mut again = open(MemBackend::from_image(image), target(&branch, 6), &then).unwrap();
+        assert!(!again.missing().is_empty());
+        fill(&mut again, &then, 2);
+        goes_on(again.finish(KEEP).unwrap(), &other, &branch, 6);
+
+        let absent = (0..).find(|i| then.parts().iter().all(|p| p.0 != *i)).unwrap();
+        let mut parts = then.parts().to_vec();
+        parts.push((absent, outputs::part_root(LEVEL, &[])));
+        parts.sort_by_key(|p| p.0);
+        if parts.last().unwrap().0 < target(&branch, 6).next.div_ceil(1 << LEVEL) {
+            assert_eq!(outputs::parts_root(LEVEL, &parts), outputs::parts_root(LEVEL, then.parts()));
+        }
+        let refused =
+            Receiving::open_at(MemBackend::new(), target(&branch, 6), &parts, then.name_parts(), LEVEL, NAME_LEVEL);
+        assert_eq!(refused.err(), Some(Error::PartRoot));
+    }
+
     /// A node that has the headers and a state of its own takes the
     /// state as of a later block in its place: the blocks it knows of
     /// are kept through it, more arrive meanwhile, and the state it had
@@ -1090,7 +1172,8 @@ mod tests {
         let past = source.past(6).unwrap();
         let t = target(&chain, 6);
         // Roots that are not the block's: the node's state is left.
-        let wrong = Receiving::replace_at(node, t, &past.parts()[1..], past.name_parts(), LEVEL, NAME_LEVEL);
+        let wrong =
+            Receiving::replace_at(node, t, &past.parts()[1..], past.name_parts(), LEVEL, NAME_LEVEL, |_, _| Ok(()));
         assert_eq!(wrong.err(), Some(Error::PartRoot));
         let mut node = State::open(MemBackend::new(), KEEP).unwrap();
         node.set_levels(LEVEL, NAME_LEVEL);
@@ -1103,7 +1186,8 @@ mod tests {
         }
         node.write_blocks(|txn, blocks| (1..=6).try_for_each(|h| blocks.put_entry(txn, &entry(h)))).unwrap();
 
-        let mut receiving = Receiving::replace_at(node, t, past.parts(), past.name_parts(), LEVEL, NAME_LEVEL).unwrap();
+        let mut receiving =
+            Receiving::replace_at(node, t, past.parts(), past.name_parts(), LEVEL, NAME_LEVEL, |_, _| Ok(())).unwrap();
         assert_eq!(receiving.missing().len(), past.parts().len());
         // Some parts, a header and a body meanwhile, and a stop.
         for index in receiving.missing().into_iter().step_by(3) {

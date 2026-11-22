@@ -687,6 +687,11 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         verifier = verifier.unchecked();
     }
     let backend = FileBackend::open(&store).map_err(|e| format!("cannot open the store {}: {e}", store.display()))?;
+    // (A file made now is in its directory for good only once the
+    // directory is.)
+    if let Some(dir) = store.parent() {
+        let _ = tabminer::store::backend::sync_dir(dir);
+    }
     let chain = Chain::open(backend, c.keep, params, seed, verifier)
         .map_err(|e| format!("cannot open the store {}: {e}", store.display()))?;
     // Debugging: the state the chain begins with, put as a state taken

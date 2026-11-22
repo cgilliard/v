@@ -274,10 +274,10 @@ pub struct State<B: Backend + 'static> {
     /// has been waited for.
     marking: Mutex<Option<JoinHandle<Result<(), io::ErrorKind>>>>,
     /// The state as of an earlier block that was last asked for
-    /// ([`State::past`]), and the root of the file it was made at: it
-    /// is the same for as long as that is the file's root, and making
-    /// it reads the root of every part there is.
-    past: Mutex<Option<(u64, Arc<PastThen>)>>,
+    /// ([`State::past`]), and the block the state was at when it was
+    /// made: it is the same for as long as the state is, and making it
+    /// reads the root of every part there is.
+    past: Mutex<Option<(Digest, Arc<PastThen>)>>,
     /// Tests: how long each step of the last block applied took (the
     /// outputs, the names and the window, the sweep, the commit).
     #[cfg(test)]
@@ -417,18 +417,23 @@ impl<B: Backend + 'static> State<B> {
         // The state now, and everything read from the root record that
         // is held: a block applied meanwhile changes neither.
         let pin = self.file.pin();
-        // The one made last, if it is of this block and nothing has
-        // been written since: a node that hands a state over is asked
-        // for the same one thousands of times.
+        let meta = Meta::read(&pin, pin.root())?;
+        // The one made last, if it is of this block and the state is
+        // what it was made of: a node that hands a state over is asked
+        // for the same one thousands of times. (The state, not the
+        // file: headers go on arriving, each a root of the file's, and
+        // none of them changes what a block's state was.)
         let kept = self.past.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((seq, then)) = &*kept
-            && *seq == pin.root().seq
+        if let Some((tip, then)) = &*kept
+            && *tip == meta.tip
             && then.height == height
+            && then.outputs.to_bytes() == meta.outputs.to_bytes()
+            && then.names.to_bytes() == meta.names.to_bytes()
+            && then.commits.to_bytes() == meta.commits.to_bytes()
         {
             return Ok(Past { pin, then: Arc::clone(then) });
         }
         drop(kept);
-        let meta = Meta::read(&pin, pin.root())?;
         let oldest = meta.window.oldest().unwrap_or(meta.height + 1);
         if height > meta.height || height + 1 < oldest {
             return Err(Error::NoUndoRecord);
@@ -493,7 +498,7 @@ impl<B: Backend + 'static> State<B> {
             commits: meta.commits,
             commits_then,
         });
-        *self.past.lock().unwrap_or_else(|e| e.into_inner()) = Some((pin.root().seq, Arc::clone(&then)));
+        *self.past.lock().unwrap_or_else(|e| e.into_inner()) = Some((meta.tip, Arc::clone(&then)));
         Ok(Past { pin, then })
     }
 
