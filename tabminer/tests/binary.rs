@@ -1258,9 +1258,15 @@ impl Unchecked {
     }
 
     /// Waits until its log has `count` lines with `text` in them, and
-    /// gives them: the test fails if ten minutes pass first, or the
-    /// node ends, or says of anything that it is an error.
+    /// gives them: the test fails if ten minutes pass first (thirty of
+    /// a build not optimized), or the node ends, or says of anything
+    /// that it is an error.
     fn wait(&mut self, text: &str, count: usize) -> Vec<String> {
+        // (A block is won by chance, at about a million hashes: a
+        // build not optimized, on two cores and counting its lines,
+        // makes six thousand a second, and one block in thirty is
+        // then more than ten minutes in coming.)
+        let most = std::time::Duration::from_secs(if cfg!(debug_assertions) { 1_800 } else { 600 });
         let began = std::time::Instant::now();
         loop {
             let lines = self.lines(text);
@@ -1273,11 +1279,7 @@ impl Unchecked {
                 panic!("the node ended ({ended}) before its log said '{text}' {count} times");
             }
             let all = std::fs::read_to_string(self.dir.join("tabernacle.log")).unwrap_or_default();
-            assert!(
-                began.elapsed() < std::time::Duration::from_secs(600),
-                "'{text}' {} of {count}: {all}",
-                lines.len()
-            );
+            assert!(began.elapsed() < most, "'{text}' {} of {count}: {all}", lines.len());
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
