@@ -236,6 +236,11 @@ enum Job {
     /// The state, every part of it in, to make whole: with the body of
     /// its block.
     Finish { target: Digest, body: Vec<u8> },
+    /// The leaves a block's header commits to, as a peer gave them when
+    /// asked: to check against the header and keep. (Keeping them is a
+    /// change to the file, which waits its turn behind a block being
+    /// applied: not a thing to wait for between datagrams.)
+    Leaves { id: Digest, leaves: Box<[[u8; 32]; crate::chain::leaves::AUX_LEAVES]>, from: SocketAddrV4 },
     /// The header of a block a peer announced, to check and keep: its
     /// work is in it, and checking that is not done between datagrams.
     Announced { header: Header, len: u32, from: SocketAddrV4, unix: u64 },
@@ -289,6 +294,10 @@ enum Outcome {
         from: SocketAddrV4,
         verdict: Verdict,
     },
+    /// Leaves a peer gave were not what the header commits to.
+    BadLeaves {
+        from: SocketAddrV4,
+    },
     /// Work that was no work: nothing came of it.
     Nothing,
 }
@@ -320,6 +329,10 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
         Job::Confirm { best, from, target } => {
             Outcome::Confirmed { target, held: matches!(chain.confirm_work(&best, from), Ok(Ok(_))) }
         }
+        Job::Leaves { id, leaves, from } => match chain.put_aux_leaves(&id, &leaves) {
+            Err(Error::AuxMismatch) => Outcome::BadLeaves { from },
+            _ => Outcome::Nothing,
+        },
         Job::Check { block, next, roots } => {
             let view = BlockRef::from_bytes(&block).ok()?;
             Outcome::Checked { target: view.header().hash(), result: chain.check_state_block(&view, next, &roots) }
@@ -2663,6 +2676,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // many lives of a token have passed, not by when each began.)
         let lives = now / self.cfg.serve.token_life.max(1);
         if lives != self.secrets {
+            // (More than one life gone by, of a machine that slept: the
+            // secret before this one is the life before's, not one of
+            // however long ago.)
+            if lives > self.secrets.saturating_add(1) {
+                self.tokens.rotate(derive(&self.shared.token_secret, b't', lives - 1));
+            }
             self.secrets = lives;
             self.tokens.rotate(derive(&self.shared.token_secret, b't', lives));
             self.rotated = now;
@@ -3154,9 +3173,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Message::Leaves { id, leaves } => match self.leaves_asked.iter().position(|a| *a == (id, from)) {
                 Some(at) => {
                     self.leaves_asked.swap_remove(at);
-                    if let Err(Error::AuxMismatch) = self.chain.put_aux_leaves(&id, &leaves) {
-                        self.tell(now, from, Notice::Strike(from));
-                    }
+                    let list = Arc::clone(&self.list);
+                    self.work(&mut write(&list), Job::Leaves { id, leaves: Box::new(leaves), from });
                 }
                 None => self.counts.unheard += 1,
             },
@@ -3901,6 +3919,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.headers_kept(l, now, first, count, last, from, error.is_some());
                 }
                 Outcome::Nothing => {}
+                Outcome::BadLeaves { from } => self.tell(now, from, Notice::Strike(from)),
                 // What follows is of the peer that announced it: its own
                 // worker's to do.
                 Outcome::Announced { header, len, from, verdict } => match self.shared.owner(&from) {

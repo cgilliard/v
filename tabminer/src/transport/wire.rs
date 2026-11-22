@@ -181,6 +181,14 @@ impl<'a> Get<'a> {
             if count == 0 || start.checked_add(count as u32 - 1).is_none() {
                 return Err(BAD);
             }
+            // (Nor does it follow the one before it, with room in that
+            // one: they would have been sent as one.)
+            if i > 0 {
+                let last = ranges.r[i - 1];
+                if last.start.checked_add(last.count as u32) == Some(start) && last.count.checked_add(count).is_some() {
+                    return Err(BAD);
+                }
+            }
             ranges.r[i] = Range { start, count };
             ranges.chunks = ranges.chunks.saturating_add(count as u32);
         }

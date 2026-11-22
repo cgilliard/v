@@ -296,8 +296,16 @@ impl Peers {
             }
         }
         if self.totals.peers() >= self.cfg.max {
-            // One that never proved itself gives way, and no other.
-            let old = self.peers.values().find(|p| !p.proven && !p.seed).expect("or it was refused").addr;
+            // One that never proved itself gives way, and no other: the
+            // one that has left a ping unanswered longest. One not yet
+            // tried does not: it was learned of honestly as likely as
+            // not, and whoever writes addresses on pings would else
+            // have every such address out of the table before it was
+            // asked anything.
+            let tried = self.peers.values().filter(|p| !p.proven && !p.seed && p.first_ping.is_some());
+            let Some(old) = tried.min_by_key(|p| p.first_ping).map(|p| p.addr) else {
+                return Err(Refused::Full);
+            };
             self.remove(&old);
         }
         self.unproven += !seed as usize;
@@ -943,9 +951,19 @@ mod tests {
         for n in 0..64 {
             t.add(nth(n), false, T0).unwrap();
         }
-        // Full of addresses to try: a new one takes the place of one.
-        assert_eq!(t.add(nth(100), false, T0), Ok(true));
+        // Full of addresses to try, none tried yet: no room for one
+        // more. Once some have been asked and have not answered, a new
+        // one takes the place of the one silent longest.
+        assert_eq!(t.add(nth(100), false, T0), Err(Refused::Full));
+        let mut pinged = Vec::new();
+        t.pings_due(T0, || 1, |a, _| pinged.push(a));
+        assert_eq!(t.add(nth(100), false, T0 + 1), Ok(true));
         assert_eq!(t.len(), 64);
+        assert_eq!(pinged.iter().filter(|a| t.get(a).is_none()).count(), 1);
+        // (The rest of those asked answer.)
+        for a in &pinged {
+            let _ = t.pong(a, status(1, 1), T0 + 1);
+        }
         // All proven (eight a call, as unproven addresses are pinged).
         for k in 0..8 {
             prove_all(&mut t, T0 + k, 1);

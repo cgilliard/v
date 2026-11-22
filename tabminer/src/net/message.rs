@@ -51,6 +51,9 @@ const NOTICE: u8 = 15;
 /// What a [`Message::Notice`] says of a message offered: passed on to
 /// the wallet it is for; that wallet is not here to take it; or not
 /// taken, by a node that passes nothing on or has no room.
+/// The kinds a step on a way is of ([`super::circuits::OPEN`] to
+/// [`super::circuits::CLOSE`]).
+const STEP_KINDS: std::ops::RangeInclusive<u8> = super::circuits::OPEN..=super::circuits::CLOSE;
 pub const NOTICE_PASSED: u8 = 1;
 pub const NOTICE_OFFLINE: u8 = 2;
 pub const NOTICE_REFUSED: u8 = 3;
@@ -455,7 +458,10 @@ impl<'a> Message<'a> {
                 for _ in 0..n {
                     let ip: [u8; 4] = r.array().ok_or(BAD)?;
                     let port = u16::from_le_bytes(r.array().ok_or(BAD)?);
-                    if !addrs.push(SocketAddrV4::new(Ipv4Addr::from(ip), port)) {
+                    // (An address something could be at, said once.)
+                    let addr = SocketAddrV4::new(Ipv4Addr::from(ip), port);
+                    if port == 0 || addr.ip().is_unspecified() || addrs.as_slice().contains(&addr) || !addrs.push(addr)
+                    {
                         return Err(BAD);
                     }
                 }
@@ -507,10 +513,19 @@ impl<'a> Message<'a> {
                 id: r.digest().ok_or(BAD)?,
                 len: r.u32().ok_or(BAD)?,
             },
-            NOTICE => Message::Notice { id: r.digest().ok_or(BAD)?, what: r.take(1).ok_or(BAD)?[0] },
+            NOTICE => {
+                let (id, what) = (r.digest().ok_or(BAD)?, r.take(1).ok_or(BAD)?[0]);
+                if !(NOTICE_PASSED..=NOTICE_REFUSED).contains(&what) {
+                    return Err(BAD);
+                }
+                Message::Notice { id, what }
+            }
             STEPPED => {
                 let (name, circuit) = (r.u64().ok_or(BAD)?, r.u64().ok_or(BAD)?);
                 let (kind, count) = (r.take(1).ok_or(BAD)?[0], r.u64().ok_or(BAD)?);
+                if !STEP_KINDS.contains(&kind) {
+                    return Err(BAD);
+                }
                 let len = u16::from_le_bytes(r.array().ok_or(BAD)?) as usize;
                 let bytes = r.take(len).ok_or(BAD)?;
                 Message::Stepped { name, circuit, kind, count, bytes }
@@ -523,14 +538,14 @@ impl<'a> Message<'a> {
                 seq: r.u64().ok_or(BAD)?,
             },
             ALIAS_STATE => Message::AliasState { n: r.digest().ok_or(BAD)?, seq: r.u64().ok_or(BAD)? },
-            CARRY => Message::Carry {
-                grant: r.u64().ok_or(BAD)?,
-                name: r.u64().ok_or(BAD)?,
-                circuit: r.u64().ok_or(BAD)?,
-                kind: r.take(1).ok_or(BAD)?[0],
-                count: r.u64().ok_or(BAD)?,
-                len: r.u32().ok_or(BAD)?,
-            },
+            CARRY => {
+                let (grant, name, circuit) = (r.u64().ok_or(BAD)?, r.u64().ok_or(BAD)?, r.u64().ok_or(BAD)?);
+                let kind = r.take(1).ok_or(BAD)?[0];
+                if !STEP_KINDS.contains(&kind) {
+                    return Err(BAD);
+                }
+                Message::Carry { grant, name, circuit, kind, count: r.u64().ok_or(BAD)?, len: r.u32().ok_or(BAD)? }
+            }
             // The transport's own, which take the whole body or refuse it.
             GET => return Ok(Message::Get(Get::decode(body)?)),
             CHUNK => return Ok(Message::Chunk(Chunk::decode(body)?)),
@@ -792,11 +807,23 @@ mod tests {
         }
         // More addresses than there may be, and fewer than it says.
         let mut b = b"TEST\x04\x21".to_vec();
-        b.extend_from_slice(&[1; 6 * 33]);
+        (0..33u8).for_each(|k| b.extend_from_slice(&[10, 0, 0, k + 1, 1, 1]));
         assert!(Message::decode(NET, &b).is_err());
         b[5] = 32;
         assert!(Message::decode(NET, &b).is_err());
         assert!(Message::decode(NET, &b[..6 + 6 * 32]).is_ok());
+        // An address said twice, one nothing is at, and no port.
+        for (at, to) in [(6 + 6 + 3, 1u8), (6, 0), (6 + 4, 0)] {
+            let mut bad = b[..6 + 6 * 32].to_vec();
+            bad[at] = to;
+            if at == 6 {
+                bad[6..10].fill(0);
+            }
+            if at == 6 + 4 {
+                bad[10..12].fill(0);
+            }
+            assert!(Message::decode(NET, &bad).is_err(), "{at}");
+        }
         // A locator of nothing, and of too much.
         let n = Message::FindFork { token: 1, locator: Locator::new(&[d]).unwrap() }.encode(NET, &mut buf);
         assert!(Message::decode(NET, &buf[..n]).is_ok());

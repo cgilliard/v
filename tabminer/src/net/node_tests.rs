@@ -2001,11 +2001,11 @@ fn a_host_is_one_workers_and_the_nodes_limits_hold_over_all() {
     of.dedup();
     assert!(of.len() > 1, "{of:?}");
     // Thirty-two in all; and never more than forty, however many more
-    // are told of (one that never answered gives way, in its own
-    // worker's table).
+    // are told of (none of those there has been tried yet, so none
+    // gives way: eight more are taken, and no more).
     assert_eq!(sizes(&node).iter().sum::<usize>(), 32);
     let far = |k: u8| SocketAddrV4::new(Ipv4Addr::new(60, k, 0, 1), 3737);
-    assert_eq!((0..100).filter(|k| node.add_peer(far(*k), false, 0)).count(), 100);
+    assert_eq!((0..100).filter(|k| node.add_peer(far(*k), false, 0)).count(), 8);
     assert_eq!((sizes(&node).iter().sum::<usize>(), node.peer_counts(0)), (40, (40, 0)));
 }
 

@@ -265,6 +265,10 @@ where
 {
     let (gauge, queue) = (node.hold(), node.request_queue());
     let (workers, shared) = node.parts();
+    // (What may wait is what may wait in all, shared among the workers:
+    // each queue has its room from the start, a datagram's worth for
+    // each place in it.)
+    let queue = (queue / workers.len().max(1)).max(queue.min(256));
     let (senders, queues): (Vec<SyncSender<Item>>, Vec<Receiver<Item>>) =
         workers.iter().map(|_| sync_channel(queue)).unzip();
     // Whoever leaves something for a worker wakes it. (If its queue is
