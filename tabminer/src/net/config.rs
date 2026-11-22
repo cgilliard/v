@@ -118,6 +118,12 @@ pub struct Sync {
     /// joining node takes whole. Zero: every block from the first is
     /// applied instead.
     pub sync_point: u32,
+    /// How many blocks under the best header the chain may be and still
+    /// be caught up block by block: further behind, the state is taken
+    /// whole though the blocks could be had (of nodes that keep every
+    /// block, a node would else never take it). Zero: only when the
+    /// blocks cannot be had.
+    pub sync_behind: u32,
     /// Parts of that state fetched at once.
     pub parts: usize,
     /// What is fetched for the chain (headers, a block, a piece of a
@@ -189,6 +195,7 @@ impl Default for Sync {
             blocks_per_peer: 8,
             lookahead: 32,
             sync_point: 144,
+            sync_behind: 1008,
             parts: 32,
             fetch_rate: 4096,
             fetch_grace: 30 * SECOND,

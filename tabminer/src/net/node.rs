@@ -480,6 +480,9 @@ pub(crate) struct Join {
     /// believed before.
     best: Header,
     worked: bool,
+    /// It was begun though the blocks could be had, the chain being so
+    /// far behind: no more of them are asked for.
+    far: bool,
     /// The roots of the parts of each range fetched so far.
     roots: BTreeMap<u32, Vec<(u64, Digest)>>,
     /// The chain has begun to receive the state; or is beginning to.
@@ -3788,8 +3791,14 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// first to be applied once it is here. Blocks join the chain in
     /// order, so a body that arrives before the one below it waits.
     fn sync_blocks(&mut self, l: &mut List, now: Micros) {
-        // While the state is being taken, no block can join.
-        if self.chain.receiving() {
+        // While the state is being taken, no block can join. Nor is one
+        // asked for once it is to be: what was asked for is let come.
+        // (And where the chain is so far behind that the state is to be
+        // taken, that is seen to before a block is asked for.)
+        if l.join.is_none() && now >= l.rejoin.0 && self.far_behind() {
+            self.sync_state(l, now);
+        }
+        if self.chain.receiving() || l.join.as_ref().is_some_and(|j| j.far) {
             return;
         }
         let mut need = vec![self.chain.params().genesis().header; self.cfg.sync.lookahead];
@@ -4207,11 +4216,29 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         l.rejoin = (now.saturating_add(wait), l.rejoin.1.saturating_add(1));
     }
 
+    /// Whether the chain is further under the best header than a node
+    /// catches up from block by block
+    /// ([`super::config::Sync::sync_behind`]).
+    fn far_behind(&self) -> bool {
+        let (point, behind) = (self.cfg.sync.sync_point, self.cfg.sync.sync_behind);
+        if point == 0 || behind == 0 || self.chain.receiving() {
+            return false;
+        }
+        match (self.chain.best_header(), self.chain.tip()) {
+            (Ok(best), Ok(tip)) => best.header.height.saturating_sub(tip.height) > behind,
+            _ => false,
+        }
+    }
+
     /// Chooses the block to take the state as of, if it is to be taken
     /// at all. True if one was chosen.
     fn begin_join(&mut self, l: &mut List) -> bool {
         let point = self.cfg.sync.sync_point;
-        if point == 0 || l.aim.is_some() || !l.applying.is_empty() {
+        // (So far behind that the state is taken though the blocks
+        // could be had: whatever is being done with blocks goes on
+        // until the chain begins to receive it.)
+        let far = self.far_behind();
+        if point == 0 || l.aim.is_some() || (!far && !l.applying.is_empty()) {
             return false;
         }
         let Ok(best) = self.chain.best_header().map(|k| k.header) else {
@@ -4220,7 +4247,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         // Already receiving (and the block it was as of given up): on,
         // as of another. Else only where blocks cannot be had: the
         // first body wanted is held by nobody that is there to ask.
-        if !self.chain.receiving() {
+        if !self.chain.receiving() && !far {
             let mut first = [best];
             if self.chain.missing_bodies(&mut first).unwrap_or(0) == 0
                 || !l.views.iter().any(|v| v.live > 0)
@@ -4288,6 +4315,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             checking: false,
             best,
             worked: false,
+            far,
             roots: BTreeMap::new(),
             begun: false,
             beginning: false,
@@ -4382,10 +4410,13 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             let job = Job::Check { block: block.clone(), next: manifest.next, roots: manifest.roots() };
             return self.work(l, job);
         }
-        // Every range's roots: the state can begin to be received.
+        // Every range's roots: the state can begin to be received. (With
+        // no block on its way to the chain: the state there is is given
+        // up for it.)
         if join.checked
             && !join.begun
             && !join.beginning
+            && l.applying.is_empty()
             && let Some((manifest, _)) = &join.manifest
             && manifest.ranges.iter().all(|(range, _)| join.roots.contains_key(range))
         {

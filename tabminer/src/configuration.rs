@@ -265,6 +265,11 @@ is given (default 5)",
                 help: "take the state whole as of the block N under the best\nheader when blocks cannot be had (default 144; 0: never)",
             },
             Opt {
+                name: "sync-behind",
+                takes: Takes::Value("N"),
+                help: "take the state whole when more than N blocks under the\nbest header, though the blocks could be had (default 1008;\n0: only when they cannot)",
+            },
+            Opt {
                 name: "max-undo-blocks",
                 takes: Takes::Value("N"),
                 help: "blocks that can be undone, and whose bodies and states\nare served (default 1008)",
@@ -827,6 +832,7 @@ impl Configuration {
         p.strikes = given.number("ban-strikes", 1)?.map_or(p.strikes, |n| n.min(u32::MAX as u64) as u32);
         p.ban = seconds("ban-seconds", 1)?.unwrap_or(p.ban);
         s.sync_point = given.number("sync-point", 0)?.map_or(s.sync_point, |n| n.min(u32::MAX as u64) as u32);
+        s.sync_behind = given.number("sync-behind", 0)?.map_or(s.sync_behind, |n| n.min(u32::MAX as u64) as u32);
         s.header_fetches = count("header-fetches", 1)?.unwrap_or(s.header_fetches);
         s.blocks = count("block-fetches", 1)?.unwrap_or(s.blocks);
         s.blocks_per_peer = count("block-fetches-per-peer", 1)?.unwrap_or(s.blocks_per_peer);
@@ -1071,6 +1077,13 @@ impl Configuration {
             (
                 "Sync Point",
                 if s.sync_point == 0 { "never".to_string() } else { format!("{} blocks", commas(s.sync_point as u64)) },
+            ),
+            (
+                "Sync Behind",
+                match (s.sync_point, s.sync_behind) {
+                    (0, _) | (_, 0) => "never".to_string(),
+                    (_, behind) => format!("{} blocks", commas(behind as u64)),
+                },
             ),
             ("Max Undo Blocks", commas(self.keep as u64)),
             ("Header Fetches", commas(s.header_fetches as u64)),

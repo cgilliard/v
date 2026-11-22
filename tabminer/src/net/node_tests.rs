@@ -1328,6 +1328,29 @@ fn a_new_node_takes_the_state_and_goes_on_from_it() {
     }
 }
 
+/// Among nodes that have every block, a node takes the state whole
+/// when it is further behind than it is set to catch up from block by
+/// block, and the blocks when it is not.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn a_node_far_behind_takes_the_state_though_the_blocks_could_be_had() {
+    for (behind, states, taken) in [(30, 1, 10), (60, 0, 50), (0, 0, 50)] {
+        let (ahead, _) = long_chain(50);
+        // (The headers in one run: how far behind the node is is known
+        // before the first block is asked for.)
+        let mut cfg = Config::default();
+        (cfg.sync.sync_point, cfg.sync.sync_behind) = (10, behind);
+        let mut w = World::with(vec![ahead, chain_of(easy())], &cfg);
+        w.nodes[1].add_peer(at(0), false, 0);
+        w.run(90 * SECOND);
+        assert_eq!(tip(&w, 1), tip(&w, 0), "behind {behind}");
+        assert_eq!(w.nodes[1].chain().state().root(), w.nodes[0].chain().state().root());
+        let c = w.nodes[1].counts();
+        assert_eq!((c.states, c.blocks, c.blocks_refused), (states, taken, 0), "behind {behind}");
+        assert!(w.nodes[1].list().join.is_none() && !w.nodes[1].chain().receiving());
+    }
+}
+
 /// A node with an old state, further behind than anyone's bodies reach,
 /// gives it up for the state taken whole.
 #[test]
