@@ -1,27 +1,43 @@
 name: setup
 
-# Makes the main network's setup: a block of each shape proven once, for
-# the list of shapes and the program of the chain's step
-# (resources/setup-mainnet.bin, which the program has built in). Run by
-# hand, when a circuit, the shapes, the emission or the proofs'
-# parameters change: the file it makes is this run's artifact, to be
-# committed; until it is, the slow job of test.yml fails. Half an hour
-# and more of proving.
+# Makes the setups the program has built in (resources/setup-mainnet.bin,
+# resources/setup-dev.bin) and commits them: what a change to a circuit
+# asks for, and hours of proving that need no one's machine.
+#
+# Begun by hand only (Actions, "setup", "Run workflow"; or
+# `gh workflow run setup.yml`): never by a push. It first asks whether
+# there is anything to do: the main network's setup that is built in is
+# tried by proving and checking two blocks with it, and if that passes,
+# the setups are this code's and nothing is made (unless `force` says
+# otherwise). The `test` workflow says when it is needed: its job
+# `slow (prover::tests::main_network_block_timing)` fails on a setup
+# that is not the code's.
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: Make the setups even if the ones built in still hold
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write
+  actions: write
+
+# One at a time: a second waits for the first, and then finds nothing to do.
+concurrency:
+  group: setup
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   setup:
-    name: make the main network's setup
+    name: make the setups
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360
     defaults:
       run:
         working-directory: tabminer
@@ -33,15 +49,73 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustc --version
-          free -m
-          nproc
 
-      - name: Make the setup
-        run: cargo test --locked --release --lib -- --ignored --exact --nocapture prover::tests::write_the_main_network_s_setup
+      - name: Build
+        run: cargo test --release --features dev --lib --no-run
 
-      - name: Upload the setup
-        uses: actions/upload-artifact@v4
-        with:
-          name: setup-mainnet
-          path: resources/setup-mainnet.bin
-          retention-days: 90
+      # Two blocks made and taken with the main network's setup as it is
+      # built in: if that holds, the setup is this code's.
+      - name: Is there anything to do?
+        id: needed
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "forced"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif cargo test --release --features dev --lib -- prover::tests::main_network_block_timing --ignored --nocapture; then
+            echo "the setups built in are this code's: nothing to do" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "the main network's setup is not this code's: making it"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Make the dev networks' setup
+        if: steps.needed.outputs.needed == 'true'
+        run: cargo test --release --features dev --lib -- prover::tests::write_the_dev_networks_setup --ignored --nocapture
+
+      - name: Make the main network's setup
+        if: steps.needed.outputs.needed == 'true'
+        run: cargo test --release --features dev --lib -- prover::tests::write_the_main_network_s_setup --ignored --nocapture
+
+      # With the new setups built in: two blocks of the main network made
+      # and taken, which says how large its proof is and how long it takes.
+      - name: Try the main network's setup
+        if: steps.needed.outputs.needed == 'true'
+        run: |
+          cargo test --release --features dev --lib -- prover::tests::main_network_block_timing --ignored --nocapture 2>&1 | tee timing.log
+          {
+            echo '### The main network, with the setup just made'
+            echo '```'
+            grep -vE '^\s*(Compiling|Finished|Running|running|test |$)' timing.log | tail -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm timing.log
+
+      - name: Commit the setups
+        if: steps.needed.outputs.needed == 'true'
+        working-directory: .
+        run: |
+          if git diff --quiet -- resources/setup-mainnet.bin resources/setup-dev.bin; then
+            echo "the setups made are the ones kept: nothing to commit" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          made_from=$(git rev-parse --short HEAD)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add resources/setup-mainnet.bin resources/setup-dev.bin
+          git commit -m "The setups, made again for the circuits as they are at $made_from"
+          # (What was pushed meanwhile stays: if it changed a circuit, the
+          # test workflow says the setup is not its code's, and this is
+          # run again.)
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "committed $(git rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # A push made by a workflow begins no other: the tests are begun
+      # by hand, of the commit just made.
+      - name: Test what was committed
+        if: steps.needed.outputs.needed == 'true'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run test.yml --ref "${GITHUB_REF_NAME}"

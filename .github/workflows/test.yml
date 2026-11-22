@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # (By hand, and by the `setup` workflow after it commits: a push made
+  # by a workflow begins no other.)
+  workflow_dispatch:
 
 # Every push is tested: runs of the same branch go side by side, and none
 # cancels another.
