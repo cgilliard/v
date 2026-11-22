@@ -55,6 +55,25 @@ Each entry says what was seen, where, and what the change would be.
 - **Change:** `Server is ready!`, then one line, `Recovery phrase:`
   followed by the twelve words, then the prompt. Nothing else.
 
+### 6. A mining node starts with twenty or thirty seconds of nothing
+
+- **Seen:** same test. A node that mines says nothing and gives no
+  prompt for 20 to 30 seconds after it is started.
+- **What it most likely is:** the node rebuilding what it proves blocks
+  with from the setup that is built in (`Setup::from_parts`, called
+  from `main.rs` before the server starts). That proves the chain's
+  first statement once and compiles the circuits' tables. The setup
+  workflow timed the same step at 15.3 s on a four-core runner
+  (`the setup, from its file`). A node that does not mine skips it,
+  which fits what was seen. To be confirmed by timing the steps of a
+  start.
+- **Change, in order of preference:**
+  1. Do it after the prompt is up: the server starts and answers at
+     once, and mining begins when the setup is ready.
+  2. If part of it cannot be moved or kept from one run to the next,
+     say what is being done and how far it has got, as the table of
+     the proof of work does.
+
 ## Done
 
 (Nothing yet.)
