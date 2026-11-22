@@ -97,8 +97,8 @@ impl Output {
 }
 
 /// An input: the key, and the output it spends (its amount, its memo,
-/// the height it was made at, where it lies). The position is not
-/// signed.
+/// the height it was made at, where it lies). Where it lies is signed:
+/// the id is of that output and no other of the same key and amount.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Input {
     pub key: PublicKey,
@@ -133,6 +133,17 @@ pub fn absorb(domain: u32, so_far: &Digest, x: &Digest) -> Digest {
     hash_domain(domain, &block(&[so_far, x]))
 }
 
+/// The id so far with an input taken in: the commitment of the output
+/// it spends, under the place that output lies at in the state. Two
+/// outputs of one key and one amount have one commitment, and a
+/// signature over that alone would spend either: what is signed is one
+/// output. (The place is in the hash's key, beside the domain: the
+/// block is full.)
+pub fn absorb_input(so_far: &Digest, commitment: &Digest, position: u64) -> Digest {
+    let key = [DOM_BODY_IN, position as u32, (position >> 32) as u32, 0, 0, 0, 0, 0];
+    crate::blake3::keyed_hash_words(&key, &block(&[so_far, commitment]))
+}
+
 /// What a transaction's id starts from: how many inputs it has, how
 /// many things it makes (outputs, and operations on names), and how
 /// many of its outputs conditions are on.
@@ -154,10 +165,10 @@ impl Transaction {
         let mut id =
             body_head(self.inputs.len() + self.policy.len(), self.outputs.len() + self.ops.len(), self.covered);
         for input in &self.inputs {
-            id = absorb(DOM_BODY_IN, &id, &input.output().commitment);
+            id = absorb_input(&id, &input.output().commitment, input.position);
         }
         for input in &self.policy {
-            id = absorb(DOM_BODY_IN, &id, &input.output().commitment);
+            id = absorb_input(&id, &input.output().commitment, input.position);
         }
         for output in &self.outputs {
             id = absorb(DOM_BODY_OUT, &id, &output.item());
@@ -575,13 +586,18 @@ mod tests {
             covered: 0,
         };
         let id = tx.id();
-        // Where the inputs lie, when they were made and their memos are
-        // not the transaction's.
-        let mut moved = tx.clone();
-        (moved.inputs[0].position, moved.inputs[0].created, moved.inputs[0].memo) = (77, 3, [5; MEMO]);
-        assert_eq!(moved.id(), id);
-        // Everything else is.
-        let changes: [&dyn Fn(&mut Transaction); 6] = [
+        // When the inputs were made and their memos are not the
+        // transaction's: where an output lies says which it is, and
+        // the rest follows from that.
+        let mut other = tx.clone();
+        (other.inputs[0].created, other.inputs[0].memo) = (3, [5; MEMO]);
+        assert_eq!(other.id(), id);
+        // Everything else is: where each input lies among it, so that
+        // what is signed spends one output, and not another of the
+        // same key and amount.
+        let changes: [&dyn Fn(&mut Transaction); 8] = [
+            &|t| t.inputs[0].position = 77,
+            &|t| t.inputs[1].position += 1 << 32,
             &|t| t.inputs[0].amount += 1,
             &|t| t.inputs[1].key = key(3),
             &|t| t.inputs.swap(0, 1),

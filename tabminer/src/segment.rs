@@ -601,9 +601,15 @@ pub fn circuit() -> Circuit {
             // block's length and the flags.
             let of = |pick: &dyn Fn(&Spec) -> bool| (0..KINDS).filter(|k| pick(&SPECS[*k])).collect::<Vec<usize>>();
             let going_on = any(&of(&|s| s.goes_on));
+            // (An input is taken into the id under the place of the
+            // output it spends, which is in the key beside the domain:
+            // the two words after it, there and nowhere else. The leaf
+            // that follows is walked from that place.)
+            let placed = going_on.xor(&ones()).xor(&f(BODYIN));
             for i in 0..8 {
                 let key = if i == 0 { dom.clone() } else { con(0) };
-                s.zero_where(&going_on.xor(&ones()), cv[i].xor(&key));
+                let free = if i == 1 || i == 2 { &placed } else { &going_on.xor(&ones()) };
+                s.zero_where(free, cv[i].xor(&key));
                 s.zero_where(&going_on, cv[i].xor(&out[i].prev()));
             }
             for (k, spec) in SPECS.iter().enumerate() {
@@ -765,6 +771,9 @@ pub fn circuit() -> Circuit {
             same(s, &[LEAF, PSLEAF, OLEAF], &m[13..15], &r.amount);
             same(s, &[ISP], &m[..8], &before(&r.isp));
             same(s, &[ISP], &m[8..10], &r.pos0);
+            // (The leaf walked is at the place the id took the input
+            // in under: the row before a spent leaf is that one.)
+            same(s, &[LEAF, PSLEAF], &r.pos, &[p(&cv[1]), p(&cv[2])]);
             same(s, &[OLEAF, RLEAF, PCOMMIT], &m[..8], &before(&out[..]));
             same(s, &[OLEAF, CLEAF], &m[15..], &r.counts[2..]);
             same(s, &[OITEM], &m[..15], &before(&m[..15]));
@@ -1307,6 +1316,9 @@ pub struct Run {
     /// and the same as the run began with them.
     stack: Vec<([u32; 8], [u32; 8])>,
     stack0: Vec<([u32; 8], [u32; 8])>,
+    /// Where the output lies that the input in hand spends: what its
+    /// row of the id is keyed by.
+    placing: [u32; 2],
 }
 
 /// Where a signature's entry is in the signed set: its place and its
@@ -1345,7 +1357,17 @@ impl Run {
         // The nodes held are a run's own: none until it is told them.
         let state = State { stk: [0; 8], stk0: [0; 8], next0: state.next, stage: 0, ..state };
         let (stack, stack0) = (Vec::new(), Vec::new());
-        let mut run = Run { rows: Vec::new(), state, kind: START, dir: 0, out: [0; 8], start: state, stack, stack0 };
+        let mut run = Run {
+            rows: Vec::new(),
+            state,
+            kind: START,
+            dir: 0,
+            out: [0; 8],
+            start: state,
+            stack,
+            stack0,
+            placing: [0; 2],
+        };
         run.push(START, [0; 16], state);
         run
     }
@@ -1454,7 +1476,10 @@ impl Run {
     /// The compression a row of `kind` does of `block`.
     fn hash(&self, kind: usize, block: &[u32; 16]) -> ([u32; 8], [u32; 8]) {
         let spec = &SPECS[kind];
-        let cv = if spec.goes_on { self.out } else { [spec.domain.unwrap_or(0), 0, 0, 0, 0, 0, 0, 0] };
+        let mut cv = if spec.goes_on { self.out } else { [spec.domain.unwrap_or(0), 0, 0, 0, 0, 0, 0, 0] };
+        if kind == BODYIN {
+            cv[1..3].copy_from_slice(&self.placing);
+        }
         (cv, blake3::compress(&cv, block, 0, spec.len, spec.flags))
     }
 
@@ -1680,9 +1705,10 @@ impl Run {
         block[8..10].copy_from_slice(&amount);
         self.step(PCOMMIT, block, |s, out| (s.hold, s.amount) = (out, amount));
         let block = Self::pair(&self.state.body, &self.out);
+        let pos = split(input.position);
+        self.placing = pos;
         self.step(BODYIN, block, |s, out| (s.body, s.counts[0]) = (out, s.counts[0].wrapping_sub(1)));
         let block = Self::leaf_block(&self.state.hold, &input.memo, input.amount, input.created);
-        let pos = split(input.position);
         self.step(PSLEAF, block, |s, out| (s.w, s.v, s.cnt, s.pos, s.pos0, s.input) = (out, [0; 8], 0, pos, pos, !0));
         self.removal(path, input.amount);
     }
@@ -1737,6 +1763,12 @@ impl Run {
     /// the entry of the key's signature with `leaf` is in the signed set
     /// at `signed`.
     pub fn input(&mut self, input: &Input, path: &[Digest], leaf: u64, signed: &Signed) {
+        self.input_at(input, path, leaf, signed, input.position)
+    }
+
+    /// [`Run::input`], the leaf walked being the one at `walked`: the
+    /// input's own place, but in a test.
+    fn input_at(&mut self, input: &Input, path: &[Digest], leaf: u64, signed: &Signed, walked: u64) {
         self.entry(&input.key, leaf, signed, (KEY, ENT2));
         let amount = split(input.amount);
         let mut block = [0u32; 16];
@@ -1744,9 +1776,10 @@ impl Run {
         block[8..10].copy_from_slice(&amount);
         self.step(COMMIT, block, |s, out| (s.hold, s.amount) = (out, amount));
         let block = Self::pair(&self.state.body, &self.out);
+        self.placing = split(input.position);
+        let pos = split(walked);
         self.step(BODYIN, block, |s, out| (s.body, s.counts[0]) = (out, s.counts[0].wrapping_sub(1)));
         let block = Self::leaf_block(&self.state.hold, &input.memo, input.amount, input.created);
-        let pos = split(input.position);
         self.step(LEAF, block, |s, out| (s.w, s.v, s.cnt, s.pos, s.pos0, s.input) = (out, [0; 8], 0, pos, pos, !0));
         self.removal(path, input.amount);
     }
@@ -2637,6 +2670,33 @@ mod tests {
             other[word] ^= 1;
             assert!(!proves(named_run(&n, true).0, Some(&other)), "word {word}");
         }
+    }
+
+    /// What is signed spends one output: a transaction made to spend
+    /// one of two outputs of the same key and amount is not rows that
+    /// hold when the other is the leaf walked.
+    #[test]
+    fn a_signature_spends_the_output_it_names() {
+        let mine = key_hash(&key(0));
+        let mut tree = Outputs::default();
+        let places = [0, 1].map(|_| tree.insert(&Output::to(&mine, 60, [4; MEMO]), 90));
+        let input = Input { key: key(0), amount: 60, memo: [4; MEMO], created: 90, position: places[0] };
+        let out = Output::to(&key_hash(&key(7)), 60, [9; MEMO]);
+        let tx = Transaction { inputs: vec![input], outputs: vec![out], ops: vec![], policy: vec![], covered: 0 };
+        let set = Set(vec![[5u8; 32], crate::signature::entry(&key(0), &tx.id(), 1)]);
+        let spent_as = |walked: u64| {
+            let start = Record::start(&tree, EMPTY, EMPTY, 100);
+            let mut run = Run::new(&start, closed(), &set.root());
+            run.frontier(&tree.frontier_without([walked]));
+            run.head(&tx);
+            run.input_at(&tx.inputs[0], &tree.path(walked), 1, &set.at(1), walked);
+            run.output(&out, &key_hash(&key(7)));
+            run.settle();
+            let (rows, program, public) = run.finish(128);
+            holds(&rows, &program, &public)
+        };
+        assert!(spent_as(places[0]));
+        assert!(!spent_as(places[1]));
     }
 
     /// A reveal that spends its commitment registers its name: rows
