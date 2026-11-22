@@ -993,4 +993,80 @@ mod tests {
         let snap = state.snapshot().unwrap();
         assert_eq!(snap.outputs().next, 2 + 1 + count);
     }
+
+    /// Debugging only, where proofs go unchecked: blocks filled with
+    /// what nobody sent, that spend the outputs a chain began with; and
+    /// a chain of empty blocks made beforehand, with a table and
+    /// without one.
+    #[cfg(feature = "dev")]
+    #[test]
+    fn blocks_are_filled_and_a_chain_is_made_beforehand() {
+        use crate::chain::headers::tests::easy;
+        use crate::chain::params::ChainParams;
+        use crate::prover::{Level, Parts};
+        let open = |params: ChainParams| {
+            let verifier = ChainVerifier::of(&Level::SMALL, &Parts::dev()).unchecked();
+            let chain = Chain::open(MemBackend::new(), 8, params, seed(), verifier).unwrap();
+            chain.set_dataset(table());
+            chain
+        };
+        // What a block holds of what is asked for: all of it, or both
+        // less in the same measure.
+        assert_eq!(fill_plan(2_000_000, 10, 20), (10, 20));
+        let (outputs, spends) = fill_plan(2_000_000, 100_000, 100_000);
+        assert!(outputs == spends && (20_000..100_000).contains(&outputs), "{outputs}");
+        assert_eq!(fill_plan(0, 5, 5), (0, 0));
+
+        // A chain begun with a state nobody made.
+        let (n, spacing) = (400u64, 5u64);
+        let (root, roots) = crate::chain::debug::root(n, spacing, &|_| {});
+        let params = ChainParams { genesis_state: Some(root), ..easy() };
+        let chain = open(params);
+        crate::chain::debug::fill(&chain, n, spacing, &roots, &|_| {}).unwrap();
+        let dataset = &*table();
+        let said = Mutex::new(Vec::new());
+        let say = |line: &str| said.lock().unwrap().push(line.to_string());
+        let filled = Some((n, spacing));
+        for height in 1..=3u32 {
+            let paid = Output::to_key_hash(&[9; 32], params.subsidy(height) - 30);
+            let made = mine_filled(&chain, dataset, &paid, NOW, 1, 30, 20, filled, &say, &|| false).unwrap();
+            let Mined::Block { block, header, .. } = made else { panic!("{made:?}") };
+            let view = BlockRef::from_bytes(&block).unwrap();
+            assert_eq!((view.body().outputs().len(), view.body().inputs().len()), (31, 20));
+            assert_eq!(chain.apply_block(&view, NOW), Ok(Applied::Extended));
+            assert_eq!(chain.tip().unwrap(), header);
+        }
+        let lines = said.lock().unwrap().clone();
+        assert!(lines[0].starts_with("debug fill: block 1: 30 outputs, 20 spends, "), "{lines:?}");
+        assert_eq!(reward_due(&chain, &[]).unwrap(), Some((4, params.subsidy(4))));
+        // A reward that is not what the block may make with its outputs
+        // is another block's; and a block given up is not made.
+        let paid = Output::to_key_hash(&[9; 32], params.subsidy(4));
+        let made = mine_filled(&chain, dataset, &paid, NOW, 1, 30, 20, filled, &say, &|| false).unwrap();
+        assert!(matches!(made, Mined::Stale), "{made:?}");
+        let paid = Output::to_key_hash(&[9; 32], params.subsidy(4) - 30);
+        let made = mine_filled(&chain, dataset, &paid, NOW, 1, 30, 20, filled, &say, &|| true).unwrap();
+        assert!(matches!(made, Mined::Cancelled), "{made:?}");
+
+        // A chain of empty blocks: with the table every block's work is
+        // done, and a chain that is long enough already is left alone.
+        let chain = open(easy());
+        let told = Mutex::new(Vec::new());
+        let progress = |height: u32| told.lock().unwrap().push(height);
+        extend_empty(&chain, &seed(), Some(dataset), 20, 600, NOW + 1_000_000, &progress).unwrap();
+        assert_eq!(chain.tip().unwrap().height, 20);
+        extend_empty(&chain, &seed(), Some(dataset), 20, 600, NOW + 1_000_000, &progress).unwrap();
+        assert_eq!(chain.tip().unwrap().height, 20);
+        // Without one, only the first and the last of them: the rest
+        // claim work nobody did, which the chain is told to take while
+        // they are made, and no longer.
+        let chain = open(easy());
+        let blocks = 2 * WORKED + 8;
+        extend_empty(&chain, &seed(), None, blocks, 600, NOW + 1_000_000, &progress).unwrap();
+        assert_eq!(chain.tip().unwrap().height, blocks);
+        let claimed = chain.header_at(WORKED + 4).unwrap().unwrap();
+        assert_eq!(claimed.mix, EMPTY);
+        assert_ne!(chain.header_at(WORKED).unwrap().unwrap().mix, EMPTY);
+        assert_ne!(chain.header_at(blocks).unwrap().unwrap().mix, EMPTY);
+    }
 }

@@ -11,7 +11,8 @@
 # Needs the llvm-tools component: rustup component add llvm-tools
 #
 # The figures include the tests' own code (the `mod tests` of each file),
-# which always runs; src/tests/util.rs, only ever test code, is left out.
+# which always runs; src/tests/util.rs, only ever test code, is left out,
+# and so are tests/binary.rs and tests/scale.rs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -131,7 +132,11 @@ unset RUSTFLAGS
 "$bin/llvm-profdata" merge -sparse "$out"/prof/*.profraw -o "$out/coverage.profdata"
 
 # Only this crate's code: not the dependencies', nor the standard library's.
-ignore='(/\.cargo/|/rustc/|/src/tests/util\.rs$)'
+# Nor the program's own tests and the scale tests: nearly all of them
+# run nodes that prove blocks, or a state the size of years, which is
+# not done here, and what they would have reached of themselves is not
+# what is measured.
+ignore='(/\.cargo/|/rustc/|/src/tests/util\.rs$|/tests/(binary|scale)\.rs$)'
 # shellcheck disable=SC2086
 "$bin/llvm-cov" report --instr-profile="$out/coverage.profdata" $objects \
     --ignore-filename-regex="$ignore" > "$out/report.txt"

@@ -1203,13 +1203,27 @@ fn a_wallet_is_paid_by_a_name_under_a_name() {
 #[cfg(all(unix, feature = "dev"))]
 struct Unchecked {
     node: Running,
+    typed: std::process::ChildStdin,
     dir: PathBuf,
     listen: String,
 }
 
 #[cfg(all(unix, feature = "dev"))]
 impl Drop for Unchecked {
+    /// Told to stop at its prompt, as whoever keeps a node tells it, and
+    /// waited for: a node that ends of itself says what it did (where
+    /// what the tests reach is counted, it is then that it is written
+    /// down). Ended outright if it has not by then.
     fn drop(&mut self) {
+        use std::io::Write;
+        let _ = writeln!(self.typed, "quit");
+        let began = std::time::Instant::now();
+        while began.elapsed() < std::time::Duration::from_secs(20) {
+            if matches!(self.node.0.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let _ = self.node.0.kill();
         let _ = self.node.0.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -1222,16 +1236,20 @@ impl Unchecked {
         let dir = scratch(name);
         let listen = format!("127.0.0.1:{port}");
         let node = Command::new(TABMINER)
-            .args(["--network", network, "--debug-no-validate-proofs", "--no-prompt"])
+            .args(["--network", network, "--debug-no-validate-proofs"])
             .args(["--stat-interval-seconds", "1", "--stat-summary-seconds", "2"])
             .args(["--data-dir", &dir.display().to_string(), "--listen", &listen])
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        Unchecked { node: Running(node), dir, listen }
+        let mut node = Running(node);
+        // (A new wallet, if it makes one, has no password.)
+        let mut typed = node.0.stdin.take().unwrap();
+        let _ = std::io::Write::write_all(&mut typed, b"\n");
+        Unchecked { node, typed, dir, listen }
     }
 
     /// The lines of its main log that have `text` in them.
