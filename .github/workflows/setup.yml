@@ -75,7 +75,9 @@ jobs:
 
       - name: Make the main network's setup
         if: steps.needed.outputs.needed == 'true'
-        run: cargo test --release --features dev --lib -- prover::tests::write_the_main_network_s_setup --ignored --nocapture
+        # (tools/ignored.sh reads this line: the test that is run here and
+        # nowhere else.)
+        run: cargo test --locked --release --features dev --lib -- --ignored --exact --nocapture prover::tests::write_the_main_network_s_setup
 
       # With the new setups built in: two blocks of the main network made
       # and taken, which says how large its proof is and how long it takes.
