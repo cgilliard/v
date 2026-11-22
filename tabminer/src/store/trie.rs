@@ -181,7 +181,10 @@ const VOID: u8 = 0x40;
 const SPAN: u8 = 0x30;
 
 fn put_extent(out: &mut Vec<u8>, e: Extent) {
-    debug_assert!(e.start < 1 << 40 && e.units < 256);
+    // (Five bytes of where and one of how long: a file of 2^40 units,
+    // which no disk holds. Past that, what was written would be read
+    // from somewhere else.)
+    assert!(e.start < 1 << 40 && e.units < 256, "a page past what a child says of one");
     out.extend_from_slice(&e.start.to_le_bytes()[..5]);
     out.push(e.units as u8);
 }

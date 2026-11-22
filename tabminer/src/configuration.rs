@@ -267,7 +267,7 @@ is given (default 5)",
             Opt {
                 name: "sync-behind",
                 takes: Takes::Value("N"),
-                help: "take the state whole when more than N blocks under the\nbest header, though the blocks could be had (default 1008;\n0: only when they cannot)",
+                help: "take the state whole when more than N blocks under the\nbest header, though the blocks could be had (default 1008;\ntwice --sync-point at the least; 0: only when they cannot)",
             },
             Opt {
                 name: "max-undo-blocks",
@@ -1427,7 +1427,13 @@ mod tests {
         assert_eq!(wrong(&["--peer-drop-seconds", "30"]), "--peer-drop-seconds (30) is under --peer-live-seconds (65)");
         assert_eq!(wrong(&["--block-fetches", "4"]), "--block-fetches-per-peer (8) is over --block-fetches (4)");
         assert_eq!(wrong(&["--serve-queue", "4"]), "--serve-queue-per-peer (32) is over --serve-queue (4)");
-        assert_eq!(wrong(&["--sync-point", "2000"]), "--sync-point (2000) is not under --max-undo-blocks (1008)");
+        assert_eq!(
+            wrong(&["--sync-point", "2000", "--sync-behind", "4000"]),
+            "--sync-point (2000) is not under --max-undo-blocks (1008)"
+        );
+        let twice = "a setting cannot be run with: sync.sync_behind is under twice sync.sync_point";
+        assert_eq!(wrong(&["--sync-behind", "200"]), twice);
+        assert_eq!(wrong(&["--sync-point", "600"]), twice);
         assert_eq!(
             wrong(&["--stat-summary-seconds", "5"]),
             "--stat-summary-seconds (5) is under --stat-interval-seconds (10)"

@@ -122,7 +122,8 @@ pub struct Sync {
     /// be caught up block by block: further behind, the state is taken
     /// whole though the blocks could be had (of nodes that keep every
     /// block, a node would else never take it). Zero: only when the
-    /// blocks cannot be had.
+    /// blocks cannot be had. Twice the sync point at the least: a node
+    /// that has just taken the state is the sync point behind.
     pub sync_behind: u32,
     /// Parts of that state fetched at once.
     pub parts: usize,
@@ -276,6 +277,14 @@ impl Config {
         need(s.blocks >= 1 && s.blocks_per_peer >= 1, "sync.blocks or sync.blocks_per_peer is zero")?;
         need(s.lookahead >= 1, "sync.lookahead is zero")?;
         need(s.parts >= 1, "sync.parts is zero")?;
+        // (A node that has taken the state is as far under the best
+        // header as the sync point says, with those blocks to apply
+        // while more are made: were that "far behind", it would take
+        // the state again, and again.)
+        need(
+            s.sync_point == 0 || s.sync_behind == 0 || s.sync_behind as u64 >= 2 * s.sync_point as u64,
+            "sync.sync_behind is under twice sync.sync_point",
+        )?;
         need(self.serve.rate >= 1, "serve.rate is zero")?;
         need(self.serve.waiting_each >= 1, "serve.waiting_each is zero")?;
         need(self.serve.waiting >= self.serve.waiting_each, "serve.waiting is under serve.waiting_each")?;
@@ -334,6 +343,8 @@ mod tests {
         assert!(bad(|c| c.sync.headers = 0).contains("sync.headers"));
         assert!(bad(|c| c.sync.headers = 513).contains("sync.headers"));
         assert!(bad(|c| c.sync.header_fetches = 0).contains("sync.header_fetches"));
+        assert!(bad(|c| c.sync.sync_behind = 287).contains("sync.sync_behind"));
+        assert!(bad(|c| c.sync.sync_point = 505).contains("sync.sync_behind"));
         assert!(bad(|c| c.sync.blocks_per_peer = 0).contains("sync.blocks"));
         assert!(bad(|c| c.sync.parts = 0).contains("sync.parts"));
         assert!(bad(|c| c.serve.rate = 0).contains("serve.rate"));
