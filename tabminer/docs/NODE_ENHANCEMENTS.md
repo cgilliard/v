@@ -526,6 +526,11 @@ Two entries are in two places:
     should. With the block that hung for 85 s (entry 33) it would
     have been 85 s. So entry 33 first; the grace is what covers the
     rest.
+  - Seen at block 144 of the live test, the first boundary with a
+    file voted for (123 of 144 blocks): the node went over to onion
+    mode (`reached at: 3 of 3 nodes`), and a payment sent at block
+    144 was answered, signed and pooled at once. So with blocks
+    arriving as they should, the change of file works as it is.
   - Done with the rest of this entry, since both are of nodes
     agreeing on the file about a boundary.
 
@@ -669,6 +674,51 @@ these had a test of its own.
     To settle when it is done: what `Our vote` says on a node that
     votes for nothing, and where the rendezvous points go (they are
     not in the new form; `status` already says `reached at`).
+  - The same command with a file in force (seen after block 144),
+    which says more still:
+
+    ```
+    > consensus
+    mode onion
+    decided at block 144, of the votes of blocks 1 to 144: 137 of 144 voted
+    the next is decided at block 288
+    in force: 4a27…b492 (137 votes)
+      relay tab1qljp…dpxd 62.210.163.171:3737
+      relay tab1rz4c…swum 159.54.172.190:3737
+      relay tab1t4rw…xy2n 146.235.230.124:3737
+    rendezvous points (relays of the file in force, by ways through the others), reached at 3 of 3: 146.235.230.124:3737, 159.54.172.190:3737, 62.210.163.171:3737
+    since then: 4a27…b492 has 2 votes
+      as it stands not counted: 4a27…b492 (2 votes): too few blocks voted: 73 of the window's must, for any file
+    as the votes stand, from block 288 the mode will be init: 2 of the 144 blocks have voted, and 73 must for a file to be in force
+    the blocks made here vote for nothing (set-leaf 0 FILE)
+    ```
+
+    To be, in the form of the two above (proposed, to be agreed):
+
+    ```
+    > consensus
+    Mode: onion
+    File: 4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb492
+    Decided at block: 144 (137 of 144 votes)
+    Relays (reached at 3 of 3):
+        tab1qljpy98457gl0gx6hyujq4lsyftwt4aen5pwd44yuft84kafupwq9ddpxd 62.210.163.171:3737
+        tab1rz4cvn33nqqrmmuxma3jl00r4rqaqaej2t8a8w7z0c8kk5uenn9q55swum 159.54.172.190:3737
+        tab1t4rwy27j3c6p9a33xx8kfq97e3t2nzxuuajp5j9tekzau3hwuqtszjxy2n 146.235.230.124:3737
+    Next decision block: 288
+    Votes (73 needed):
+        4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb492: 2
+    Our vote: none
+    ```
+
+    - `File`, `Decided at block` and `Relays` only where a file is in
+      force; in init mode they are not there, as in the first form.
+    - `Votes (73 needed)` says in three words what the two long lines
+      about too few votes say; with it, what the mode will be at the
+      next decision can be read off and is not said.
+    - A file voted for that is not counted for another reason (not
+      held here, cannot be read) has that after its count:
+      `4a27…: 80 (not held)`.
+    - Addresses and hashes whole, never cut short: they are copied.
 - **Done so far:** one of a thing and several, in the line of a block's transactions. The going over of everything is still to do: as a list of what is said now and what is proposed, to be read through and agreed.
 
 ### 25. The prompt recalls what was typed, and completes what is begun
@@ -1167,20 +1217,26 @@ these had a test of its own.
   into one only by paying itself nearly everything, with the fee
   worked out by hand; and it goes by the message layer, which a
   payment to oneself has no need of.
-- **Change:** a command of its own, `consolidate [N] [FEE]`: the
-  wallet spends its N smallest spendable outputs (all that fit, if
-  no number is said) into one output of its own, signed at once with
-  no slate and nobody to answer, as a burn or a cancel is. A row of
-  its own kind in `txs`.
-- **To settle:**
-  - How many at once. Each output spent is a signature; a block
-    takes 256 signatures unless its miner says otherwise, and a
-    transaction with many is slower to prove. A number that fits one
-    block comfortably, and the command says how many are left.
+- **It does already, near enough (the user's point):** a wallet with
+  203,827 spendable sends itself 203,800: the wallet spends nearly
+  every output it has to make that up, and what comes back is one
+  output and a little change. Nothing has to be built for a miner to
+  do this today.
+- **Nice to have, no more:** `send all ADDRESS`: everything
+  spendable, less the fee, in one output and no change, so the amount
+  and the fee need not be worked out by hand. To one's own address it
+  makes all into one; to another's it empties the wallet.
+- **To keep in mind when it is done:**
+  - Each output spent is a signature; a block takes 256 signatures
+    unless its miner says otherwise. A wallet with more spendable
+    outputs than fit cannot send all at once: `send all` takes as
+    many as fit and says how much is left for another.
+  - A transaction with many signatures takes the miner longer to
+    prove (entry 19).
   - Rewards too young to spend are left out, and said.
-  - Which outputs: the smallest first, or the oldest.
-  - Each spend uses one of the eight signatures of each output's
-    key, as any spend does: nothing new, but said in `help`.
+  - To one's own address it goes by the message layer like any
+    payment, so the wallet has to be reached; whether a payment to
+    oneself is signed at once, with no slate.
 
 ## Done
 
