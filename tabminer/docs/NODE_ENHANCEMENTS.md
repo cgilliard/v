@@ -1326,9 +1326,13 @@ these had a test of its own.
      time, not the table whole; an index from an id to its row; the
      tables changed in place; `outputs` and `txs` keeping what they
      look up.
-  3. `txs` and `outputs` show the last screenful unless asked for
-     more (`txs 100`, `txs --all`), as entry 26 has `outputs` list
-     only what is unspent.
+  3. `outputs` lists what is unspent (entry 26): few lines for a
+     miner that makes its outputs one from time to time, as most
+     will. `outputs --all` is to work all the same with everything a
+     year leaves: tens of thousands of lines in a time that is no
+     trouble, since it is how a miner looks at what it has spent.
+     The test times both. `txs` shows the last screenful unless
+     asked for more (`txs 100`, `txs --all`).
   4. Whether rows of rewards long settled are kept for good, or
      folded into a count after a time (`4,320 rewards before block
      …`).
