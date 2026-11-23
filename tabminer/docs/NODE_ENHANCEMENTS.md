@@ -556,6 +556,36 @@ Two entries are in two places:
   proven for one signature that is the same for any (done once and
   kept); threads. Peak memory with each (5.5 GB at the most, in the
   live test).
+- **Readings from the live network** (the miner, 6 threads):
+
+  | block | signatures | all | signatures | work | run | sigs + work joined | block's root | chain's step |
+  |---|---|---|---|---|---|---|---|---|
+  | 117 | 0 | 32.4 s | - | 4.7 | 0.4 | - | 12.7 | 14.1 |
+  | 118 | 1 | 77.2 s | 9.9 | 4.1 | 7.5 | 27.2 | 12.7 | about 16 |
+  | 150 | 142 | 136.6 s | 81.5 | 4.3 | 7.6 | 13.5 | 13.5 | 15.6 |
+
+  - 142 signatures in one transaction (a miner paying itself all it
+    had, to make its outputs one) took 81 s: some 0.57 s a signature
+    past the first. A full block of 256 would be near two and a half
+    minutes of signatures alone, at a 34 s block here; at ten minutes
+    a block it fits.
+  - The joining of signatures and work took 27 s with one signature
+    and 13 s with 142: to be looked at, it should not be less with
+    more.
+  - Peak memory was no more than for any block (9.4 GB at the most
+    over the run, which is more than the 5.5 GB noted above: to be
+    looked at too).
+- **The fee of that transaction, asked about:** 0.00037 for 142
+  inputs and two outputs. That is the rule as written, not a fault:
+  a fee is by weight, an input weighs 1 and an output 3
+  (`mempool::Weights`), so 148 units at the least fee a unit. The
+  rule makes spending many outputs into few cheap on purpose (it
+  shrinks what every node keeps). But it prices a signature at a
+  third of an output, and a signature is what costs the miner: half
+  a second of proving each. **To settle:** whether an input should
+  weigh more (it would make every payment dearer, not only these),
+  or the miner's choice of what goes in a block should count the
+  proving time of its signatures against their fees.
 - **Done so far:** the line that says how long a block took to prove now says where the time went, part by part: the work, the run (or runs, and their joining), the signatures, the signatures and work together, the block's root, the chain's step. To be read off the live network for a block of a reward alone and one with a transaction. What is known from the code: a block of a reward alone has a run of the smallest size made for it; a block with any transaction has a run of 2^15 rows at the least, a proof of signatures made for sixty-four at a time, and one more proof that puts the signatures and the work together. That is where the forty-five seconds are, and a smaller size of run and of signatures' proof for a block of a few transactions is what would take them back (shapes of the setup: batch E).
 
 ### 21. Two ways to slow a node down that were left as they are
