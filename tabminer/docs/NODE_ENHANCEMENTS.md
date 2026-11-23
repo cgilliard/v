@@ -77,6 +77,18 @@ Two entries are in two places:
      say what is being done and how far it has got, as the table of
      the proof of work does.
 - **Done so far:** a node that mines with a setup that is built in (the main network's, the dev networks') gets ready to make blocks behind its start: it listens and answers at once, says `Getting ready to make blocks` and then `Ready to make blocks, after N s` in its log, and whatever makes blocks waits for that. If the setup built in is not the build's, the node says so and stops, as before. To be seen on the live network: that the prompt is there at once, and how long getting ready takes.
+- **Seen on the live network:** the server was ready at once and
+  peers connected while the setup was being made ready, which took
+  15.2 s (`Ready to make blocks, after 15.2s`). The miner asked for it
+  3.4 s after the server was ready and waited some 10.5 s: once a
+  start, not at later blocks.
+- **Still open, if the 15 s are to go (not decided):**
+  - keep what was made ready in a file in the data directory, and
+    read it at the next start; how large that file is has not been
+    measured;
+  - make the circuits ready side by side; how much of the 15 s is
+    side by side already has not been looked at.
+  Neither touches a circuit.
 
 ### 7. The command that shows the recovery phrase is hard to find
 
@@ -465,6 +477,32 @@ Two entries are in two places:
     leaves its blocks as not voting for everyone alike.
   - This is where entry 16 comes from: the further back the answer
     lies, the worse each of these is.
+- **The change from one file to the next has no grace (seen in the
+  live test, by asking):**
+  - As it is: the votes of the 144 blocks that end at a multiple of
+    144 decide; a file is in force if more than half of those blocks
+    (73) voted, for any file, and it is the most voted for that the
+    node holds and can read; else the mode is init. A node goes over
+    to it the moment its own chain reaches that block: its list of
+    relays is replaced at one stroke.
+  - `consensus.rs` names a grace (`GRACE = 6`: both files stand from
+    the boundary for five blocks, the old one goes at the sixth) and
+    a switch (`SWITCH = 2`: whoever sends prefers the new file from
+    the second block). Nothing reads them but a test that orders
+    them.
+  - The message layer has two blocks either side of a boundary in
+    which a wallet is reached at the points of both epochs
+    (`msg::OVERLAP`). Both sets are chosen from the one list the node
+    then holds: it covers the points changing with the epoch, not the
+    list changing with the file.
+  - What follows: between two different lists (init to onion, or one
+    list of relays to another), whoever is a block behind looks for a
+    wallet where it no longer is, until both are past the boundary.
+  - **Change:** the grace as it is named: the relays of the file
+    before stay in use until the sixth block, and whoever sends goes
+    over to the new ones from the second. Done with the rest of this
+    entry, since both are of nodes agreeing on the file about a
+    boundary.
 
 ### 19. How long a block takes to prove, and more with a transaction in it
 
@@ -562,7 +600,157 @@ these had a test of its own.
 - **Seen so far, and found to be clear enough as they are:**
   `Block 12 carries 1 transactions of the pool (1 signatures)`
   (but for the plural), and `reached at: 2 of 2 nodes` in `status`.
+- **Seen in the live test, to change:**
+  - What a command answers begins with a small letter and what the
+    node says later of the same thing with a capital: `payment
+    ed50925a begun: …` and then `Payment ed50925a answered by …`.
+    Both with a capital: `Payment`. (The same to be looked for in the
+    other answers: `payment … given up`, and the like.)
+  - `consensus` says too much, in sentences. Now:
+
+    ```
+    > consensus
+    mode init
+    nothing is decided before block 144: until then the mode is init
+    the next is decided at block 144
+    rendezvous points (the seeds: no file names relays), reached at 2 of 2: 159.54.172.190:3737, 146.235.230.124:3737
+    no valid votes received since then: init mode will be used from block 144 unless a file receives votes
+    the blocks made here vote for 4a27…b492: each one begun since that was set
+    ```
+
+    To be (decided), with no votes yet:
+
+    ```
+    > consensus
+    Mode: init
+    Next decision block: 144
+    Votes: none
+    Our vote: 4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb492
+    ```
+
+    and with votes, each file voted for and how many blocks voted
+    for it:
+
+    ```
+    > consensus
+    Mode: init
+    Next decision block: 144
+    Votes:
+        4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb492: 5
+        4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb491: 3
+    Our vote: 4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb492
+    ```
+
+    To settle when it is done: what `Our vote` says on a node that
+    votes for nothing, and where the rendezvous points go (they are
+    not in the new form; `status` already says `reached at`).
 - **Done so far:** one of a thing and several, in the line of a block's transactions. The going over of everything is still to do: as a list of what is said now and what is proposed, to be read through and agreed.
+
+### 25. The prompt recalls what was typed, and completes what is begun
+
+- **Asked for:** the up arrow brings back the commands typed before
+  (and down goes forward again), and tab completes a command begun.
+- **To settle:**
+  - The prompt reads whole lines today, which the terminal edits. For
+    arrows and tab it has to read key by key, with the terminal's own
+    echo and line editing off, and do the editing itself (left and
+    right, backspace, ctrl-h as backspace too, home and end, ctrl-c
+    and ctrl-d as now). There
+    is no library for it here: the terminal's settings are changed by
+    the system's own calls, which differ on Windows.
+  - Where input is not a terminal (the tests, a script piping
+    commands in), it reads lines as it does now.
+  - Tab as in bash (decided): where one thing fits, it is completed;
+    where several do, the first tab completes as much as they have in
+    common, and a second tab lists them under the line, which is then
+    drawn again as it was.
+  - What tab completes: the names of commands at least; whether also
+    what follows them (a file's name for `receive` and `finalize`,
+    `pending` and `mined` for `txs`, the wallet's names).
+  - Whether what was typed is kept from one run to the next, in a
+    file in the data directory. If so, never a line that carries a
+    secret (a recovery phrase typed to restore, a password).
+  - The log's lines come while a line is being typed: what is typed
+    is to be drawn again under them, not cut in two.
+
+### 26. `outputs` and `txs`, after the live test
+
+- **Asked for:** `outputs` says when an output that cannot be spent
+  yet can be: `spendable in N blocks`, counted from the confirmations
+  the wallet waits for (six, unless told otherwise) and, of a reward,
+  from when a reward may be spent.
+- **To settle:** where it goes: as the state (`confirmed` becoming
+  `spendable in 4 blocks` until it is spendable), or a column of its
+  own.
+- **Seen in the same test, a fault:** in `txs` a payment received
+  that has since been spent has no block:
+
+  ```
+       #  kind      state      amount        fee  block  id
+       1  received  confirmed     100          -      -  6fcada40
+       2  sent      confirmed      10  0.0000175     19  71d97043
+  ```
+
+  The block of an output is asked of the chain, which says it only of
+  what is unspent; row 2 spent the output of row 1. The same holds of
+  the `block` column of `outputs` for an output that is spent.
+  **Change:** the row keeps the height of the block that made the
+  output, from when the wallet is first told where it lies.
+
+### 27. `names` does not say when a commit can be revealed
+
+- **Seen:** a name committed to says `committed, not yet revealed`,
+  the same whether its commit is in no block yet, in a block and not
+  deep enough, or ready to be revealed. `name-reveal` refuses until
+  it is ready; `names` does not say when that is.
+- **The rule:** the chain takes a reveal from the block after the
+  commit's. The wallet waits longer of itself: as many blocks as it
+  waits before it spends an output (six, unless told), since a commit
+  undone by a reorganization after its name was revealed leaves the
+  name for whoever saw it.
+- **Change:** `names` says which of these a commit is in:
+  - `committed, not yet in a block`
+  - `committed, can be revealed in N blocks`
+  - `committed, ready to reveal (until block H)`, with the height
+    after which it can no longer be revealed and is swept.
+
+### 28. A reveal whose commit is not in the chain
+
+- **Asked for:** that a name cannot be revealed without its commit in
+  the chain; and that where it happens all the same (a
+  reorganization undoes the commit after the reveal was sent), the
+  wallet says the reveal failed and puts itself right.
+- **As it is, at the prompt:** `name-reveal` is refused unless the
+  wallet holds a commit for the name (`no commit for …`), the chain
+  has that commit (`the commit is not on chain yet`), and it is as
+  deep as the wallet waits (`the commit is N blocks old; wait M
+  more`). So a reveal with no commit is not signed by this wallet.
+- **As it is, after a reorganization:** not handled. A reveal names
+  its commit by where the commit lies. If the commit is undone, or
+  made again elsewhere, the reveal that was signed is of no use: no
+  block will take it. The wallet goes on saying `revealed, not yet in
+  the chain`, for good; it has let go of its record of the commit, so
+  the name cannot be revealed again without `cancel` of the reveal
+  first, which nothing tells the user to do. Only the case of another
+  registering the name first is seen and given up.
+- **Change:**
+  - At every block the wallet holds each reveal that is in no block
+    against the chain: is its commit still there, and where the
+    reveal says.
+  - If not: the reveal is given up of itself (what it was to spend is
+    free, the name goes back to `committed`, with the state of entry
+    27), its row in `txs` says `failed: its commit is no longer in
+    the chain`, and the log says so once.
+  - If the commit is in the chain again, elsewhere: the name is ready
+    to be revealed again, from there. If it is in no block: the
+    commit is pooled again as it was signed, if what it spent is
+    still where it was; else the user is told to commit again.
+  - The name has been said by then. That is told too: whoever saw the
+    reveal may commit to the name first.
+- **Tests wanted:** a commit undone after its reveal was sent and
+  before the reveal is in a block; the same with the commit made
+  again at another place; the same with reveal and commit both in
+  blocks that are undone.
 
 ## Done
 
