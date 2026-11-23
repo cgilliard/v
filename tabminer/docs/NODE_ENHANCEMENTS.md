@@ -720,10 +720,10 @@ these had a test of its own.
           tab1t4rwy27j3c6p9a33xx8kfq97e3t2nzxuuajp5j9tekzau3hwuqtszjxy2n 146.235.230.124:3737  *
       ```
 
-      with a mark beside those this wallet is reached at. To settle:
-      the command's name (`relays`, or `consensus relays`); and, of a
-      long list, whether it is shown whole or a screen at a time (or
-      `relays FILE` writes it to a file).
+      with a mark beside those this wallet is reached at. The
+      command is `relays` (decided). To settle: of a long list,
+      whether it is shown whole or a screen at a time (or `relays
+      FILE` writes it to a file).
     - `File`, `Decided at block` and `Relays` only where a file is in
       force; in init mode they are not there, as in the first form.
     - `Votes (73 needed)` says in three words what the two long lines
