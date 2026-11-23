@@ -863,7 +863,7 @@ pub enum Event {
     /// If the chain went over to its branch to take it, `undone` blocks
     /// of ours gave way, and `taken` of that branch are the chain's
     /// now (this one the last of them); else none and one.
-    Block { header: Header, from: Option<SocketAddrV4>, undone: u32, taken: u32 },
+    Block { header: Header, len: u32, from: Option<SocketAddrV4>, undone: u32, taken: u32 },
     /// A block was kept on a branch with no more work than the chain's:
     /// the chain is as it was. From this peer, or made here.
     Side { header: Header, from: Option<SocketAddrV4> },
@@ -2964,7 +2964,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     return;
                 }
                 self.peers.seen(&from, now);
-                for a in addrs.as_slice() {
+                // (But an address of the machine itself, which is
+                // whoever said it and nobody else's to try.)
+                for a in addrs.as_slice().iter().filter(|a| !a.ip().is_loopback()) {
                     self.tell(now, *a, Notice::Try(*a));
                 }
             }
@@ -3982,6 +3984,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     .find(|p| free(&p.addr) && !self.lacking.contains(&(*id, p.addr)))
                     .map(|p| (p.addr, None)),
             };
+            // Nobody: then one that is passed over, if it has been so
+            // for a little while, rather than nobody at all. (Nobody
+            // of any worker's: another's peer that can be asked is
+            // that worker's to ask.)
+            let nobody = source.is_none() && !l.views.iter().any(|v| v.holds(header.height));
+            let source = source.or_else(|| {
+                let rested = self.cfg.sync.header_wait;
+                let again = self.peers.holders_rested(header.height, now, rested);
+                again
+                    .filter(|_| nobody)
+                    .find(|p| free(&p.addr) && !self.lacking.contains(&(*id, p.addr)))
+                    .map(|p| (p.addr, None))
+            });
             // In order: a body nobody holds is not to be had, and those
             // above it could not join the chain without it.
             let Some((addr, len)) = source else {
@@ -4139,15 +4154,18 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             Ok(Applied::Extended | Applied::Reorganized { .. }) => {
                 self.counts.blocks += 1;
                 self.shared.blocks.fetch_add(1, Ordering::Relaxed);
-                // (Whoever waits for the chain to move is told.)
-                drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
-                self.shared.moved.1.notify_all();
                 let (undone, taken) = match result {
                     Ok(Applied::Reorganized { fork_height, unwound }) => (unwound, header.height - fork_height),
                     _ => (0, 1),
                 };
-                self.shared.say(Event::Block { header, from, undone, taken });
+                // The pool first: whoever waits for the chain to move
+                // makes the next block of what the pool then holds, and
+                // would else make it of what this block has just taken.
                 self.pool_follows(&header, taken, undone > 0);
+                // (Whoever waits for the chain to move is told.)
+                drop(self.shared.moved.0.lock().unwrap_or_else(|e| e.into_inner()));
+                self.shared.moved.1.notify_all();
+                self.shared.say(Event::Block { header, len, from, undone, taken });
                 // Caught up, if a chain ahead was being caught up with.
                 let mut first = [header];
                 if l.syncing

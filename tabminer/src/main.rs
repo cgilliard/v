@@ -136,11 +136,18 @@ fn said(event: &Event) -> Option<String> {
         Event::HeadersRefused { peer } => format!("Headers from {peer} refused"),
         // (A block made here that joins the chain was said when won.)
         Event::Block { from: None, undone: 0, .. } => return None,
-        Event::Block { header, from, undone: 0, .. } => {
-            format!("Received block {} ({}) {}", n(header.height), short(&header.hash()), whose(from))
+        Event::Block { header, len, from, undone: 0, .. } => {
+            let bytes = tabminer::block::HEADER_SIZE as u64 + *len as u64;
+            format!(
+                "Received block {} ({}) of {} bytes {}",
+                n(header.height),
+                short(&header.hash()),
+                commas(bytes),
+                whose(from)
+            )
         }
         // The chain went over to another branch.
-        Event::Block { header, from, undone, taken } => {
+        Event::Block { header, from, undone, taken, .. } => {
             let blocks = |k: u32| if k == 1 { "1 block".to_string() } else { format!("{} blocks", n(k)) };
             format!(
                 "Reorganized to block {} ({}) {}: {} undone, {} taken, above block {}",
@@ -394,10 +401,12 @@ fn make_block(
         && !pooled.is_empty()
     {
         let signatures: usize = pooled.iter().map(|tx| tx.weight()).sum();
+        let some =
+            |n: usize, one: &str, more: &str| format!("{} {}", commas(n as u64), if n == 1 { one } else { more });
         main.log(&format!(
-            "Block {height} carries {} transactions of the pool ({} signatures)",
-            commas(pooled.len() as u64),
-            commas(signatures as u64)
+            "Block {height} carries {} of the pool ({})",
+            some(pooled.len(), "transaction", "transactions"),
+            some(signatures, "signature", "signatures")
         ));
     }
     // What it pays is paid to the wallet: an output made for this
@@ -450,12 +459,17 @@ fn make_block(
     }
     match made {
         Ok(Mined::Block { block, header, hashes, solved, .. }) => {
+            // (Its size, and its proof's: nearly all of a block that
+            // carries little.)
+            let proof = tabminer::block::BlockRef::from_bytes(&block).map_or(0, |b| b.body().proof().len());
             main.log(&format!(
-                "Won block {} ({}): {} hashes in {}",
+                "Won block {} ({}): {} hashes in {}; {} bytes, {} of them its proof",
                 commas(header.height as u64),
                 short(&header.hash()),
                 commas(hashes),
-                short_seconds(solved.as_millis() as u64)
+                short_seconds(solved.as_millis() as u64),
+                commas(block.len() as u64),
+                commas(proof as u64)
             ));
             stats.add(socket::MINED, 1);
             // Until what came of it is heard: it is the chain's
@@ -851,7 +865,7 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     if let Some(phrase) = phrase {
         // (To nobody, if nobody is there to read it: that is no
         // reason for the node to stop.)
-        let _ = writeln!(std::io::stderr(), "\n{}\n", tabminer::console::made(&phrase));
+        let _ = writeln!(std::io::stderr(), "{phrase}");
     }
 
     // Blocks are made on a thread of their own, for as long as the
@@ -909,7 +923,11 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                 // not forget everybody it knew.)
                 let answered = hold.answered();
                 if answered != peers_were && !answered.is_empty() {
-                    let text: String = answered.iter().map(|peer| format!("{peer}\n")).collect();
+                    // (But an address of this machine itself, which is
+                    // given each time the node is started if it is
+                    // wanted, and is not for the next run to find.)
+                    let kept = answered.iter().filter(|peer| !peer.ip().is_loopback());
+                    let text: String = kept.map(|peer| format!("{peer}\n")).collect();
                     let tmp = peers_kept.with_extension("tmp");
                     match std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &peers_kept)) {
                         Ok(()) => peers_were = answered,
@@ -1204,7 +1222,8 @@ fn open_wallet(
         match made {
             Ok(wallet) => {
                 main.log(&format!("A wallet was made again from its words in '{}'", path.display()));
-                (wallet, None)
+                let said = tabminer::console::restored(&wallet.address());
+                (wallet, Some(said))
             }
             Err(e) => {
                 // (Nothing is left of a wallet that was not made.)
@@ -1219,7 +1238,7 @@ fn open_wallet(
             }
             e => whose(e),
         })?;
-        let phrase = phrase.filter(|_| is_new);
+        let phrase = phrase.filter(|_| is_new).map(|phrase| tabminer::console::made(&phrase));
         if phrase.is_some() {
             main.log(&format!("A wallet was made in '{}'", path.display()));
         }

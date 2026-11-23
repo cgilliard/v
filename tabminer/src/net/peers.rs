@@ -594,7 +594,10 @@ impl Peers {
     /// Live peers other than `except`, picked at random: as many as fit
     /// one message. What a node answers "whom else do you know?" with.
     pub fn sample(&mut self, except: Option<SocketAddrV4>, now: Micros) -> Addrs {
-        let mut all: Vec<SocketAddrV4> = self.live(now).map(|p| p.addr).filter(|a| Some(*a) != except).collect();
+        // (Never an address of the machine itself: it is this
+        // machine's to whoever is told it, wherever they are.)
+        let tellable = |a: &SocketAddrV4| Some(*a) != except && !a.ip().is_loopback();
+        let mut all: Vec<SocketAddrV4> = self.live(now).map(|p| p.addr).filter(tellable).collect();
         let mut out = Addrs::new();
         // A random few, not the table's first.
         for i in 0..all.len() {
@@ -665,6 +668,19 @@ impl Peers {
     pub fn holders(&self, height: u32, now: Micros) -> impl Iterator<Item = &Peer> {
         self.live(now).filter(move |p| {
             !self.passed_over(p, now) && p.status.is_some_and(|s| s.oldest <= height && height <= s.height)
+        })
+    }
+
+    /// The live peers whose chain holds the body at `height` and that
+    /// are passed over, each for longer than `rested`: whom to ask
+    /// when nobody else has it. A peer is passed over so that another
+    /// is asked in its place; where there is no other, not asking it
+    /// is not asking anyone, and a node with one peer that was slow
+    /// once would stand still for as long as a peer is passed over.
+    pub fn holders_rested(&self, height: u32, now: Micros, rested: Micros) -> impl Iterator<Item = &Peer> {
+        self.live(now).filter(move |p| {
+            p.failed.is_some_and(|t| self.passed_over(p, now) && now.saturating_sub(t) >= rested)
+                && p.status.is_some_and(|s| s.oldest <= height && height <= s.height)
         })
     }
 

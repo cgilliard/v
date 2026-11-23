@@ -47,34 +47,6 @@ Two entries are in two places:
 
 ## Open
 
-### 1. The miner builds a template before the pool has dropped what just confirmed
-
-- **Seen:** live test, 2026-11-22, block 12 on the miner (`main1`).
-  Block 11 carried a payment. Right after it was won, the log said
-  `Block 12 carries 1 transactions of the pool (1 signatures)`, and a
-  quarter of a second later `Proving block 12` again, this time without
-  the transaction.
-- **Effect:** none on the chain. Block 12 was proven in the usual time
-  and does not hold the payment twice. A moment of proving is thrown
-  away, and the log line says something that is not so.
-- **Change:** update the pool for the block just won before the next
-  template is built, so the first template is the right one.
-
-### 2. Block and proof sizes are not in the main log
-
-- **Seen:** same test. To learn the sizes of the blocks so far we had to
-  read them out of block announcements in `request.log`.
-- **Change:** say the block's size (and its proof's) on the `Won block`
-  and `Received block` lines.
-
-### 3. The space kept for the proof in a block has a thin margin
-
-- **Seen:** same test. Over 29 blocks, a block was 421 to 433 KB (mean
-  428 KB), nearly all of it the proof. The mempool keeps 440 KB of a
-  block for the proof (`PROOF_BYTES`), 7 KB over the largest seen.
-- **Change:** raise the reserve (450 KB, say), or measure the spread
-  over many more blocks and set it from that.
-
 ### 4. Blocks reach one seed a chunk at a time
 
 - **Seen:** same test. The RISC-V seed asked the miner for each block in
@@ -85,15 +57,6 @@ Two entries are in two places:
 - **Change:** look at why the transfer window to that node stays at one
   chunk (a slow or lossy path, or pacing that does not recover), and
   whether it should grow again sooner.
-
-### 5. What is said when a wallet is made is too long
-
-- **Seen:** same test, at the miner's first start. After
-  `Server is ready!` come a blank line, three lines about the twelve
-  words, a blank line, the words indented, a blank line, and then the
-  prompt.
-- **Change:** `Server is ready!`, then one line, `Recovery phrase:`
-  followed by the twelve words, then the prompt. Nothing else.
 
 ### 6. A mining node starts with twenty or thirty seconds of nothing
 
@@ -130,6 +93,7 @@ Two entries are in two places:
   everywhere would be a command named for it (`recovery-phrase`, say),
   listed in `help` under that name, with `seed` kept as another name
   for it or dropped.
+- **Done so far:** `seed` answers with the one line, and `help` calls it the recovery phrase. The command's name is as it was.
 
 ### 8. The wallet by two commands, `txs` and `outputs`, and one `cancel`
 
@@ -258,6 +222,7 @@ Two entries are in two places:
     gigabytes for the seconds it lasts (5.5 GB at the most in the live
     test). Whether that is to be of a fixed size too, kept between
     blocks, or left as it is and said apart in `status`.
+- **Done so far:** what `status` says: `memory: N MB`, and the store as one number (the file's length only where it is another). Memory of a fixed size is to come (batch D).
 
 ### 11. One node is counted as two peers when it is reached at two addresses
 
@@ -280,28 +245,6 @@ Two entries are in two places:
   another address, keeps one of the two (the one it was given, or the
   first); one that hears its own number knows it has reached itself,
   however it did.
-
-### 12. An address of the machine itself is told to other nodes
-
-- **Seen:** a node started with a new directory and no `--peer` had
-  `127.0.0.1:3737` among its peers at once.
-- **What it is:** a node asked for peers tells of any it has live
-  (`Peers::sample`), whatever kind of address each is; and a node told
-  of addresses tries each (`Message::Peers`), refusing only port 0 and
-  the unspecified, broadcast and multicast addresses. Another node of
-  the same machine had `127.0.0.1:3737` live and told of it; the new
-  one tried it, and the miner answered there, both being on one
-  machine. On another machine it would have been that machine itself,
-  or nothing. It is also kept in `peers.txt` and read again at the
-  next start.
-- **Change:** an address of the machine itself (`127.0.0.0/8`) is
-  never told to another node, and never taken from one. Such a peer is
-  one given on the command line and no other (two nodes on one
-  machine, to try things).
-- **To decide:** whether the same holds of the private ranges
-  (`10/8`, `172.16/12`, `192.168/16`): they too mean nothing outside
-  their own network, but two nodes of one network may rightly be each
-  other's peers by them. Taken only if given, perhaps, and never told.
 
 ### 13. What a live network says to itself: the request logs, read
 
@@ -505,7 +448,6 @@ idea is wanted, and how to do it is not settled.
   must be kept can be held to something recent (a vote said again
   from time to time, a bound on how long a file stands unrenewed), so
   that the last windows always say it.
-
 
 - **The concern:** init mode (the seeds standing in for relays) is for
   a network that is very small. Once the network is in onion mode and
@@ -726,14 +668,6 @@ idea is wanted, and how to do it is not settled.
   - This is where entry 16 comes from: the further back the answer
     lies, the worse each of these is.
 
-### 18. A wallet made again says its new address
-
-- **Seen:** a wallet made again from its words has another address
-  than it had. That is as it is meant to be, and not what whoever
-  restores one expects.
-- **Change:** when a wallet is made again, one line:
-  `Wallet's restored address: <address> (Note: this is different than the previous address)`.
-
 ### 19. How long a block takes to prove, and more with a transaction in it
 
 - **Seen:** live test, on six threads, with the table of the proof of
@@ -756,28 +690,6 @@ idea is wanted, and how to do it is not settled.
   proven for one signature that is the same for any (done once and
   kept); threads. Peak memory with each (5.5 GB at the most, in the
   live test).
-
-### 20. A node that stops catching up, with several workers (not yet understood)
-
-- **Seen:** once, in the test `over_real_sockets_with_several_workers`
-  on Windows: a node catching up over real sockets with several
-  workers had its headers in after 3.1 s and its first block after
-  1.9 s, reached block 10 of 25, and had nothing more in the five
-  minutes it was given. The same code passed on Windows four times
-  before and after. Earlier failures of this test, put down to a slow
-  machine, were probably the same.
-- **What it is:** not known. Ten blocks in two seconds and then none
-  is not slowness: something stopped asking for the blocks after, or
-  stopped giving them. It has been seen on Windows only, which does
-  not say it is of Windows only: a fault between workers would be
-  everywhere, and rarer elsewhere.
-- **Where to look first:** a fetch that one worker finished or gave
-  up while the list all workers share still has it as under way, so
-  that nothing more is asked for; the turns the serving side gives
-  among the addresses of a host; the rule for a fetch that is too
-  slow.
-- **Why it matters:** a node of the live network that stops catching
-  up and says nothing is wrong would be this.
 
 ### 21. Two ways to slow a node down that were left as they are
 
@@ -840,6 +752,7 @@ has a test of its own.
 - **Seen so far, and found to be clear enough as they are:**
   `Block 12 carries 1 transactions of the pool (1 signatures)`
   (but for the plural), and `reached at: 2 of 2 nodes` in `status`.
+- **Done so far:** one of a thing and several, in the line of a block's transactions. The going over of everything is still to do: as a list of what is said now and what is proposed, to be read through and agreed.
 
 ### 24. A `supply` command
 
@@ -862,4 +775,98 @@ has a test of its own.
 
 ## Done
 
-(Nothing yet.)
+### 1. The miner builds a template before the pool has dropped what just confirmed
+
+- **Seen:** live test, 2026-11-22, block 12 on the miner (`main1`).
+  Block 11 carried a payment. Right after it was won, the log said
+  `Block 12 carries 1 transactions of the pool (1 signatures)`, and a
+  quarter of a second later `Proving block 12` again, this time without
+  the transaction.
+- **Effect:** none on the chain. Block 12 was proven in the usual time
+  and does not hold the payment twice. A moment of proving is thrown
+  away, and the log line says something that is not so.
+- **Change:** update the pool for the block just won before the next
+  template is built, so the first template is the right one.
+- **Done:** the pool is brought up to a block before whoever waits for the chain to move is told.
+
+### 2. Block and proof sizes are not in the main log
+
+- **Seen:** same test. To learn the sizes of the blocks so far we had to
+  read them out of block announcements in `request.log`.
+- **Change:** say the block's size (and its proof's) on the `Won block`
+  and `Received block` lines.
+- **Done:** `Won block` says the block's size and its proof's; `Received block` the block's size.
+
+### 3. The space kept for the proof in a block has a thin margin
+
+- **Seen:** same test. Over 29 blocks, a block was 421 to 433 KB (mean
+  428 KB), nearly all of it the proof. The mempool keeps 440 KB of a
+  block for the proof (`PROOF_BYTES`), 7 KB over the largest seen.
+- **Change:** raise the reserve (450 KB, say), or measure the spread
+  over many more blocks and set it from that.
+- **Done, for now:** 450 KB. To be looked at once more when the proof is the size it will be (batch E).
+
+### 5. What is said when a wallet is made is too long
+
+- **Seen:** same test, at the miner's first start. After
+  `Server is ready!` come a blank line, three lines about the twelve
+  words, a blank line, the words indented, a blank line, and then the
+  prompt.
+- **Change:** `Server is ready!`, then one line, `Recovery phrase:`
+  followed by the twelve words, then the prompt. Nothing else.
+- **Done:** `Server is ready!`, then `Recovery phrase:` and the words on one line.
+
+### 12. An address of the machine itself is told to other nodes
+
+- **Seen:** a node started with a new directory and no `--peer` had
+  `127.0.0.1:3737` among its peers at once.
+- **What it is:** a node asked for peers tells of any it has live
+  (`Peers::sample`), whatever kind of address each is; and a node told
+  of addresses tries each (`Message::Peers`), refusing only port 0 and
+  the unspecified, broadcast and multicast addresses. Another node of
+  the same machine had `127.0.0.1:3737` live and told of it; the new
+  one tried it, and the miner answered there, both being on one
+  machine. On another machine it would have been that machine itself,
+  or nothing. It is also kept in `peers.txt` and read again at the
+  next start.
+- **Change:** an address of the machine itself (`127.0.0.0/8`) is
+  never told to another node, and never taken from one. Such a peer is
+  one given on the command line and no other (two nodes on one
+  machine, to try things).
+- **To decide:** whether the same holds of the private ranges
+  (`10/8`, `172.16/12`, `192.168/16`): they too mean nothing outside
+  their own network, but two nodes of one network may rightly be each
+  other's peers by them. Taken only if given, perhaps, and never told.
+- **Done:** an address of the machine itself is not told, not taken from what a peer tells, and not kept in `peers.txt`. A node that is reached from one directly still answers it and has it as a peer: that is a node of the same machine, and the two-nodes-on-one-machine case needs it. The private ranges are as they were (still to decide).
+
+### 18. A wallet made again says its new address
+
+- **Seen:** a wallet made again from its words has another address
+  than it had. That is as it is meant to be, and not what whoever
+  restores one expects.
+- **Change:** when a wallet is made again, one line:
+  `Wallet's restored address: <address> (Note: this is different than the previous address)`.
+- **Done:** the line is said after `Server is ready!`.
+
+### 20. A node that stops catching up
+
+- **Seen:** once, in the test `over_real_sockets_with_several_workers`
+  on Windows: a node catching up over real sockets with several
+  workers had its headers in after 3.1 s and its first block after
+  1.9 s, reached block 10 of 25, and had nothing more in the five
+  minutes it was given. The same code passed on Windows four times
+  before and after. Earlier failures of this test, put down to a slow
+  machine, were probably the same.
+- **What it is:** not known. Ten blocks in two seconds and then none
+  is not slowness: something stopped asking for the blocks after, or
+  stopped giving them. It has been seen on Windows only, which does
+  not say it is of Windows only: a fault between workers would be
+  everywhere, and rarer elsewhere.
+- **Where to look first:** a fetch that one worker finished or gave
+  up while the list all workers share still has it as under way, so
+  that nothing more is asked for; the turns the serving side gives
+  among the addresses of a host; the rule for a fetch that is too
+  slow.
+- **Why it matters:** a node of the live network that stops catching
+  up and says nothing is wrong would be this.
+- **Found, and done:** a fetch of a block that comes to nothing (given up for silence, or as too slow) has its peer passed over for ten minutes, so that another is asked in its place. A node with one peer that can give the block then asked nobody for ten minutes: ten blocks and then none. Now, where nobody else holds the block, a peer that has been passed over for a little while (`sync.header_wait`) is asked again. Tried by `a_node_with_one_peer_asks_it_again_after_a_fetch_fails`, which stands at block 8 of 40 without the change. Why a fetch should fail at all between two nodes of one machine on the Windows runner is not known (datagrams lost on a machine doing much else, most likely); with the change it costs seconds, and the other test of real sockets no longer asks that no fetch fail.

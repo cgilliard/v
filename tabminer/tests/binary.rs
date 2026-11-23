@@ -7,6 +7,8 @@ use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;
 
+/// What the line of a new wallet's words begins with.
+const PHRASE: &str = "Recovery phrase: ";
 const TABMINER: &str = env!("CARGO_BIN_EXE_tabminer");
 
 /// A node run by a test: ended with the test, however that ends.
@@ -284,8 +286,10 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
         let mut lines = BufReader::new(node.0.stderr.take().unwrap()).lines();
         let before: Vec<String> =
             lines.by_ref().map(|l| l.unwrap()).take_while(|l| !l.ends_with("Server is ready!")).collect();
-        assert!(!before.iter().any(|l| l.starts_with("    ")), "{before:#?}");
-        let words = lines.by_ref().map(|l| l.unwrap()).find(|l| l.starts_with("    ")).expect("the wallet's words");
+        assert!(!before.iter().any(|l| l.starts_with(PHRASE)), "{before:#?}");
+        // (One line, after the node is ready.)
+        let said = lines.by_ref().map(|l| l.unwrap()).find(|l| l.starts_with(PHRASE)).expect("the wallet's words");
+        let words = said.strip_prefix(PHRASE).unwrap_or_else(|| panic!("{said}"));
         assert_eq!(words.split_whitespace().count(), 12, "{words}");
         assert!(dirs[i].join("wallet.tab").exists());
         // (What it says on that side from here on is not waited for.)
@@ -451,12 +455,22 @@ impl Prompted {
             lines.by_ref().map(|l| l.unwrap()).take_while(|l| !l.ends_with("Server is ready!")).collect();
         // (A new wallet's words are said after that, and nowhere
         // before.)
-        assert!(!before.iter().any(|l| l.starts_with("    ")), "{before:#?}");
+        assert!(!before.iter().any(|l| l.starts_with(PHRASE)), "{before:#?}");
         let mut words = None;
         if new {
-            let said = lines.by_ref().map(|l| l.unwrap()).find(|l| l.starts_with("    ")).expect("the wallet's words");
-            assert_eq!(said.split_whitespace().count(), 12, "{said}");
-            words = Some(said.trim().to_string());
+            let said = lines.by_ref().map(|l| l.unwrap()).find(|l| l.starts_with(PHRASE)).expect("the wallet's words");
+            let phrase = said.strip_prefix(PHRASE).unwrap_or_else(|| panic!("{said}"));
+            assert_eq!(phrase.split_whitespace().count(), 12, "{said}");
+            words = Some(phrase.trim().to_string());
+        } else if restore.is_some() {
+            // (A wallet made again says its address, which is another.)
+            let said = lines
+                .by_ref()
+                .map(|l| l.unwrap())
+                .find(|l| l.starts_with("Wallet's restored"))
+                .expect("the wallet's address");
+            assert!(said.starts_with("Wallet's restored address: tab1"), "{said}");
+            assert!(said.ends_with("(Note: this is different than the previous address)"), "{said}");
         }
         std::thread::spawn(move || lines.for_each(drop));
         let mut node = Prompted { node, typed, said };

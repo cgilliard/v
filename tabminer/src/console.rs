@@ -105,8 +105,8 @@ pub const HELP: &str = "commands:
                             spends)
   prune                     forget outputs expected that the chain does not hold and
                             the pool will not make: of payments taken back, say
-  seed                      this wallet's twelve words (its password is asked for,
-                            if it has one)
+  seed                      this wallet's recovery phrase: its twelve words (its
+                            password is asked for, if it has one)
   password                  give the wallet a password, another, or none: asked for
   names                     this wallet's names, and its commits not yet revealed
   name NAME                 look a name up on the chain
@@ -159,12 +159,16 @@ pub enum Reply {
     NewPassword,
 }
 
-/// What is said of a wallet's twelve words when they are shown.
+/// What is said of a wallet's twelve words when they are shown: when
+/// the wallet is made, and when they are asked for. One line.
 pub fn made(phrase: &str) -> String {
-    format!(
-        "A wallet has been made. Its twelve words, which are all of it: write them down, and keep them\n\
-         where nobody else can read them. Whoever has them has what the wallet holds.\n\n    {phrase}"
-    )
+    format!("Recovery phrase: {phrase}")
+}
+
+/// What is said of a wallet made again from its words: its address,
+/// which is another than the wallet had.
+pub fn restored(address: &str) -> String {
+    format!("Wallet's restored address: {address} (Note: this is different than the previous address)")
 }
 
 /// What the commands are run on.
@@ -405,10 +409,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
     /// of a wallet that has none).
     pub fn seed(&self, password: &str) -> Result<String, String> {
         let phrase = self.wallet()?.phrase(password).map_err(|e| e.to_string())?;
-        Ok(format!(
-            "The wallet's twelve words, which are all of it. Whoever has them has what the wallet holds:\n\
-             keep them where nobody else can read them.\n\n    {phrase}"
-        ))
+        Ok(made(&phrase))
     }
 
     fn wallet(&self) -> Result<MutexGuard<'_, Wallet<W>>, String> {
@@ -438,14 +439,17 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         if sessions > 0 {
             out.push_str(&format!("\nsessions: {} wallets are reached here", commas(sessions as u64)));
         }
-        let (held, most) = (crate::heap::now() / 1_000_000, crate::heap::peak() / 1_000_000);
-        out.push_str(&format!("\nmemory: {} MB held, {} MB at the most", commas(held as u64), commas(most as u64)));
+        out.push_str(&format!("\nmemory: {} MB", commas(crate::heap::now() as u64 / 1_000_000)));
         // (Of the store's file, what is in use and how long it is: the
         // rest is space inside it, taken again before the file grows.)
         if let Ok(state) = self.hold.chain().whole() {
             let (used, end) = state.file().space();
             let mb = |units: u64| commas(units * crate::store::pagefile::UNIT as u64 / 1_000_000);
-            out.push_str(&format!("\nstore: {} MB in use, of a file of {} MB", mb(used), mb(end)));
+            // (The file's length is said only where it is another.)
+            match mb(used) == mb(end) {
+                true => out.push_str(&format!("\nstore: {} MB", mb(used))),
+                false => out.push_str(&format!("\nstore: {} MB, in a file of {} MB", mb(used), mb(end))),
+            }
         }
         if let Ok(wallet) = self.wallet() {
             let balance = follow::balance(self.hold.chain(), &wallet).map_err(|e| e.to_string())?;
@@ -2114,7 +2118,8 @@ mod tests {
         assert_eq!(bare.run("seed"), Reply::Wrong(none.to_string()));
         assert_eq!(bare.run("password"), Reply::Wrong(none.to_string()));
         assert_eq!(held.run("password"), Reply::NewPassword);
-        assert_eq!(said(&held, "seed").split_whitespace().count(), 37);
+        assert_eq!(said(&held, "seed").split_whitespace().count(), 14);
+        assert!(said(&held, "seed").starts_with("Recovery phrase: ") && !said(&held, "seed").contains('\n'));
         assert!(said(&held, "address").starts_with("tab1"));
         assert_eq!(said(&held, "balance"), "spendable   0");
         assert_eq!(said(&held, "outputs"), "no outputs");
@@ -2382,7 +2387,7 @@ mod tests {
         assert_eq!(payer.run("seed"), Reply::Password);
         assert_eq!(payer.run("password"), Reply::NewPassword);
         assert_eq!(payer.seed("wrong"), Err("wrong wallet password".to_string()));
-        assert_eq!(payer.seed("a password").unwrap().split_whitespace().count(), 37);
+        assert_eq!(payer.seed("a password").unwrap().split_whitespace().count(), 14);
         assert_eq!(payer.set_password("wrong", "x"), Err("wrong wallet password".to_string()));
         assert!(payer.set_password("a password", "").unwrap().starts_with("The wallet has no password now"));
         assert!(!payer.locked());
