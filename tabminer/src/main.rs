@@ -64,12 +64,21 @@ impl Making {
     }
 }
 
-/// What the node's proofs are made and checked with: made once, when
-/// the node starts.
+/// What the node's proofs are made with: made once, when the node
+/// starts, or behind its start where the setup is one that is built
+/// in (which is some seconds of work, and a node that is listening
+/// and answering meanwhile is better than one that says nothing).
 static SETUP: std::sync::OnceLock<Setup> = std::sync::OnceLock::new();
 
+/// The setup: waited for, by whoever makes blocks, if it is still being
+/// got ready.
 fn setup() -> &'static Setup {
-    SETUP.get().expect("the setup is made before anything uses it")
+    loop {
+        if let Some(setup) = SETUP.get() {
+            return setup;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The whole table of a network whose table is small enough to make in
@@ -378,7 +387,13 @@ fn make_block(
     let proved = |took: Duration| {
         if let Some((height, parent)) = &on {
             let took = short_seconds(took.as_millis() as u64);
-            main.log(&format!("Mining block {height} on {parent}: proved in {took}"));
+            // (And where the time went, part by part.)
+            let parts: Vec<String> = tabminer::prover::parts_timed()
+                .iter()
+                .map(|(name, took)| format!("{name} {}", short_seconds(took.as_millis() as u64)))
+                .collect();
+            let parts = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
+            main.log(&format!("Mining block {height} on {parent}: proved in {took}{parts}"));
         }
     };
     // What the block carries of the pool: none, if it cannot be
@@ -656,9 +671,48 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     // (Debugging: nor does one whose blocks are filled with what
     // nobody sent, which are not proven.)
     let proves = c.mine && c.debug_fill.is_none();
-    let again =
-        read.as_ref().filter(|_| proves).and_then(|parts| Setup::from_parts(proofs, emission, params.pow, parts));
+    // What makes blocks is got ready from the setup's numbers: seconds
+    // of work. Of a setup that is built in, behind the node's start:
+    // the numbers are all that checking blocks takes, and the node
+    // listens and answers while the rest is done. (Of one kept in the
+    // data directory, here and now as before: if it is not this
+    // build's, another is made, whose numbers the node then starts
+    // with.)
+    #[cfg(feature = "dev")]
+    let built_in = !matches!(c.network, Network::DevMainWork) || c.debug_unchecked;
+    #[cfg(not(feature = "dev"))]
+    let built_in = true;
+    let behind = proves && built_in && read.is_some();
+    if let (true, Some(parts)) = (behind, read.clone()) {
+        let (main, pow, mainnet) = (Arc::clone(&main), params.pow, matches!(c.network, Network::Mainnet));
+        let getting_ready = move || {
+            let began = Instant::now();
+            main.log("Getting ready to make blocks");
+            match Setup::from_parts(proofs, emission, pow, &parts) {
+                Some(proving) => {
+                    let _ = SETUP.set(proving);
+                    main.log(&format!("Ready to make blocks, after {:.1}s", began.elapsed().as_secs_f64()));
+                }
+                // (Never made here, the main network's least of all: a
+                // node with a setup of its own would make blocks nobody
+                // takes, and take nobody's.)
+                None => {
+                    let which = if mainnet { "the main network" } else { "this network" };
+                    main.log(&format!(
+                        "Error: the proofs' setup built in is not this build's: it makes no block of {which}. Halting!"
+                    ));
+                    std::process::exit(1);
+                }
+            }
+        };
+        std::thread::Builder::new().name("setup".into()).spawn(getting_ready).map_err(threads)?;
+    }
+    let again = read
+        .as_ref()
+        .filter(|_| proves && !behind)
+        .and_then(|parts| Setup::from_parts(proofs, emission, params.pow, parts));
     let (parts, proving) = match (read, again) {
+        (Some(parts), None) if behind => (parts, None),
         (Some(parts), Some(proving)) => (parts, Some(proving)),
         (Some(parts), None) if !proves => (parts, None),
         // (The main network's are never made here: a node with others

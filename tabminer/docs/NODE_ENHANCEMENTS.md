@@ -76,6 +76,7 @@ Two entries are in two places:
   2. If part of it cannot be moved or kept from one run to the next,
      say what is being done and how far it has got, as the table of
      the proof of work does.
+- **Done so far:** a node that mines with a setup that is built in (the main network's, the dev networks') gets ready to make blocks behind its start: it listens and answers at once, says `Getting ready to make blocks` and then `Ready to make blocks, after N s` in its log, and whatever makes blocks waits for that. If the setup built in is not the build's, the node says so and stops, as before. To be seen on the live network: that the prompt is there at once, and how long getting ready takes.
 
 ### 7. The command that shows the recovery phrase is hard to find
 
@@ -690,6 +691,7 @@ idea is wanted, and how to do it is not settled.
   proven for one signature that is the same for any (done once and
   kept); threads. Peak memory with each (5.5 GB at the most, in the
   live test).
+- **Done so far:** the line that says how long a block took to prove now says where the time went, part by part: the work, the run (or runs, and their joining), the signatures, the signatures and work together, the block's root, the chain's step. To be read off the live network for a block of a reward alone and one with a transaction. What is known from the code: a block of a reward alone has a run of the smallest size made for it; a block with any transaction has a run of 2^15 rows at the least, a proof of signatures made for sixty-four at a time, and one more proof that puts the signatures and the work together. That is where the forty-five seconds are, and a smaller size of run and of signatures' proof for a block of a few transactions is what would take them back (shapes of the setup: batch E).
 
 ### 21. Two ways to slow a node down that were left as they are
 

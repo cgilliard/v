@@ -88,6 +88,31 @@ pub struct Level {
     pub joins: usize,
 }
 
+/// How long each part of proving took, since this was last asked:
+/// the parts of a block's proof, in the order they were made. For
+/// whoever says how long a block took, to say where the time went.
+static PARTS: std::sync::Mutex<Vec<(&'static str, Duration)>> = std::sync::Mutex::new(Vec::new());
+
+/// What `part` gives, the time it took added to [`PARTS`] under `name`
+/// (to what is there under that name already, of a part done more
+/// than once).
+fn timed<T>(name: &'static str, part: impl FnOnce() -> T) -> T {
+    let began = std::time::Instant::now();
+    let out = part();
+    let mut parts = PARTS.lock().unwrap_or_else(|e| e.into_inner());
+    match parts.iter_mut().find(|p| p.0 == name) {
+        Some(p) => p.1 += began.elapsed(),
+        None => parts.push((name, began.elapsed())),
+    }
+    out
+}
+
+/// The parts of proving timed since this was last asked, and how long
+/// each took.
+pub fn parts_timed() -> Vec<(&'static str, Duration)> {
+    std::mem::take(&mut *PARTS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 impl Level {
     /// The main network's: 124 bits proven, the published proof ground
     /// more for fewer queries.
@@ -883,7 +908,7 @@ impl Setup {
         if signings.is_empty() || tree > self.level.trees {
             return None;
         }
-        sign(&self.level, &self.tables, &mut self.signed.clone(), signings, tree)
+        timed("the signatures", || sign(&self.level, &self.tables, &mut self.signed.clone(), signings, tree))
     }
 
     /// The runs of a block of `contents`, from the state `start` is of,
@@ -1116,7 +1141,7 @@ impl Setup {
         let rows = run.len() + SETTLE_ROWS;
         let per_tree = self.level.runs.len() + self.level.joins;
         let largest = 1usize << self.level.runs[self.level.runs.len() - 1];
-        let work = self.work(source, &parent.pow_hash(), &parent.nonce);
+        let work = timed("the work", || self.work(source, &parent.pow_hash(), &parent.nonce));
         let shown = Worked { proof: &work.0, stated: &work.1 };
         let cx = Shared::new();
         let mut reader = Deferred::new(&cx);
@@ -1125,7 +1150,7 @@ impl Setup {
                 if rows > REWARD_ROWS {
                     return None;
                 }
-                let run = segment::prove(run, REWARD_ROWS, self.level.inner);
+                let run = timed("the run", || segment::prove(run, REWARD_ROWS, self.level.inner));
                 let stated =
                     root_into(&cx, &self.tables, &mut reader, &Runs::One(&run), None, Some(&shown), start.height)?;
                 (0, self.reward, stated)
@@ -1140,7 +1165,9 @@ impl Setup {
                         joined = None;
                         (
                             proven.tree * per_tree + size,
-                            Some(segment::prove(run, 1 << self.level.runs[size], self.level.inner)),
+                            Some(timed("the run", || {
+                                segment::prove(run, 1 << self.level.runs[size], self.level.inner)
+                            })),
                         )
                     }
                     None => {
@@ -1150,8 +1177,9 @@ impl Setup {
                         if depth == 0 || depth > self.level.joins {
                             return None;
                         }
-                        let proved: Vec<segment::Proved> =
-                            runs.into_iter().map(|run| segment::prove(run, largest, self.level.inner)).collect();
+                        let proved: Vec<segment::Proved> = timed("the runs", || {
+                            runs.into_iter().map(|run| segment::prove(run, largest, self.level.inner)).collect()
+                        });
                         let mut level: Vec<(Proved, Vec<F>)> = Vec::new();
                         for at in 0..depth {
                             let mut above = Vec::new();
@@ -1172,7 +1200,8 @@ impl Setup {
                                     [&children[0], &children[1]],
                                 )?;
                                 reader.settle(&self.tables.all());
-                                let proof = prove_at(cx, vec![], self.level.inner, self.joins[at]);
+                                let proof =
+                                    timed("the runs joined", || prove_at(cx, vec![], self.level.inner, self.joins[at]));
                                 if !proof.holds {
                                     return None;
                                 }
@@ -1195,7 +1224,10 @@ impl Setup {
                     let mut reader = Deferred::new(&cx);
                     let both = beside_into(&cx, &self.tables, &mut reader, &proven.as_signed(), &shown)?;
                     reader.settle(&self.tables.all());
-                    (prove_at(cx, vec![], self.level.inner, sized.beside), both)
+                    (
+                        timed("signatures and work together", || prove_at(cx, vec![], self.level.inner, sized.beside)),
+                        both,
+                    )
                 };
                 if !beside.0.holds {
                     return None;
@@ -1206,11 +1238,11 @@ impl Setup {
             }
         };
         reader.settle(&self.tables.all());
-        let root = prove_at(cx, vec![], self.level.inner, sized.root);
+        let root = timed("the block's root", || prove_at(cx, vec![], self.level.inner, sized.root));
         if !root.holds || root.program != sized.program {
             return None;
         }
-        self.step(shape, &root, &stated, before, &parent.rest())
+        timed("the chain's step", || self.step(shape, &root, &stated, before, &parent.rest()))
     }
 
     /// The chain's step over a block's root, of the plan's shape
