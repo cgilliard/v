@@ -509,11 +509,25 @@ Two entries are in two places:
   - What follows: between two different lists (init to onion, or one
     list of relays to another), whoever is a block behind looks for a
     wallet where it no longer is, until both are past the boundary.
-  - **Change:** the grace as it is named: the relays of the file
-    before stay in use until the sixth block, and whoever sends goes
-    over to the new ones from the second. Done with the rest of this
-    entry, since both are of nodes agreeing on the file about a
-    boundary.
+  - **Change (decided):** the grace as it is named: the relays of
+    the file before stay in use until the sixth block after the
+    boundary, and whoever sends goes over to the new ones from the
+    second. Six is what a node does unless told otherwise: it is a
+    setting of the node, with the others of its kind.
+  - What the setting may be: how long a node goes on being reached
+    by the old relays is its own affair, and longer harms nobody.
+    Shorter than the block at which senders go over (the second)
+    would leave it unreachable in between: that is the least it can
+    be set to, and the block at which senders go over is not a
+    setting, since every sender is to do the same.
+  - A payment sent at the boundary in the live test went through:
+    two nodes disagree only while one has the boundary's block and
+    the other has not, a second or two when blocks arrive as they
+    should. With the block that hung for 85 s (entry 33) it would
+    have been 85 s. So entry 33 first; the grace is what covers the
+    rest.
+  - Done with the rest of this entry, since both are of nodes
+    agreeing on the file about a boundary.
 
 ### 19. How long a block takes to prove, and more with a transaction in it
 
@@ -1141,6 +1155,32 @@ these had a test of its own.
     that starts `12…`): the number wins; an id is given by enough
     digits not to be a number of a row, or all of it.
   - `help` says it once, for all of them.
+
+### 35. Many small outputs made into one
+
+- **Asked for:** a miner's wallet fills with one output a block. It is
+  to be able to make many of them into one.
+- **As it is:** a wallet can pay its own address (`send AMOUNT
+  ITS-OWN-ADDRESS`; the prompt allows it, and the wallet answers its
+  own slate through the nodes it is reached at). But the wallet
+  spends only as many outputs as the amount needs, so many are made
+  into one only by paying itself nearly everything, with the fee
+  worked out by hand; and it goes by the message layer, which a
+  payment to oneself has no need of.
+- **Change:** a command of its own, `consolidate [N] [FEE]`: the
+  wallet spends its N smallest spendable outputs (all that fit, if
+  no number is said) into one output of its own, signed at once with
+  no slate and nobody to answer, as a burn or a cancel is. A row of
+  its own kind in `txs`.
+- **To settle:**
+  - How many at once. Each output spent is a signature; a block
+    takes 256 signatures unless its miner says otherwise, and a
+    transaction with many is slower to prove. A number that fits one
+    block comfortably, and the command says how many are left.
+  - Rewards too young to spend are left out, and said.
+  - Which outputs: the smallest first, or the oldest.
+  - Each spend uses one of the eight signatures of each output's
+    key, as any spend does: nothing new, but said in `help`.
 
 ## Done
 
