@@ -45,6 +45,35 @@ Two entries are in two places:
 - **10**: what `status` says is in A; memory of a fixed size is in D,
   since the sizes of 15 say most of what is to be allocated.
 
+### After the second live test: the order of the fixes
+
+What the live test of batches A to C showed is entries 25 to 37, and
+more in 4, 6, 17, 19, 23 and 26. Taken in this order; the first six
+change nothing nodes say to each other, so nodes are upgraded one at
+a time.
+
+1. **The node itself:** a block's end fetched a chunk at a time (33,
+   and 4 with it), with a second peer asked when the chain waits on
+   one block and the wait said in the logs; and a node with nothing
+   to do that reads its store without end (37).
+2. **The wallet's commands, in one pass:** a row by its number or
+   its id everywhere (34); `outputs` (26); `txs` in the place of
+   `sent` and `slates` (32); when a commit can be revealed (27);
+   sending all (35).
+3. **What is said:** `consensus` and `relays`, `verify-proof`,
+   `Payment` (23, 29).
+4. **A miner's wallet at its size** (36), tried on CI.
+5. **A reveal whose commit is undone** (28), tests first.
+6. **The prompt:** recall and completion (25).
+7. **With batch D, as one upgrade of every node:** the grace at a
+   change of consensus file (17); names said in slates and proofs
+   (30, 31).
+
+Still to be decided, wanted by step 2 or 3: whether a payment
+expected is given up of itself when its payer takes it back (26);
+whether a payment to oneself is one row (26); whether an input
+should weigh more in the fee (19).
+
 ## Open
 
 ### 4. Blocks reach one seed a chunk at a time
