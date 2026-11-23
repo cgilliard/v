@@ -1339,6 +1339,43 @@ these had a test of its own.
 - **With it:** sending all, and how many signatures at once (entry
   35), since a miner's wallet is where both are met.
 
+### 37. A node with nothing to do uses three to four percent of a processor
+
+- **Seen:** with the miner stopped and no blocks coming, a node that
+  does not mine stays at 3.7% of a processor (and another the same).
+  It should be at nothing.
+- **Measured on that node** (from the system's own counts of the
+  process, ten seconds at a time):
+  - It is the six workers alike, 50 to 70 ms each in ten seconds.
+    They wake only once or twice a second: so each waking costs
+    some 4 ms, which is a great deal for a waking with nothing to
+    do.
+  - The node makes **17,000 reads a second** from its store,
+    15 MB a second, all of them answered from memory by the system
+    (nothing reaches the disk). That is what the 4 ms are.
+- **What it most likely is** (from the code; to be confirmed by
+  taking it away): every two seconds (`leaves_retry`) each worker
+  counts the votes for the consensus file afresh, twice over: the
+  144 blocks that decided what is in force, and the last 144. Each
+  count reads every one of those blocks' headers and leaves from the
+  store, and the files voted for, which are then read through again.
+  Six workers, each on its own. Nothing in the count can have changed
+  unless a block joined the chain, or leaves or a file arrived.
+- **Change:**
+  1. The votes are counted when the chain's last block changes, or
+     leaves or a file come in, and what was counted is kept where
+     every worker reads it. The two-second turn only asks again for
+     what is still missing.
+  2. Then measure again: a node with nothing to do is to make no
+     reads at all, and what is left of its waking (pings, the turns
+     of time) is to be too little to see.
+  3. A test that holds it there: a node left alone with a chain and
+     peers that say nothing new reads nothing from its store.
+- **With it, to look at:** that the store is read by the system's
+  call each time, with nothing kept by the node itself. For a node
+  catching up or serving many that may matter more than here (entry
+  10 has the store's memory).
+
 ## Done
 
 ### 1. The miner builds a template before the pool has dropped what just confirmed
