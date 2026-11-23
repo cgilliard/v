@@ -49,6 +49,7 @@
 //! the chain's state holds is asked through [`Unspent`].
 
 pub mod follow;
+pub mod list;
 pub mod names;
 pub mod records;
 
@@ -107,6 +108,8 @@ const T_PAYMENTS: usize = 16;
 /// What the slates that paid this wallet said (their notes): by the
 /// commitment of the output each made.
 const T_NOTES: usize = 17;
+/// The list of what the wallet has done and been paid ([`list`]).
+const T_LIST: usize = 18;
 
 /// A name this wallet has given out under a name it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -956,6 +959,9 @@ struct Tables {
     commits: BTreeMap<Id, names::PendingCommit>,
     /// The names the wallet holds or awaits, by name.
     names: BTreeMap<Vec<u8>, names::OwnedName>,
+    /// What the wallet has done and been paid, a row each, numbered
+    /// from one ([`list`]).
+    list: Vec<list::Row>,
 }
 
 /// A table of records each named by 32 bytes.
@@ -1011,6 +1017,7 @@ impl Tables {
             T_NAMES_SIGNED => put_entries(self.names_signed.iter().map(|(at, word)| (at, word.clone()))),
             T_PAYMENTS => put_entries(self.payments.iter().map(|(id, payment)| (id, payment.to_bytes()))),
             T_NOTES => put_entries(self.notes.iter().map(|(id, note)| (id, note.clone()))),
+            T_LIST => list::encode(&self.list),
             T_ADDRESS => match self.address {
                 0 => Vec::new(),
                 at => at.to_le_bytes().to_vec(),
@@ -1053,6 +1060,7 @@ impl Tables {
         for (id, note) in get_entries(&table(T_NOTES)?).ok_or(WalletError::Corrupt("notes"))? {
             t.notes.insert(id, note.to_vec());
         }
+        t.list = list::decode(&table(T_LIST)?).ok_or(WalletError::Corrupt("list"))?;
         for (at, word) in get_entries(&table(T_NAMES_SIGNED)?).ok_or(WalletError::Corrupt("names signed for"))? {
             t.names_signed.insert(at, word.to_vec());
         }
@@ -1171,7 +1179,11 @@ impl<B: Backend> Wallet<B> {
 
     /// Puts `t` in place of what the wallet keeps: the tables `dirty` on
     /// disk first, all at once, and only then in memory.
-    fn commit(&mut self, t: Tables, dirty: &[usize]) -> Result<()> {
+    fn commit(&mut self, mut t: Tables, dirty: &[usize]) -> Result<()> {
+        // (The list of what the wallet has done follows from the rest:
+        // brought up to it with every change, and kept with it.)
+        let listed = list::relist(&mut t);
+        let dirty: Vec<usize> = dirty.iter().copied().chain(listed.then_some(T_LIST)).collect();
         let encoded: Vec<(usize, Vec<u8>)> = dirty.iter().map(|table| (*table, t.encode(*table))).collect();
         let changes: Vec<(usize, &[u8])> = encoded.iter().map(|(table, bytes)| (*table, &bytes[..])).collect();
         self.records.write(&changes)?;
@@ -1787,6 +1799,7 @@ impl<B: Backend> Wallet<B> {
     /// no receipt, and what proves it is what the output's memo is the
     /// hash of.
     fn finalize_as(&mut self, slate: &Slate, now: u64, burn: Option<crate::proofs::Burn>) -> Result<Signed> {
+        let is_burn = burn.is_some();
         if slate.stage != 2 {
             return Err(WalletError::BadSlate("not a stage-2 slate"));
         }
@@ -1874,6 +1887,7 @@ impl<B: Backend> Wallet<B> {
         let proof = crate::proofs::Proof { height: 0, position: 0, key_hash, amount, memo, path, claim };
         let payment = Payment { txid: sent.txid, fee: slate.fee, created: now, proven: false, landed: None, proof };
         t.payments.insert(digest_to_bytes(&sent.txid), payment);
+        t.signed(&slate.id, &digest_to_bytes(&sent.txid), is_burn);
         t.sent.insert(digest_to_bytes(&sent.txid), sent);
         self.commit(t, &[T_OUTPUTS, T_SLATES, T_SENT, T_PAYMENTS])?;
         Ok(signed)
@@ -2042,8 +2056,11 @@ impl<B: Backend> Wallet<B> {
         unsigned: UnsignedTransaction,
         fee: u64,
         now: u64,
+        kind: list::Kind,
     ) -> Result<Signed> {
         let signed = self.sign(&mut t, unsigned, &sent.inputs)?;
+        list::relist(&mut t);
+        t.replaced(&digest_to_bytes(&sent.txid), &digest_to_bytes(&signed.tx.txid()), kind, fee, now);
         t.sent.remove(&digest_to_bytes(&sent.txid));
         let next = Sent {
             txid: signed.tx.txid(),
@@ -2092,7 +2109,7 @@ impl<B: Backend> Wallet<B> {
         for op in &sent.tx.ops {
             self.undo_name_op_in(&mut t, op);
         }
-        self.replace(t, sent, UnsignedTransaction::new(inputs, vec![back]), fee, now)
+        self.replace(t, sent, UnsignedTransaction::new(inputs, vec![back]), fee, now, list::Kind::Cancel)
     }
 
     /// Speeds up a finalized payment that is not yet confirmed: signs a
@@ -2135,7 +2152,7 @@ impl<B: Backend> Wallet<B> {
             return Err(WalletError::Insufficient { have: have as u128 + sent.fee as u128, need: fee as u128 });
         };
         let unsigned = UnsignedTransaction::with_ops(inputs, outputs, sent.tx.ops.clone());
-        self.replace(t, sent, unsigned, fee, now)
+        self.replace(t, sent, unsigned, fee, now, list::Kind::Bump)
     }
 
     /// A sent transaction as it was signed, to send again. Where its
@@ -2162,8 +2179,24 @@ impl<B: Backend> Wallet<B> {
     /// rewards not yet settled and anything in `keep`: the outputs of
     /// pooled transactions, which may yet land. Returns how many went.
     pub fn prune_pending(&mut self, chain: &impl Unspent, keep: &[Commitment]) -> Result<usize> {
+        self.prune_pending_of(chain, keep, true)
+    }
+
+    /// [`Wallet::prune_pending`]; with `answered` false, what this
+    /// wallet added to others' payments is kept whether a pool has it
+    /// or not: whoever pays may sign days later, and nobody asked for
+    /// the output to be forgotten. That is what the wallet does of
+    /// itself at every block.
+    pub fn prune_pending_of(&mut self, chain: &impl Unspent, keep: &[Commitment], answered: bool) -> Result<usize> {
         let mut t = self.t.clone();
         let mut in_flight: BTreeSet<Id> = keep.iter().map(digest_to_bytes).collect();
+        // (What a transaction this wallet signed makes may yet be made,
+        // whether the pool here has it or has lost it: it is sent
+        // again from its record.)
+        in_flight.extend(t.sent.values().flat_map(|s| s.tx.outputs.iter().map(|o| digest_to_bytes(&o.commitment))));
+        if !answered {
+            in_flight.extend(t.answered.iter().copied());
+        }
         in_flight.extend(t.slates.values().filter_map(|p| p.change.as_ref().map(digest_to_bytes)));
         in_flight.extend(t.rewards.keys().copied());
         let mut gone = 0;
@@ -2358,6 +2391,38 @@ impl<B: Backend> Wallet<B> {
     /// any more ([`Wallet::reconcile`]).
     pub fn is_lost(&self, c: &Commitment) -> bool {
         self.t.lost.contains_key(&digest_to_bytes(c))
+    }
+
+    /// The list of what the wallet has done and been paid, in the
+    /// order it first saw each ([`list`]).
+    pub fn list(&self) -> &[list::Row] {
+        &self.t.list
+    }
+
+    /// The row of number `number`.
+    pub fn listed(&self, number: u32) -> Option<&list::Row> {
+        self.t.list.get((number as usize).checked_sub(1)?)
+    }
+
+    /// The numbers of the rows that made the output of `commitment` and
+    /// that spend it, where the wallet knows: a transaction it signed
+    /// that has the output among those it makes, or the row of the
+    /// output itself as it came; and a transaction it signed that has
+    /// it among its inputs.
+    pub fn rows_of_output(&self, commitment: &Commitment) -> (Option<u32>, Option<u32>) {
+        let id = digest_to_bytes(commitment);
+        let signed = |row: &&list::Row| self.t.sent.get(&row.txid);
+        let made = self.t.list.iter().find(|row| {
+            (row.is_output() && row.id == id)
+                || signed(row).is_some_and(|s| s.tx.outputs.iter().any(|o| o.commitment == *commitment))
+        });
+        // (The last of them: a payment taken back or sped up spends
+        // what the one before it did.)
+        let spent = self.t.list.iter().rev().find(|row| {
+            row.by == 0 && signed(row).is_some_and(|s| s.inputs.contains(commitment))
+                || self.t.slates.get(&row.id).is_some_and(|p| p.inputs.contains(commitment))
+        });
+        (made.map(|row| row.number), spent.map(|row| row.number))
     }
 
     /// The payments sent that no block has: those of which the chain

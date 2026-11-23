@@ -43,7 +43,16 @@ pub const HELP: &str = "commands:
                             undone. Rewards of such blocks are under `mining`)
   mining                    the blocks this node won of late, and those of them that
                             were orphaned: undone, for a longer chain without them
-  outputs                   the wallet's outputs
+  txs [N | pending | mined] everything the wallet has done and been paid, a row each
+                            with a number that stays: payments sent and received,
+                            rewards, coins burned, the steps of names, and what was
+                            taken back or sped up. `txs N` says all of one; `txs
+                            pending` those in no block yet; `txs mined` the rewards
+  outputs                   the wallet's outputs: each one's block, where it lies
+                            among the chain's outputs, how many of its eight
+                            signatures are used (*last* beside it when one is
+                            left), and the rows of `txs` that made it and spend it
+                            (a dash where the wallet does not know)
   send AMOUNT [FEE] TO      pay AMOUNT to the wallet at TO: its address (tab1…), its
                             name (@name), or a name under a name (label@name). Its
                             wallet answers and this one signs, with nothing more
@@ -93,18 +102,17 @@ pub const HELP: &str = "commands:
                             what a command writes)
   slates                    the payments begun and not yet finalized
   sent                      the payments signed and not yet in a block
-  cancel ID [FEE]           give up a payment begun (ID: the first digits of its id),
-                            freeing what it was to spend; or take back a payment
-                            sent and not yet in a block, by another that pays what
-                            it spent back to this wallet (FEE as for send-file, at
-                            least the smallest that replaces it)
-  bump ID [FEE]             pay a payment sent the same with a higher fee, from its
+  cancel N [FEE]            undo row N of `txs`, if it can still be undone (N: its
+                            number, or the first digits of its id). Of a payment
+                            begun: gives it up, freeing what it was to spend. Of
+                            one sent and in no block yet: another is signed that
+                            pays what it spent back to this wallet (FEE as for
+                            send-file, at least the smallest that replaces it). Of
+                            one in a block: nothing, and it says so
+  bump N [FEE]              pay a payment sent the same with a higher fee, from its
                             change
-  resend ID                 pool a payment sent again, as it was signed (after a
-                            restart dropped it, or a reorganization moved what it
-                            spends)
-  prune                     forget outputs expected that the chain does not hold and
-                            the pool will not make: of payments taken back, say
+  resend N                  pool a payment sent again, as it was signed (after a
+                            restart dropped it)
   seed                      this wallet's recovery phrase: its twelve words (its
                             password is asked for, if it has one)
   password                  give the wallet a password, another, or none: asked for
@@ -134,10 +142,10 @@ pub const HELP: &str = "commands:
 
 /// What is said after a payment sent has been taken back, and after one
 /// has been sped up.
-const CANCELLED: &str = "The transaction has been cancelled, but it could still end up in a block. \
-Call prune to remove the stale transaction from your wallet.";
-const BUMPED: &str = "The transaction has been replaced, but the one before it could still end up in a block. \
-Call prune to remove the stale transaction from your wallet.";
+const CANCELLED: &str = "The transaction has been cancelled, but it could still end up in a block: \
+`txs` says which of the two did.";
+const BUMPED: &str = "The transaction has been replaced, but the one before it could still end up in a block: \
+`txs` says which of the two did.";
 
 /// What came of a command.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,6 +280,40 @@ type Said = Result<String, String>;
 /// transactions were signed from: so that a wallet whose file has gone
 /// back to an earlier state never signs from one of them again. How
 /// many outputs it was behind on.
+/// Lets go of what the wallet expected and will not have: outputs that
+/// the chain does not hold and nothing will make (of payments taken
+/// back, say). How many outputs, and which names' commits. Done by the
+/// wallet itself at every block (`asked` false): nobody has to ask.
+pub fn tidy<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + Sync>(
+    hold: &Handle<B, V>,
+    wallet: &Mutex<Wallet<W>>,
+    asked: bool,
+) -> Result<(usize, Vec<String>), String> {
+    // (What the pool's transactions make may yet be made.)
+    let (mut keep, mut commits) = (Vec::new(), Vec::new());
+    hold.pool(&mut |pool| {
+        for e in pool.entries() {
+            keep.extend(e.tx().outputs().iter().map(|o| o.commitment));
+            commits.extend(e.tx().ops().filter_map(|op| match op {
+                NameOp::Commit { commit, .. } => Some(commit),
+                _ => None,
+            }));
+        }
+    });
+    let mut wallet = wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let state = hold.chain().whole().map_err(|e| e.to_string())?;
+    let snap = state.snapshot().map_err(|e| e.to_string())?;
+    // (Asked for: what was added to others' payments goes too, and
+    // commits to names no pool has. Of itself: neither, since whoever
+    // pays may yet sign, and a commit the pool has lost is sent again.)
+    let gone = wallet.prune_pending_of(&snap, &keep, asked).map_err(|e| e.to_string())?;
+    let names = match asked {
+        true => wallet.prune_commits(&snap, &commits).map_err(|e| e.to_string())?,
+        false => Vec::new(),
+    };
+    Ok((gone, names))
+}
+
 pub fn observe<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + Sync>(
     hold: &Handle<B, V>,
     wallet: &Mutex<Wallet<W>>,
@@ -317,6 +359,8 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             ("balance", []) => self.balance(),
             ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(),
+            ("txs", []) => self.txs(None),
+            ("txs", [which]) => self.txs(Some(which)),
             ("mining", []) => self.mining(),
             ("send", [amount, to]) if !noted => self.send(amount, None, to, ""),
             ("send", [amount, to, note]) if noted => self.send(amount, None, to, note),
@@ -338,8 +382,10 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             ("finalize", [file]) => self.finalize(file),
             ("slates", []) => self.slates(),
             ("sent", []) => self.sent(),
-            ("cancel", [id]) => self.cancel(id, None),
-            ("cancel", [id, fee]) => self.cancel(id, Some(fee)),
+            ("cancel", [id]) => self.cancel(id, None, false),
+            ("cancel", [id, "yes"]) => self.cancel(id, None, true),
+            ("cancel", [id, fee]) => self.cancel(id, Some(fee), false),
+            ("cancel", [id, fee, "yes"]) => self.cancel(id, Some(fee), true),
             ("bump", [id]) => self.bump(id, None),
             ("bump", [id, fee]) => self.bump(id, Some(fee)),
             ("resend", [id]) => self.resend(id),
@@ -373,7 +419,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 "send" | "status" | "peers" | "mempool" | "fees" | "leaves" | "set-leaf" | "set-leaf-value"
                 | "consensus" | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "slates"
                 | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit"
-                | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
+                | "txs" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
                 | "name-transfer" | "mining" | "payments" | "payment-proof" | "burn-proof" | "verify-proof" | "burn",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
@@ -828,8 +874,14 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         let wallet = self.wallet()?;
         let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
         let snap = state.snapshot().map_err(|e| e.to_string())?;
-        let mut lines = Vec::new();
+        let tip = snap.tip().0;
+        let dash = |n: Option<u64>| n.map_or("-".to_string(), commas);
+        let mut lines = vec![format!(
+            "  {:<8}  {:>24}  {:<9}  {:>9}  {:>12}  {:<8}  {:>7}  {:>8}",
+            "id", "amount", "state", "block", "position", "sigs", "made by", "spent by"
+        )];
         for o in wallet.outputs() {
+            use crate::wallet::Unspent;
             let held = wallet.held(&o, &snap).map_err(|e| e.to_string())?;
             let what = match (o.state, held) {
                 (State::Unspent, true) => "confirmed",
@@ -839,18 +891,154 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 (State::Spent, true) => "locked",
                 (State::Spent, false) => "spent",
             };
-            let at = o.position.map_or("-".to_string(), |p| commas(p));
+            // The block that made it, while it is unspent there.
+            let deep = o.position.and_then(|p| snap.confirmations(p, &o.commitment).ok().flatten());
+            let block = deep.map(|deep| u64::from(tip + 1 - deep.min(tip + 1)));
+            // (How many of its eight signatures are used; the last one
+            // left is marked.)
+            let last = if o.signatures_left() == 1 { " *last*" } else { "" };
+            let sigs = format!("{}{last}", o.used);
+            let (made, spent) = wallet.rows_of_output(&o.commitment);
             // (What the slate that paid it said it was for.)
             let note = wallet.note_of(&o.commitment).map_or(String::new(), |note| format!("  \"{}\"", shown(note)));
             lines.push(format!(
-                "  {}  {:>24}  {what:<9}  at {at}{note}",
+                "  {}  {:>24}  {what:<9}  {:>9}  {:>12}  {sigs:<8}  {:>7}  {:>8}{note}",
                 short(&digest_to_bytes(&o.commitment)),
-                coins(o.amount as u128)
+                coins(o.amount as u128),
+                dash(block),
+                dash(o.position),
+                dash(made.map(u64::from)),
+                dash(spent.map(u64::from)),
             ));
         }
-        match lines.is_empty() {
-            true => Ok("no outputs".to_string()),
-            false => Ok(lines.join("\n")),
+        match lines.len() {
+            1 => Ok("no outputs".to_string()),
+            _ => Ok(lines.join("\n")),
+        }
+    }
+
+    /// The wallet's list of what it has done and been paid
+    /// ([`crate::wallet::list`]): all of it, a part of it (`pending`,
+    /// `mined`), or everything of one row.
+    fn txs(&self, which: Option<&&str>) -> Said {
+        use crate::wallet::Unspent;
+        use crate::wallet::list::{Kind, Row, Stage};
+        let wallet = self.wallet()?;
+        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        let tip = snap.tip().0;
+        let kind = |row: &Row| match row.kind {
+            Kind::Sent => "sent".to_string(),
+            Kind::Received => "received".to_string(),
+            Kind::Reward => "reward".to_string(),
+            Kind::Burn => "burn".to_string(),
+            Kind::NameCommit => "name commit".to_string(),
+            Kind::NameReveal => "name reveal".to_string(),
+            Kind::NameUpdate => "name update".to_string(),
+            Kind::NameTransfer => "name transfer".to_string(),
+            Kind::Cancel => format!("cancel of {}", row.of),
+            Kind::Bump => format!("bump of {}", row.of),
+        };
+        let stage = |row: &Row| match row.stage {
+            Stage::Begun if row.is_output() => "pending".to_string(),
+            Stage::Begun => "begun".to_string(),
+            Stage::Pooled => "pooled".to_string(),
+            Stage::Confirmed => "confirmed".to_string(),
+            Stage::Cancelled => "cancelled".to_string(),
+            Stage::Replaced => format!("replaced by {}", row.by),
+            Stage::Orphaned => "orphaned".to_string(),
+            Stage::Remake => "to be made again".to_string(),
+        };
+        // The block: of an output, the one the chain says made it; of a
+        // transaction, the height at which it was seen to be in.
+        let block = |row: &Row| -> Option<u64> {
+            if row.stage != Stage::Confirmed {
+                return None;
+            }
+            match row.is_output() {
+                true => {
+                    let o = wallet.owned(&crate::hash::digest_from_bytes(&row.id)?)?;
+                    let deep = snap.confirmations(o.position?, &o.commitment).ok().flatten()?;
+                    Some(u64::from(tip + 1 - deep.min(tip + 1)))
+                }
+                false => (row.height > 0).then_some(u64::from(row.height)),
+            }
+        };
+        let dash = |n: Option<u64>| n.map_or("-".to_string(), commas);
+        let amount = |n: u64| if n == 0 { "-".to_string() } else { coins(n as u128) };
+        let rows: Vec<&Row> = match which.copied() {
+            None => wallet.list().iter().collect(),
+            Some("pending") => wallet
+                .list()
+                .iter()
+                .filter(|r| matches!(r.stage, Stage::Begun | Stage::Pooled | Stage::Remake))
+                .collect(),
+            Some("mined") => wallet.list().iter().filter(|r| r.kind == Kind::Reward).collect(),
+            Some(n) => {
+                let row = n.parse::<u32>().ok().and_then(|n| wallet.listed(n));
+                let row = row.ok_or_else(|| format!("txs {n}: no such row (a number, `pending` or `mined`)"))?;
+                // Everything of one row.
+                let id = row.transaction().unwrap_or(row.id);
+                let mut out = format!("{}  {}  {}", row.number, kind(row), stage(row));
+                if !row.name.is_empty() {
+                    out.push_str(&format!("  @{}", String::from_utf8_lossy(&row.name)));
+                }
+                out.push_str(&format!("\namount: {}\nfee: {}", amount(row.amount), amount(row.fee)));
+                out.push_str(&format!("\nblock: {}", dash(block(row))));
+                let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+                out.push_str(&format!("\nid: {hex}"));
+                if let Some(sent) = wallet.sent().into_iter().find(|s| digest_to_bytes(&s.txid) == row.txid) {
+                    let positions = sent.tx.spent_positions();
+                    for (c, at) in sent.inputs.iter().zip(positions) {
+                        let used = wallet.owned(c).map_or("-".to_string(), |o| o.used.to_string());
+                        out.push_str(&format!(
+                            "\nspends: {} at {} (signatures used of its key: {used})",
+                            short(&digest_to_bytes(c)),
+                            commas(at)
+                        ));
+                    }
+                    for o in &sent.tx.outputs {
+                        let whose = if wallet.owned(&o.commitment).is_some() { " (this wallet's)" } else { "" };
+                        out.push_str(&format!(
+                            "\nmakes: {}  {}{whose}",
+                            short(&digest_to_bytes(&o.commitment)),
+                            coins(o.amount as u128)
+                        ));
+                    }
+                }
+                if let Some(payment) = wallet.payments().into_iter().find(|p| digest_to_bytes(&p.txid) == row.txid) {
+                    out.push_str(if payment.proven { "\nproof: ready" } else { "\nproof: not yet" });
+                }
+                if row.is_output()
+                    && let Some(c) = crate::hash::digest_from_bytes(&row.id)
+                    && let Some(note) = wallet.note_of(&c)
+                {
+                    out.push_str(&format!("\nnote: \"{}\"", shown(note)));
+                }
+                return Ok(out);
+            }
+        };
+        let mut lines = vec![format!(
+            "  {:>4}  {:<14}  {:<16}  {:>24}  {:>14}  {:>9}  {}",
+            "#", "kind", "state", "amount", "fee", "block", "id"
+        )];
+        for row in rows {
+            let name =
+                if row.name.is_empty() { String::new() } else { format!("  @{}", String::from_utf8_lossy(&row.name)) };
+            lines.push(format!(
+                "  {:>4}  {:<14}  {:<16}  {:>24}  {:>14}  {:>9}  {}{name}",
+                row.number,
+                kind(row),
+                stage(row),
+                amount(row.amount),
+                amount(row.fee),
+                dash(block(row)),
+                short(&row.transaction().unwrap_or(row.id)),
+            ));
+        }
+        match lines.len() {
+            1 => Ok("nothing yet".to_string()),
+            _ => Ok(lines.join("\n")),
         }
     }
 
@@ -1636,6 +1824,13 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
     /// The payment sent whose transaction's id starts `id`.
     fn sent_of(wallet: &Wallet<W>, id: &str) -> Result<crate::hash::Digest, String> {
         let hex = |d: &crate::hash::Digest| digest_to_bytes(d).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // (A row's number, for the transaction it is of.)
+        let of_row = id.parse::<u32>().ok().and_then(|n| wallet.listed(n)).and_then(|row| row.transaction());
+        if let Some(txid) = of_row
+            && let Some(sent) = wallet.sent().into_iter().find(|s| digest_to_bytes(&s.txid) == txid)
+        {
+            return Ok(sent.txid);
+        }
         let found: Vec<_> = wallet.sent().into_iter().map(|s| s.txid).filter(|t| hex(t).starts_with(id)).collect();
         match found[..] {
             [one] => Ok(one),
@@ -1663,11 +1858,50 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         }
     }
 
-    fn cancel(&self, id: &str, fee: Option<&&str>) -> Said {
+    fn cancel(&self, id: &str, fee: Option<&&str>, sure: bool) -> Said {
         let fee = self.fee(fee)?;
         self.observe()?;
         let mut wallet = self.wallet()?;
+        // (A row of the list, by its number: what it is of, and whether
+        // it can be undone at all.)
+        let row = id.parse::<u32>().ok().and_then(|n| wallet.listed(n).cloned());
+        if let Some(row) = &row {
+            use crate::wallet::list::{Kind, Stage};
+            match (row.kind, row.stage) {
+                (Kind::NameCommit, Stage::Confirmed) => {
+                    return Err(
+                        "a block has it: a commit cannot be cancelled. Left unrevealed, it is swept later".into()
+                    );
+                }
+                (Kind::Received | Kind::Reward, _) => {
+                    return Err("it is not this wallet's to cancel: it came to it".into());
+                }
+                (_, Stage::Confirmed) => {
+                    return Err(
+                        "a block has it already: it cannot be taken back (what it spent is spent on chain)".into()
+                    );
+                }
+                (_, Stage::Cancelled | Stage::Replaced | Stage::Orphaned) => {
+                    return Err(format!("row {} is done with already", row.number));
+                }
+                // A reveal that has been sent has said its name.
+                (Kind::NameReveal, _) if !sure => {
+                    return Err(format!(
+                        "the reveal has been sent, and has said the name: taking it back does not unsay it, \
+                         and another may register the name. To take it back all the same: cancel {id} yes"
+                    ));
+                }
+                _ => {}
+            }
+        }
         let hex = |id: &[u8; 32]| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // (By its number, the id in full; else the digits given.)
+        let id = match &row {
+            Some(row) if wallet.pending_slates().iter().any(|(slate, _)| *slate == row.id) => hex(&row.id),
+            Some(row) => hex(&row.transaction().unwrap_or(row.id)),
+            None => id.to_string(),
+        };
+        let id = &id[..];
         let found: Vec<[u8; 32]> =
             wallet.pending_slates().into_iter().map(|(i, _)| i).filter(|i| hex(i).starts_with(id)).collect();
         match found[..] {
@@ -1729,24 +1963,13 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         }
     }
 
+    /// What `prune` did by hand is done by the wallet itself at every
+    /// block ([`tidy`]); asked for, it is done now.
     fn prune(&self) -> Said {
-        // (What the pool's transactions make may yet be made.)
-        let (mut keep, mut commits) = (Vec::new(), Vec::new());
-        self.hold.pool(&mut |pool| {
-            for e in pool.entries() {
-                keep.extend(e.tx().outputs().iter().map(|o| o.commitment));
-                commits.extend(e.tx().ops().filter_map(|op| match op {
-                    NameOp::Commit { commit, .. } => Some(commit),
-                    _ => None,
-                }));
-            }
-        });
-        let mut wallet = self.wallet()?;
-        let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
-        let snap = state.snapshot().map_err(|e| e.to_string())?;
-        let gone = wallet.prune_pending(&snap, &keep).map_err(|e| e.to_string())?;
+        let wallet = self.wallet.as_ref().ok_or("this node has no wallet (it was started with --no-wallet)")?;
+        let (gone, commits) = tidy(&self.hold, wallet, true)?;
         let mut out = format!("{} outputs expected that will not be made were forgotten", commas(gone as u64));
-        for name in wallet.prune_commits(&snap, &commits).map_err(|e| e.to_string())? {
+        for name in commits {
             out.push_str(&format!("\nthe commit to {name} forgotten: it never reached the chain"));
         }
         Ok(out)
@@ -2470,6 +2693,21 @@ mod tests {
         assert_eq!(whom, id_of(&paid));
         let id = Slate::from_text(std::str::from_utf8(&slate).unwrap()).unwrap().id;
         assert!(payer.awaits_answer(&id) && !paid.awaits_answer(&id));
+        // The wallet's list has it, numbered: begun, and what it is to
+        // spend says which row spends it.
+        let row = |text: &str, n: u32| -> Vec<String> {
+            let line = text.lines().find(|l| l.split_whitespace().next() == Some(&n.to_string()));
+            line.unwrap_or_else(|| panic!("no row {n}: {text}")).split_whitespace().map(str::to_string).collect()
+        };
+        let listed = said(&payer, "txs");
+        assert_eq!(row(&listed, 1)[..4], ["1", "reward", "confirmed", "1,500"], "{listed}");
+        assert_eq!(row(&listed, 3)[..4], ["3", "sent", "begun", "5"], "{listed}");
+        let pending = said(&payer, "txs pending");
+        assert_eq!((pending.lines().count(), row(&pending, 3)[2].as_str()), (2, "begun"), "{pending}");
+        assert_eq!(said(&payer, "txs mined").lines().count(), 3);
+        let outputs = said(&payer, "outputs");
+        assert!(outputs.lines().any(|l| l.contains("reserved") && l.trim_end().ends_with(" 3")), "{outputs}");
+        assert_eq!(said(&paid, "txs"), "nothing yet");
         // What comes that is no slate, or of no kind there is.
         assert_eq!(paid.take(&message(99, vec![], None)), Err("a message of a kind not known (99)".to_string()));
         let nonsense = paid.take(&message(KIND_SLATE, b"nonsense".to_vec(), None));
@@ -2477,6 +2715,15 @@ mod tests {
         // Answered by the wallet it is for, back by the node it came by.
         let answered = paid.take(&message(KIND_SLATE, slate.clone(), None)).unwrap();
         assert!(answered.ends_with("answered: 5 to this wallet"), "{answered}");
+        // (What is coming to the wallet that is paid is a row of its
+        // list too, and its output says that row made it.)
+        let coming = said(&paid, "txs");
+        assert_eq!(row(&coming, 1)[..4], ["1", "received", "pending", "5"], "{coming}");
+        let outputs = said(&paid, "outputs");
+        assert!(
+            outputs.lines().any(|l| l.contains("pending") && l.split_whitespace().rev().nth(1) == Some("1")),
+            "{outputs}"
+        );
         let (_, answer) = last_post(&desk, KIND_SLATE);
         assert_ne!(answer, slate);
         // One that came by no node cannot be answered.
@@ -2493,6 +2740,16 @@ mod tests {
         let signed = payer.take(&message(KIND_SLATE, answer.clone(), Some(id_of(&paid)))).unwrap();
         assert!(signed.contains(&format!("answered by {to}, signed and pooled: transaction ")), "{signed}");
         assert!(said(&payer, "sent").ends_with("pooled") && !payer.awaits_answer(&id));
+        // The same row, of the transaction now: pooled, and all of it
+        // said when it is asked for by its number.
+        let listed = said(&payer, "txs");
+        assert_eq!(row(&listed, 3)[..4], ["3", "sent", "pooled", "5"], "{listed}");
+        let one = said(&payer, "txs 3");
+        assert!(
+            one.starts_with("3  sent  pooled\namount: 5\n") && one.contains("\nspends: ") && one.contains("\nmakes: ")
+        );
+        assert!(one.contains("(this wallet's)") && one.contains("\nproof: not yet"), "{one}");
+        assert!(matches!(payer.run("txs 9"), Reply::Wrong(_)));
         let again = payer.take(&message(KIND_SLATE, answer, Some(id_of(&paid)))).unwrap_err();
         assert!(again.ends_with("which this wallet has not begun"), "{again}");
         assert_eq!(payer.resolved(&id, &id_of(&paid)), Ok(String::new()));
@@ -2508,6 +2765,13 @@ mod tests {
         let given_up = payer.undelivered(&id_of(&paid), &id, "nobody there");
         assert!(given_up.ends_with("was not delivered (nobody there): given up, nothing was spent"), "{given_up}");
         assert_eq!(said(&payer, "slates"), "no payments begun");
+        // It keeps its row, which says what became of it; and a row
+        // that is done with is not cancelled again.
+        let listed = said(&payer, "txs");
+        assert_eq!(row(&listed, 4)[..4], ["4", "sent", "cancelled", "2"], "{listed}");
+        assert_eq!(payer.run("cancel 4"), Reply::Wrong("row 4 is done with already".to_string()));
+        // Nor is what came to the wallet.
+        assert_eq!(payer.run("cancel 1"), Reply::Wrong("it is not this wallet's to cancel: it came to it".to_string()));
         // One begun in a file is finalized from a file.
         let file = desk.file("by-file.slate");
         said(&payer, &format!("send-file 1 {file}"));

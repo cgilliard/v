@@ -1023,6 +1023,11 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                     _ => {}
                 }
                 failed = followed.is_err();
+                // (And what it expected and will not have is let go:
+                // of payments taken back, say. Nobody has to ask.)
+                if followed.is_ok() {
+                    let _ = tabminer::console::tidy(&hold, &wallet, false);
+                }
                 // A wallet made again from its words has looked for
                 // what it holds, the chain being all here.
                 if let Ok(did) = &followed

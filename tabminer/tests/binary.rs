@@ -354,8 +354,8 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     println!("{}", back.trim_end());
     // (Unless a block had it already: then it is not to be taken back.)
     if back.contains("taken back: transaction") {
-        let after = "The transaction has been cancelled, but it could still end up in a block. \
-                     Call prune to remove the stale transaction from your wallet.";
+        let after = "The transaction has been cancelled, but it could still end up in a block: \
+                     `txs` says which of the two did.";
         assert!(back.contains(after), "{back}");
         assert!(ask(&mut maker, "sent").contains("pooled") || ask(&mut maker, "sent").starts_with("no payments"));
         wait("the payment taken back is not mined", &mut || ask(&mut maker, "sent").starts_with("no payments"));
