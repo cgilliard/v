@@ -696,6 +696,14 @@ these had a test of its own.
   the `block` column of `outputs` for an output that is spent.
   **Change:** the row keeps the height of the block that made the
   output, from when the wallet is first told where it lies.
+- `slates` and `sent`, now that there is `txs`: entry 32.
+- **`outputs` lists what is unspent, unless asked (decided):** as it
+  is, every output the wallet still has a record of is listed, the
+  spent among them, and most of a wallet's list is soon of what is
+  gone. To be: `outputs` lists the unspent alone (confirmed, pending,
+  reserved, locked, orphaned); `outputs --all` lists the spent too.
+  Under the list of `outputs` without `--all`, a line that says so:
+  `Spent outputs are not listed: outputs --all lists every output.`
 
 ### 27. `names` does not say when a commit can be revealed
 
@@ -751,6 +759,287 @@ these had a test of its own.
   before the reveal is in a block; the same with the commit made
   again at another place; the same with reveal and commit both in
   blocks that are undone.
+
+### 29. What `verify-proof` says, and names in a proof
+
+- **Seen:** one long line:
+
+  ```
+  > verify-proof proof.txt
+  the proof holds: tab1pyhu…kfr0n paid 20 to tab1znry…mraz, in block 45 (43057e17), which has 2 confirmations. Both wallets say so, each by its own key
+  ```
+
+- **Change (decided):**
+
+  ```
+  > verify-proof proof.txt
+  the proof holds:
+  From: tab1pyhu4wjepkecczwyuee3w0pk8snad58wl3xkpn4j3v6lnt5dkqdqlkfr0n
+  To: tab1znry53z0gjgmylpvehln99csxrmukvewlvnd7radpdd8w5ssjp4s6mmraz
+  Amount: 20
+  Block: 45 (43057e17) (2 confirmations)
+  ```
+
+  With a `Note:` line where the payment has one. A burn in the same
+  form: `Burned:`, `For:` (to whose credit), `Purpose:`, `Block:`.
+- **Asked:** a proof does not say the names (or names under a name)
+  the payment was made by or to. Can it?
+- **As it is:** a proof is of two wallets' keys: who pays is named by
+  a tag of its key, who is paid signs a receipt with its own, and the
+  addresses shown are those keys'. A payment sent to `@name` is sent
+  to the address the name says at that moment; the name itself goes
+  nowhere, and nothing signed mentions it.
+- **It can, in two ways:**
+  1. *Shown, not proven.* `verify-proof` looks up, in the chain it
+     has, whether a name says each address, and shows it beside the
+     address. Nothing changes in the proof. But it is the name as it
+     stands when the proof is checked, not when the payment was made
+     (a name's address can be changed, and a name given away); and
+     the chain is kept by name, not by address, so finding the name
+     of an address means the proof or its reader supplying the name
+     to look up.
+  2. *Proven.* The proof carries the name and the chain's own proof
+     that, in the block of the payment, that name said that address
+     (the state has a root of the names, and a path to it can be
+     given, as for the output). Then `To: @name (tab1…)` is as sure
+     as the rest. For it to mean "paid as that name" and not only
+     "the name pointed there", the name is put in what the one who is
+     paid signs. That changes the slate, the receipt and the proof's
+     form, and makes the proof longer by a path.
+- **To decide:** which; whether both sides' names or only that of who
+  is paid (the payer's name is its own claim: it could be proven the
+  same way, by the payer's key and the name's record); and names
+  under a name, which are not in the chain's records at all but in
+  what the name's owner answers, so they can be shown as claimed and
+  no more, unless the owner signs them.
+
+### 30. A payment to a name does not say the name afterwards
+
+- **Seen:** `send 100 alice@me` is typed. From then on nothing says
+  `alice@me`: the row in `txs` is
+
+  ```
+      41  sent  confirmed  100  0.0000175  38  24f151cf
+  ```
+
+  with nobody named at all, and the proof of the payment shows the
+  address the name stood for. Whoever paid a name looks for the name.
+- **The thought:** the name is what the user knows the payment by, so
+  it is kept from the moment it is typed and shown wherever the
+  payment is. Three places, each more work than the one before:
+  1. **The wallet that pays remembers what was typed.** The row keeps
+     it (`alice@me`), with the address it stood for then. `txs` gets
+     a column for who the payment is to or from, which shows the name
+     where there was one and a short address where there was not;
+     `txs N` shows both in full. No change to anything sent: it can
+     be done at once.
+  2. **The wallet that is paid is told.** The slate carries the name
+     it was sent to, so the row of who is paid says `received … as
+     alice@me`; and, if who pays chooses to say so, the name it pays
+     as (`from @bob`). A change to the slate.
+  3. **The proof says it.** The name the payment was sent to is part
+     of what the one who is paid signs in the receipt, as the note
+     is. `verify-proof` then shows
+
+     ```
+     To: alice@me (tab1znry…mraz)
+     ```
+
+     and it means: the holder of that key signed that it was paid as
+     `alice@me`. This holds of names under a name as well as of
+     names, which the proving by the chain's records (entry 29, the
+     second way) cannot do. The two go together: for a name of the
+     chain's, `verify-proof` can also say whether the chain, at that
+     block, had the name at that address (`the chain agrees` or `the
+     chain did not have this name at this address`). A change to the
+     receipt and the proof's form.
+- **To settle:**
+  - A name is checked when it is shown: the one who is paid signed
+    for a name, which is not the same as owning it. Without the
+    chain's word (for a name) or the owner's (for a name under it),
+    it is said as `signed for by the recipient`, not as a fact.
+  - Whether the payer's name is in the proof at all, and by what: the
+    payer's key and the name's record at that block.
+  - The column's width: a name can be long, and a name under a name
+    longer; what is cut short in the list is whole in `txs N`.
+  - Rows from before this have no name to show.
+
+### 31. From an address to its name
+
+- **Asked:** `name NAME` says a name's address. The other way, an
+  address's name, so that wherever an address is shown its name can
+  be shown with it.
+- **What stands in the way:**
+  - A name's record says an address its owner chose, and nothing
+    makes that address's holder agree. Anyone can register a name
+    and point it at another's address. Shown beside the address as
+    its name, that is a label put on a wallet by a stranger.
+  - Several names can say one address: which is shown.
+  - The chain keeps names by name. From an address back, each node
+    keeps a list of its own, made by going through every name once
+    and kept up with each block; no rule of the chain changes.
+  - A name's address can be changed and a name given away: what is
+    shown is the name as it is now, not as it was when a payment was
+    made.
+  - Names under a name are not in the chain: none to find.
+- **Thought:** worth having, beside entry 30 and not in its place.
+  What was typed (entry 30) is right about what the user meant and
+  covers names under a name; looking back from an address covers what
+  nobody typed: payments that came in, addresses in a proof, peers'
+  addresses.
+- **To settle:**
+  - Whether a name is shown only where it is agreed to from both
+    sides. The holder of an address can say which name is its own
+    (the record's owner key and the address's keys are of one wallet,
+    and it can sign so; or a wallet says its name in what it sends).
+    Without that, how a name found this way is marked as not proven.
+  - Which of several: the one registered first, or all.
+  - The list's cost in the store and at a node's first start.
+- **The rule over all of it (decided):** the address is what a
+  payment is to and what everything rests on; a name is a
+  convenience on top of it.
+  - Everything works by address alone. Nothing is refused, held up
+    or shown wrongly for want of a name.
+  - The address is always shown. A name is shown with it only while
+    it holds: the chain's record still says that address, or the
+    certificate has not run out.
+  - When a name stops holding (its record goes to another key, a
+    certificate runs out and is not renewed), the address is shown
+    alone, as if there had never been a name. No error, nothing to
+    do.
+  - Nothing that is checked depends on a name: a payment, its
+    answer, a proof are sound by their keys, and a name that fails
+    its check is left out, not a reason to refuse.
+  - To settle: a payment made to a name that has since moved. In the
+    list, the address alone; whether `txs N` still says what was
+    typed then (`sent to alice@me, which is no longer this address`),
+    since that is what the user remembers it by.
+- **Names under a name, and a way that covers both:**
+  - There is no finding them from an address: the chain does not have
+    them, and the nodes a full name is reached at keep it by the hash
+    of the name, and only while its wallet is there.
+  - But a name under a name is a certificate (`subnames.rs`): signed
+    by the key of the name's holder, it says `label@name` is the
+    wallet of this id, until a time. The wallet that is named holds
+    it, and anyone with the chain can check it.
+  - So the name does not have to be looked up: **the wallet says its
+    own name, and whoever hears it checks it.** A wallet that goes by
+    a name says so where it says who it is: in its answer to a slate
+    (who is paid), in the slate (who pays, if it chooses), and so in
+    the proof. With it, for a name under a name, the certificate.
+    Whoever receives it checks: of a name, that the chain's record
+    says this wallet's address; of a name under a name, the
+    certificate against the chain's record of the name. What holds is
+    kept in the row and shown: `alice@me (tab1znry…mraz)`, the
+    address always with it.
+  - This is agreed from both sides without anything more: the name's
+    holder said the address (the record, or the certificate), and the
+    wallet at that address said the name. A stranger's name pointed
+    at a wallet is never shown, since the wallet does not say it.
+  - It also answers "which of several": the one the wallet says.
+  - And it is as of when the payment was made, kept with the payment,
+    not looked up again later.
+  - Whoever pays `alice@me` already asks for the certificate to find
+    the wallet: it is checked then, and can be kept then.
+  - What it does not give: a name for an address this wallet has
+    never dealt with. A list from addresses to names of the chain
+    would add that, for names alone, marked as not said by the
+    address's holder; whether that is wanted at all, once the rest is
+    there.
+  - To settle: a certificate holds for a week and is renewed. In a
+    proof read months later it is long past: it is checked against
+    the time of the payment's block, not of the reading; and the
+    name's record against that block, not the chain's last.
+
+### 32. `txs` takes the place of `slates` and `sent`
+
+- **Asked for:** what `txs` still wants, so that `sent` (and
+  `slates`) can go.
+- **`slates`:** says each payment begun, its id and amount. `txs
+  pending` says the same rows as `begun`, with more. It can go as it
+  is.
+- **`sent`:** says each payment signed that no block has: its id, its
+  fee, and whether this node's pool has it (`pooled`, or `not in the
+  pool (resend)`).
+- **What `txs` wants first:**
+  1. To ask the pool. Its `pooled` means signed and in no block,
+     whether the pool here holds the transaction or not. To be:
+     `pooled` where the pool has it, `not in the pool (resend N)`
+     where it has not (after a start that dropped it, say).
+  2. The same in `txs N` and in `txs pending`.
+- **Then:**
+  - `slates` and `sent` are taken out of the prompt and of `help`.
+  - What else names them goes over to `txs`: the lines that say
+    `Call … to` or point at `sent`, and the tests that read their
+    answers (`console.rs`, and the tests of real nodes in
+    `tests/binary.rs`, which wait on `sent` saying `pooled` and `no
+    payments sent that are not in a block`).
+
+### 33. A node catching up stood still for 38 seconds on one block
+
+- **Seen:** a third node started on the live network (`target/main3`,
+  no mining) took headers 1 to 74 in half a second and blocks 1 to 45
+  in five. Then nothing for 38.7 s (04:52:31.7 to 04:53:10.4), then
+  blocks 46 to 75 in a third of a second. Two peers connected just
+  as it stopped (the two local nodes, by the public address); that
+  looks to be chance.
+- **What the logs of that node say:**
+  - Nearly everything was here before it stopped. The statistics
+    count 26,262 datagrams in the first ten seconds: 74 blocks are
+    some 25,970 chunks. In the ten seconds in which it went on again,
+    64.
+  - So blocks 47 to 74 lay waiting, whole, behind block 46, of which
+    a few chunks were wanting (some 64, it seems). Blocks join the
+    chain in order.
+  - Block 46 is said to have come from 62.210.163.171, the seed that
+    is furthest and slowest (its blocks came half a second apart,
+    the others' a hundredth).
+  - It went on 150 ms after a ping came in from another peer: one
+    trip to that seed and back.
+  - The peers answered pings and other requests throughout. The two
+    local nodes were not asked for block 46.
+- **What that fits:** a fetch that waits in silence asks again for
+  what it waits for, one chunk, then two, four, … up to 64, waiting
+  twice as long each time (`transport/fetch.rs`). With the 150 ms
+  that seed's trip takes, eight such waits are 38 s, and the eighth
+  asks for 64 chunks. So: the last chunks of block 46 were asked for
+  again seven times, and nothing came, until the eighth.
+- **Not known:** why seven askings brought nothing. Either they did
+  not go out, or did not arrive, or the seed did not answer, or its
+  answers were lost. What would say which is the seed's own request
+  log for those 40 seconds (every `get block` from 74.244.51.185
+  and what was done with it). It has not been read: to be fetched
+  from the seed.
+  - If the seed refused them (it refuses, saying nothing, what is
+    over its bounds for one host: 32 requests, 4,096 chunks, counted
+    over every port of an address; the three nodes here are one
+    address to it), the log says `-> refused`.
+  - If the seed has no line of them, they were lost on the way or
+    never sent. The node here does not log what it asks: see below.
+- **Whatever the cause, three things are wrong on this side:**
+  1. One block's last chunks held up 28 blocks for 38 s while two
+     other peers that had the block stood idle. A fetch that is
+     silent is given eight doublings before anything else is tried;
+     the check for a fetch that is too slow goes by its rate over
+     its whole age, which a fetch that came fast and then stopped
+     passes for a long time. **Change:** a block (or run of headers)
+     that has had nothing for a few seconds, while another peer that
+     holds it is free, is asked of that peer as well; whichever
+     comes first is taken. What has come of it so far is kept.
+  2. Nothing says it happened. The main log has no line for a fetch
+     given up, too slow or silent; the statistics do not show the
+     counts the node keeps of them (`fetches_failed`,
+     `fetches_slow`, silences). **Change:** the counts in the
+     statistics' lines, and a line in the main log when the chain
+     waits on one block for more than a few seconds: which block,
+     asked of whom, how much of it is here.
+  3. The request log says what is asked of this node, not what it
+     asks of others. **Change:** to settle whether its own requests
+     for blocks are logged too (one line a fetch, not one a
+     request).
+- **To do first:** the seed's log, then the cause; then the changes
+  above, with a test of a peer that stops answering one fetch near
+  its end while it answers everything else.
 
 ## Done
 
