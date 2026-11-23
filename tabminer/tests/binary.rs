@@ -321,13 +321,14 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     let slate = dirs[0].join("payment.slate").display().to_string();
     let begun = ask(&mut maker, &format!("send-file 12.5 {slate}"));
     assert!(begun.contains("begun: 12.5 and a fee of"), "{begun}");
-    assert!(ask(&mut maker, "slates").contains("12.5"));
+    let pending = ask(&mut maker, "txs pending");
+    assert!(pending.contains(" begun ") && pending.contains("12.5"), "{pending}");
     let answered = ask(&mut other, &format!("receive {slate}"));
     assert!(answered.contains("answered: 12.5 to this wallet"), "{answered}");
     assert!(ask(&mut other, "balance").contains("unverified  12.5"));
     let signed = ask(&mut maker, &format!("finalize {slate}.received"));
     assert!(signed.contains("signed and pooled"), "{signed}");
-    assert_eq!(ask(&mut maker, "slates"), "no payments begun\n");
+    assert!(!ask(&mut maker, "txs pending").contains(" begun "));
     // Mined: the other has it, confirmed, and the maker's log says a
     // block carried it.
     wait("the payment is not confirmed", &mut || confirmed(&mut other) == "12.5");
@@ -357,8 +358,10 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
         let after = "The transaction has been cancelled, but it could still end up in a block: \
                      `txs` says which of the two did.";
         assert!(back.contains(after), "{back}");
-        assert!(ask(&mut maker, "sent").contains("pooled") || ask(&mut maker, "sent").starts_with("no payments"));
-        wait("the payment taken back is not mined", &mut || ask(&mut maker, "sent").starts_with("no payments"));
+        wait("the payment taken back is not mined", &mut || !ask(&mut maker, "txs pending").contains(" pooled "));
+        // (The list says which took the place of which.)
+        let listed = ask(&mut maker, "txs");
+        assert!(listed.contains(" replaced by ") && listed.contains(" cancel of "), "{listed}");
         // (What it was put in place of may have been mined all the
         // same, between the taking back and the block: which is what
         // the taking back says of itself. Then the other holds it.)
@@ -371,7 +374,7 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     } else {
         assert!(back.contains("a block has it already"), "{back}");
     }
-    assert!(ask(&mut maker, "bump 00").starts_with("error: no payment sent"));
+    assert!(ask(&mut maker, "bump 0000000000").starts_with("error: no row with that number"));
     // Told to stop, each does, without failure.
     for mut node in [maker, other] {
         writeln!(node.1, "quit").unwrap();
@@ -569,7 +572,7 @@ fn a_payment_survives_the_chain_going_over_to_another_branch() {
     wait("the payment that no block has is not pooled again", &mut || {
         log(0).contains("was in no block and not pooled: pooled again")
     });
-    assert!(maker.ask("sent").contains("pooled"));
+    assert!(maker.ask("txs pending").contains(" pooled "));
 
     // C makes blocks on what it has, where nobody knows of it, until
     // its branch is the longer; then it is where A and B find it.
@@ -595,7 +598,7 @@ fn a_payment_survives_the_chain_going_over_to_another_branch() {
     // is no such output now, and no block will ever have that payment.
     // Its sender has nothing waiting; its recipient has what was never
     // more than expected, until it is pruned.
-    assert_eq!(maker.ask("sent"), "no payments sent that are not in a block\n");
+    assert!(!maker.ask("txs pending").contains(" pooled "), "{}", maker.ask("txs"));
     assert!(other.ask("balance").contains("unverified  3"));
     assert!(other.ask("prune").starts_with("1 outputs expected"));
     assert_eq!(other.ask("balance"), "spendable   12.5\n");
@@ -635,7 +638,7 @@ fn a_name_is_registered_changed_and_given_at_the_prompt() {
     // commit has been in the chain for as long as the network asks.
     let committed = maker.ask("name-commit alice -");
     assert!(committed.starts_with("Name alice: committed to: transaction "), "{committed}");
-    assert!(maker.ask("names").contains("committed, not yet revealed"));
+    assert!(maker.ask("names").contains("committed, "));
     assert!(maker.ask("name-commit alice").starts_with("error: the wallet has already committed"));
     let mut early = false;
     wait("the name is not revealed", &mut || {
@@ -870,8 +873,8 @@ fn a_payment_is_sent_to_an_address() {
         std::thread::sleep(Duration::from_millis(50));
     }
     // (Mined, and what it paid is the wallet's to spend again.)
-    while !payer.ask("slates").starts_with("no payments begun") || payer.confirmed() == "0" {
-        assert!(began.elapsed() < Duration::from_secs(2400), "{}", payer.ask("slates"));
+    while payer.ask("txs pending").contains(" begun ") || payer.confirmed() == "0" {
+        assert!(began.elapsed() < Duration::from_secs(2400), "{}", payer.ask("txs"));
         std::thread::sleep(Duration::from_millis(300));
     }
     let sent = Instant::now();
@@ -987,7 +990,7 @@ fn a_payment_is_sent_to_an_address() {
         assert!(began.elapsed() < Duration::from_secs(1800), "{log}");
         std::thread::sleep(Duration::from_millis(200));
     }
-    assert!(payer.ask("slates").starts_with("no payments begun"), "{}", payer.ask("slates"));
+    assert!(!payer.ask("txs pending").contains(" begun "), "{}", payer.ask("txs"));
     assert!(payer.confirmed() >= held);
     // Each wallet's log says its part of it, and whom it was with.
     let logs: Vec<String> = dirs.iter().map(|d| std::fs::read_to_string(d.join("tabernacle.log")).unwrap()).collect();
@@ -1375,7 +1378,7 @@ fn a_wallet_is_asked_at_the_prompt_and_made_again_with_no_block() {
     assert!(node.ask("status").starts_with("block 0 ("));
     assert_eq!(node.ask("balance"), "spendable   0\n");
     assert_eq!(node.ask("peers"), "0 peers known, 0 of them live\n");
-    for line in ["outputs", "names", "fees", "mempool", "leaves", "consensus", "mining", "slates", "sent", "payments"] {
+    for line in ["outputs", "names", "fees", "mempool", "leaves", "consensus", "mining", "txs", "payments"] {
         assert!(!node.ask(line).is_empty(), "{line}");
     }
     let address = node.ask("address");

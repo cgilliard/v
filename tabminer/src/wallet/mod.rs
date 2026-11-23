@@ -962,6 +962,10 @@ struct Tables {
     /// What the wallet has done and been paid, a row each, numbered
     /// from one ([`list`]).
     list: Vec<list::Row>,
+    /// Outputs a block was just seen to make, and its height: for the
+    /// list's rows, and not kept (taken up when the list is next
+    /// brought up to date, which is at once).
+    located: Vec<(Id, u32)>,
 }
 
 /// A table of records each named by 32 bytes.
@@ -1381,6 +1385,7 @@ impl<B: Backend> Wallet<B> {
             if let Some(o) = t.outputs.get_mut(&id) {
                 o.position = Some(first + i as u64);
                 t.answered.remove(&id);
+                t.located.push((id, height));
                 found += 1;
             }
             // An output this wallet paid for, or burned: where it is,
@@ -2422,6 +2427,53 @@ impl<B: Backend> Wallet<B> {
     /// The row of number `number`.
     pub fn listed(&self, number: u32) -> Option<&list::Row> {
         self.t.list.get((number as usize).checked_sub(1)?)
+    }
+
+    /// The outputs that have a row in the list, lie in the chain, and
+    /// whose row does not say which block made them, with where each
+    /// lies: those found by looking through the unspent outputs, not
+    /// in a block as it went by. For whoever can ask the chain
+    /// ([`Wallet::placed`]).
+    pub fn unplaced(&self) -> Vec<(Commitment, u64)> {
+        let rows = self.t.list.iter().filter(|row| row.is_output() && row.height == 0);
+        rows.filter_map(|row| {
+            let o = self.t.outputs.get(&row.id)?;
+            Some((o.commitment, o.position?))
+        })
+        .collect()
+    }
+
+    /// The heights of the blocks that made these outputs, for their
+    /// rows.
+    pub fn placed(&mut self, heights: &[(Commitment, u32)]) -> Result<()> {
+        if heights.is_empty() {
+            return Ok(());
+        }
+        let mut t = self.t.clone();
+        t.located.extend(heights.iter().map(|(c, height)| (digest_to_bytes(c), *height)));
+        self.commit(t, &[])
+    }
+
+    /// The row meant by `what`: its number; or the first digits, in
+    /// hex, of an id it has (the slate's it began as, its
+    /// transaction's, or its output's). A number that is a row's is
+    /// that row, whatever ids begin with those digits. Else the numbers
+    /// of the rows that fit: none, or more than one.
+    pub fn row(&self, what: &str) -> std::result::Result<&list::Row, Vec<u32>> {
+        if let Some(row) = what.parse::<u32>().ok().and_then(|n| self.listed(n)) {
+            return Ok(row);
+        }
+        let what = what.to_ascii_lowercase();
+        let hex = |id: &Id| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let fits = |row: &&list::Row| {
+            !what.is_empty()
+                && (hex(&row.id).starts_with(&what) || row.transaction().is_some_and(|t| hex(&t).starts_with(&what)))
+        };
+        let found: Vec<&list::Row> = self.t.list.iter().filter(fits).collect();
+        match found[..] {
+            [one] => Ok(one),
+            _ => Err(found.iter().map(|row| row.number).collect()),
+        }
     }
 
     /// The numbers of the rows that made the output of `commitment` and

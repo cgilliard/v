@@ -795,7 +795,7 @@ these had a test of its own.
       held here, cannot be read) has that after its count:
       `4a27…: 80 (not held)`.
     - Addresses and hashes whole, never cut short: they are copied.
-- **Done so far:** one of a thing and several, in the line of a block's transactions. The going over of everything is still to do: as a list of what is said now and what is proposed, to be read through and agreed.
+- **Done so far:** one of a thing and several, in the line of a block's transactions. What a command answers of a payment begins `Payment`, as the log's line does. The going over of everything is still to do: as a list of what is said now and what is proposed, to be read through and agreed.
 
 ### 25. The prompt recalls what was typed, and completes what is begun
 
@@ -825,6 +825,20 @@ these had a test of its own.
     is to be drawn again under them, not cut in two.
 
 ### 26. `outputs` and `txs`, after the live test
+
+- **Done:** `outputs` lists what is unspent, in the order of the
+  chain, with a line under it that says how many spent ones are not
+  listed and how to list them; `outputs --all` lists all. A confirmed
+  output not yet deep enough to spend says `spendable in N blocks`
+  as its state. A row keeps the height of its block from when the
+  block goes by (or, of an output found by a scan, as the chain says
+  while it is unspent), so `txs` and `outputs --all` still say it of
+  what is spent. `cancel` finds a payment expected by its id (entry
+  34). The rows of a wallet made again are numbered in the order of
+  the chain.
+- **Still open:** the payer's taking back seen by the one who is
+  paid; one row or two for a payment to oneself; the reward of the
+  block being made, in `outputs`.
 
 - **Asked for:** `outputs` says when an output that cannot be spent
   yet can be: `spendable in N blocks`, counted from the confirmations
@@ -897,6 +911,10 @@ these had a test of its own.
   `Spent outputs are not listed: outputs --all lists every output.`
 
 ### 27. `names` does not say when a commit can be revealed
+
+- **Done:** `names` says `committed, not yet in a block`,
+  `committed, can be revealed in N blocks`, or `committed, ready to
+  reveal (until block H)`, by the same count `name-reveal` goes by.
 
 - **Seen:** a name committed to says `committed, not yet revealed`,
   the same whether its commit is in no block yet, in a block and not
@@ -1144,6 +1162,17 @@ these had a test of its own.
 
 ### 32. `txs` takes the place of `slates` and `sent`
 
+- **Done:** `txs` asks the pool (`pooled`, or `not in the pool
+  (resend N)`); `sent` and `slates` are gone from the prompt and from
+  `help`, and the tests read `txs pending`. `txs pending` and `txs
+  mined` say `nothing pending` and `no rewards yet` when there is
+  nothing.
+- **Seen while doing it, not put right:** a payment whose inputs are
+  in no block any more (it spent what only a branch given up had) is
+  taken by the wallet for one a block has, since what it spent is no
+  longer unspent: its row says `confirmed`. With entry 28: the
+  wallet through a reorganization.
+
 - **Asked for:** what `txs` still wants, so that `sent` (and
   `slates`) can go.
 - **`slates`:** says each payment begun, its id and amount. `txs
@@ -1281,6 +1310,13 @@ these had a test of its own.
 
 ### 34. A row is named the same way everywhere: by its number or its id
 
+- **Done:** one way of finding a row (`Wallet::row`), by number or by
+  the first digits of any id the row has, used by `txs`, `cancel`,
+  `bump`, `resend`, `payment-proof` and `burn-proof`. None found, or
+  several, is said the same way everywhere; what cannot be done to a
+  row is said of that row (`row 1 came to this wallet: there is
+  nothing to speed up`). `help` says what a ROW is, once.
+
 - **Seen:** which of the two a command takes depends on the command.
   As it is:
 
@@ -1313,6 +1349,13 @@ these had a test of its own.
   - `help` says it once, for all of them.
 
 ### 35. Many small outputs made into one
+
+- **Done:** `send all TO` and `send-file all FILE`: everything that
+  can be spent, less the fee, in one output and no change; of a
+  wallet with more outputs than a block takes signatures (256), the
+  largest 256, and it says how many are left. (The fee is that of a
+  payment with change, a few units of weight over what it need be.)
+- **Not done:** a payment to oneself signed at once, with no slate.
 
 - **Asked for:** a miner's wallet fills with one output a block. It is
   to be able to make many of them into one.

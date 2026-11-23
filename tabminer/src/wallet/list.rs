@@ -257,7 +257,12 @@ pub(super) fn relist(t: &mut Tables) -> bool {
     // blocks it has won; and what a look through the chain found.
     let coming: Vec<Id> = t.answered.iter().copied().collect();
     let won: Vec<Id> = t.rewards.iter().filter(|(_, (_, block))| *block != [0; 32]).map(|(c, _)| *c).collect();
-    let found: Vec<Id> = t.outputs.iter().filter(|(_, o)| o.recovered).map(|(c, _)| *c).collect();
+    // (Those in the order they lie in the chain: the list of a wallet
+    // made again reads oldest first, as one that grew does.)
+    let mut found: Vec<(Option<u64>, Id)> =
+        t.outputs.iter().filter(|(_, o)| o.recovered).map(|(c, o)| (o.position, *c)).collect();
+    found.sort();
+    let found: Vec<Id> = found.into_iter().map(|(_, c)| c).collect();
     for (kind, ids) in [(Kind::Received, coming), (Kind::Reward, won), (Kind::Received, found)] {
         for id in ids {
             if t.row_of(&id).is_none()
@@ -273,7 +278,7 @@ pub(super) fn relist(t: &mut Tables) -> bool {
         let (stage, height) = match row.is_output() {
             true => match t.outputs.get(&row.id) {
                 Some(_) if t.lost.contains_key(&row.id) => (Stage::Orphaned, 0),
-                Some(o) if o.position.is_some() => (Stage::Confirmed, 0),
+                Some(o) if o.position.is_some() => (Stage::Confirmed, row.height),
                 Some(_) => (Stage::Begun, 0),
                 // (Gone: spent and settled, if it was ever in a block;
                 // never made, if not.)
@@ -283,7 +288,10 @@ pub(super) fn relist(t: &mut Tables) -> bool {
             false if t.slates.contains_key(&row.id) => (Stage::Begun, 0),
             false => match t.sent.get(&row.txid) {
                 Some(sent) => match t.landed.get(&row.txid) {
-                    Some(at) => (Stage::Confirmed, *at),
+                    // (The block's own height where a block was seen
+                    // to make what it makes; else that of the chain
+                    // when it was first seen to be in.)
+                    Some(at) => (Stage::Confirmed, if row.height > 0 { row.height } else { *at }),
                     None => {
                         // Signed for where its outputs lay: if one lies
                         // elsewhere now, it spends nothing.
@@ -316,6 +324,29 @@ pub(super) fn relist(t: &mut Tables) -> bool {
             t.list[at].name = named.unwrap_or_default();
         }
     }
+    // The blocks just seen to make outputs: the height of each one's
+    // row, and of the row of the transaction that made it.
+    // (One whose row is not there yet is kept for when it is: the
+    // reward of a block is a row only once the block is known to be
+    // this wallet's, which may be said after the block is seen.)
+    let mut waiting = Vec::new();
+    for (id, height) in std::mem::take(&mut t.located) {
+        let mut placed = false;
+        for at in 0..t.list.len() {
+            let row = &t.list[at];
+            let makes = |sent: &super::Sent| sent.tx.outputs.iter().any(|o| digest_to_bytes(&o.commitment) == id);
+            if (row.is_output() && row.id == id) || (row.by == 0 && t.sent.get(&row.txid).is_some_and(makes)) {
+                t.list[at].height = height;
+                placed = true;
+            }
+        }
+        if !placed && t.outputs.contains_key(&id) {
+            waiting.push((id, height));
+        }
+    }
+    // (No more of them than a node's branches are long.)
+    let over = waiting.len().saturating_sub(4096);
+    t.located = waiting.split_off(over);
     let _ = State::Unspent;
     t.list != before
 }

@@ -142,6 +142,17 @@ pub fn follow_when<B: Backend + 'static, V, W: Backend>(
         done.restored = true;
     }
     done.changed = wallet.reconcile(&snap, height, chain.keep() as u32, undone_from)?;
+    // The blocks of outputs found by a look through the unspent ones,
+    // for the list's rows: the chain says, while they are unspent.
+    let heights: Vec<(Digest, u32)> = wallet
+        .unplaced()
+        .into_iter()
+        .filter_map(|(c, position)| {
+            let (record, live) = snap.output(position).ok().flatten()?;
+            (live && record.commitment == c).then_some((c, record.height))
+        })
+        .collect();
+    wallet.placed(&heights)?;
     // The payments made that a block now has: each one's path to that
     // block's state root, which is what proves it, taken while the
     // chain can still be taken back to that block.
