@@ -708,6 +708,15 @@ these had a test of its own.
   **Change:** the row keeps the height of the block that made the
   output, from when the wallet is first told where it lies.
 - `slates` and `sent`, now that there is `txs`: entry 32.
+- **Seen in the live test, and right:** a node stopped and started
+  has the same `txs`; a wallet made again from its words has the
+  same balance, its outputs, and a row for each, numbered afresh.
+- **A small thing in the same:** the rows of a wallet made again are
+  in the order of their outputs' ids, not of the chain (blocks 103,
+  103, 118, 84, 85). **Change:** what a look through the chain finds
+  is numbered in the order it lies in the chain (by position), so the
+  list reads oldest first, as a list that grew does. `outputs`
+  likewise lists by position, not by id.
 - **A fault: `cancel` by the id `txs` shows does not find a payment
   expected.** Seen on the wallet that is paid, after the one that
   pays took its payment back:
@@ -1086,6 +1095,14 @@ these had a test of its own.
      asks of others: this could not be found without the seed's log.
      **To settle:** whether its own fetches are logged too (a line a
      fetch, not a line a request).
+- **Seen again, on a node that was caught up:** the same node took
+  block 118 eighty-five seconds after it was won (won 05:22:06,
+  joined 05:23:31, with 119 and 120 at once behind it), fetched from
+  the local miner by the public address. Meanwhile its wallet showed
+  a payment that the block had as still `pending`, which looked like
+  a fault of the wallet and was not. So it is not only a node's
+  first catching up: a block in the ordinary run can hang the same
+  way, and the next ones wait behind it.
 - **Seen beside it:** a node catching up tells its peers of every old
   block as it joins it to its chain (`block height 4 … -> unheard`,
   seventy of them to each peer in five seconds). Nobody wants them:
