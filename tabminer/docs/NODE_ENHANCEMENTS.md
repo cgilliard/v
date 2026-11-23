@@ -54,9 +54,20 @@ Two entries are in two places:
   over 23 blocks. It kept up, a block or two behind at the worst.
 - **Effect:** none at a ten-minute block time. At the test's 34 seconds
   a block it is close to the limit.
-- **Change:** look at why the transfer window to that node stays at one
-  chunk (a slow or lossy path, or pacing that does not recover), and
-  whether it should grow again sooner.
+- **Seen again:** in the later live test another seed
+  (146.235.230.124) took a block from the miner the same way, `get
+  block, 1 chunks` every two seconds, and was a block behind the
+  others for half a minute.
+- **Cause found: entry 33.** It is not the window, nor the path, nor
+  the pace. The end of a block is lost on the way; a fetch then gets
+  it back one chunk each retry time, because the answer to each
+  probe puts off the moment at which the rest would be taken for
+  lost. Here the retry time is one to two seconds, so it shows as a
+  chunk every second or two.
+- **Change:** that of entry 33 (after a silence everything awaited is
+  lost; the grace never longer than the retry time). Nothing more is
+  needed here; this entry is done when that one is, and the seeds
+  are seen to take a block in whole windows.
 
 ### 6. A mining node starts with twenty or thirty seconds of nothing
 
