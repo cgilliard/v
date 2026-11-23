@@ -64,7 +64,6 @@ use crate::name::{BlockNameOp, Key, Record as NameRecord, expired, in_window};
 use crate::store::backend::Backend;
 use crate::store::blocks::Blocks;
 use crate::store::outputs::Record;
-use crate::store::pagefile::ReadPages;
 use crate::store::state::{BlockEdit, Session};
 use crate::u256::U256;
 
@@ -508,12 +507,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     pub fn tip_work(&self) -> Result<U256, Error> {
         let store = self.store();
         let snap = store.view()?;
-        Ok(self.tip_known(snap.pages(), snap.blocks(), snap.tip().0)?.work)
-    }
-
-    fn tip_known(&self, pages: &impl ReadPages, blocks: &Blocks, height: u32) -> Result<Known, Error> {
-        let id = blocks.at(pages, height)?.ok_or_else(|| corrupt("the tip is not in the chain"))?;
-        self.known_in(pages, blocks, &id)?.ok_or_else(|| corrupt("the tip has no header"))
+        Ok(self.tip_kept(snap.pages(), snap.blocks(), snap.tip())?.work)
     }
 }
 

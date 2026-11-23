@@ -125,7 +125,9 @@ impl Path {
     /// whole retry time.
     pub fn grace(&self) -> Micros {
         let quarter = if self.measured { self.srtt as Micros / 4 } else { RETRY / 4 };
-        quarter.max(5_000) * self.reorder as Micros / REORDER
+        // (Never as long as a silence is: where it was, the silence
+        // came first every time, and this never.)
+        (quarter.max(5_000) * self.reorder as Micros / REORDER).min(self.retry() / 2)
     }
 
     /// A chunk taken for lost had only been overtaken: the path

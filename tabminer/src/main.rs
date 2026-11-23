@@ -143,6 +143,13 @@ fn said(event: &Event) -> Option<String> {
         }
         Event::HeadersKept { height } => format!("Headers synced to {}", n(*height)),
         Event::HeadersRefused { peer } => format!("Headers from {peer} refused"),
+        Event::FetchMoved { height, from, to, quiet, here, of } => format!(
+            "Block {}: nothing more from {from} for {:.1}s, with {} of its {} chunks here; the rest is asked of {to}",
+            n(*height),
+            *quiet as f64 / 1e6,
+            commas(*here as u64),
+            commas(*of as u64)
+        ),
         // (A block made here that joins the chain was said when won.)
         Event::Block { from: None, undone: 0, .. } => return None,
         Event::Block { header, len, from, undone: 0, .. } => {

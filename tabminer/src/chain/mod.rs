@@ -61,6 +61,14 @@ pub struct Chain<B: Backend + 'static, V> {
     /// Debugging only: a header's work is taken as what it claims
     /// ([`Chain::debug_trust_work`]).
     trust_work: std::sync::atomic::AtomicBool,
+    /// How many times what the votes for a consensus file are counted
+    /// from, other than the chain's blocks, has changed: leaves and
+    /// files kept or let go, and this node's own leaves
+    /// ([`Chain::votes_epoch`]).
+    votes_epoch: std::sync::atomic::AtomicU64,
+    /// The header of the chain's last block as last read, with its id
+    /// ([`Chain::tip`]).
+    tip_read: Mutex<Option<(Digest, headers::Known)>>,
     /// Heights whose full proof of work was checked, for the tests.
     #[cfg(test)]
     pub(crate) full_pow_heights: Mutex<Vec<u32>>,
@@ -122,6 +130,8 @@ impl<B: Backend + 'static, V> Chain<B, V> {
             dataset: RwLock::new(None),
             anchor: Mutex::new(None),
             trust_work: std::sync::atomic::AtomicBool::new(false),
+            votes_epoch: std::sync::atomic::AtomicU64::new(0),
+            tip_read: Mutex::new(None),
             #[cfg(test)]
             full_pow_heights: Mutex::new(Vec::new()),
         })
@@ -383,6 +393,17 @@ impl<B: Backend + 'static> std::ops::Deref for StateRef<'_, B> {
         match &*self.0 {
             Store::Whole(state) => state,
             _ => unreachable!("made of a whole state"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<V> Chain<crate::store::testing::MemBackend, V> {
+    /// How many times the store has been read from, for the tests.
+    pub(crate) fn store_reads(&self) -> u64 {
+        match &*self.store() {
+            Store::Whole(state) => state.file().backend().reads(),
+            _ => 0,
         }
     }
 }

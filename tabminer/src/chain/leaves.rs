@@ -82,6 +82,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
             blocks.set_note(txn, Some(leaves.as_flattened()))?;
             Ok(aux_merkle_root(&leaves))
         })
+        .inspect(|_| self.votes_changed())
     }
 
     /// The auxiliary bytes this node mines with: the root of its leaves.
@@ -110,7 +111,20 @@ impl<B: Backend + 'static, V> Chain<B, V> {
                 return Err(Error::AuxMismatch);
             }
             blocks.put_aux(txn, known.header.height, id, leaves.as_flattened())
-        })
+        })?;
+        self.votes_changed();
+        Ok(())
+    }
+
+    /// How many times the leaves and files kept have changed: whoever
+    /// counted the votes need not count them again while this and the
+    /// chain's last block are what they were.
+    pub fn votes_epoch(&self) -> u64 {
+        self.votes_epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn votes_changed(&self) {
+        self.votes_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The votes of the last `window` blocks of the chain: each block's
@@ -178,6 +192,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
         }
         let hash = sha256(bytes);
         self.write_blocks(|txn, blocks| blocks.put_file(txn, &hash, bytes))?;
+        self.votes_changed();
         Ok(hash)
     }
 
@@ -238,7 +253,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
                 return Ok(0);
             }
         }
-        self.write_blocks(|txn, blocks| {
+        let gone = self.write_blocks(|txn, blocks| {
             let mut gone = 0;
             for hash in blocks.files(txn)? {
                 if !keep.contains(&hash) {
@@ -247,7 +262,9 @@ impl<B: Backend + 'static, V> Chain<B, V> {
                 }
             }
             Ok(gone)
-        })
+        })?;
+        self.votes_changed();
+        Ok(gone)
     }
 }
 

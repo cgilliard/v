@@ -118,6 +118,9 @@ pub struct Counts {
     pub fetches_failed: u64,
     /// Fetches given up for coming too slowly.
     pub fetches_slow: u64,
+    /// Blocks' fetches that brought nothing new for too long and were
+    /// gone on with by another peer.
+    pub fetches_moved: u64,
     /// Chains that left ours far down and were weighed whole before
     /// any of them was kept.
     pub weighed: u64,
@@ -147,6 +150,7 @@ impl Counts {
         self.fetched += o.fetched;
         self.fetches_failed += o.fetches_failed;
         self.fetches_slow += o.fetches_slow;
+        self.fetches_moved += o.fetches_moved;
         self.weighed += o.weighed;
         self.checked += o.checked;
         self.headers += o.headers;
@@ -875,6 +879,10 @@ pub enum Event {
     HeadersKept { height: u32 },
     /// This peer's headers were not what they should be.
     HeadersRefused { peer: SocketAddrV4 },
+    /// A block's fetch from `from` brought nothing new for `quiet`
+    /// microseconds, with `here` of its `of` chunks here: the rest is
+    /// asked of `to`.
+    FetchMoved { height: u32, from: SocketAddrV4, to: SocketAddrV4, quiet: Micros, here: u32, of: u32 },
     /// A block is the chain's new last: from this peer, or made here.
     /// If the chain went over to its branch to take it, `undone` blocks
     /// of ours gave way, and `taken` of that branch are the chain's
@@ -1173,6 +1181,12 @@ pub struct Worker<B: Backend + 'static, V> {
     /// and which peer is asked next.
     votes_looked: Micros,
     votes_turn: usize,
+    /// The votes as last counted: what they were counted from (how
+    /// often the chain had moved, and the count of changes to the
+    /// leaves and files kept), the blocks whose leaves are missing, and
+    /// a file voted for that is not held.
+    #[allow(clippy::type_complexity)]
+    votes: Option<((u64, u64), Vec<Digest>, Option<crate::consensus::Hash>)>,
     /// What is about no one peer.
     list: Arc<RwLock<List>>,
     /// Who announced which block, and how long its body is: the newest
@@ -1181,6 +1195,10 @@ pub struct Worker<B: Backend + 'static, V> {
     /// Who said it has not a block it was asked for, having never said
     /// it had: not asked for that block again.
     lacking: Vec<(Digest, SocketAddrV4)>,
+    /// The peers a block's fetch was last moved from, for having
+    /// brought nothing new, and when: one it happens to again while
+    /// that is remembered is passed over.
+    quieted: Vec<(SocketAddrV4, Micros)>,
     /// Headers announced that were given to be checked, and are not
     /// yet heard of.
     announcing: usize,
@@ -1268,9 +1286,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             leaves_asked: Vec::new(),
             votes_looked: 0,
             votes_turn: 0,
+            votes: None,
             list,
             announced: VecDeque::new(),
             lacking: Vec::new(),
+            quieted: Vec::new(),
             announcing: 0,
             inbox: Vec::new(),
             tx_wanted: VecDeque::new(),
@@ -2636,39 +2656,67 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if self.chain.receiving() {
             return;
         }
-        let Ok((current, decided)) = self.chain.consensus() else { return };
-        let Ok(running) = self.chain.consensus_votes(WINDOW) else { return };
-        // What is in force, said when it is another than was last said.
-        let now_is = (current.mode, current.winner.map(|w| w.0));
-        let mut said = self.shared.consensus.lock().unwrap_or_else(|e| e.into_inner());
-        if *said != Some(now_is) {
-            // (Not of a node that has only just started, in init mode
-            // like every other: that is no news.)
-            if said.is_some() || now_is != (crate::consensus::Mode::Init, None) {
-                self.shared.say(Event::Consensus { mode: current.mode, file: now_is.1 });
+        // The votes are counted afresh only when something they are
+        // counted from is other than it was: the chain's last block,
+        // or the leaves and files kept. Counting reads the leaves of
+        // two windows of blocks from the store; done at every turn by
+        // every worker, a node with nothing to do read its store
+        // seventeen thousand times a second.
+        let key = (self.shared.blocks.load(Ordering::Relaxed), self.chain.votes_epoch());
+        if self.votes.as_ref().is_none_or(|v| v.0 != key) {
+            let Ok((current, decided)) = self.chain.consensus() else { return };
+            let Ok(running) = self.chain.consensus_votes(WINDOW) else { return };
+            // What is in force, said when it is another than was last said.
+            let now_is = (current.mode, current.winner.map(|w| w.0));
+            let mut said = self.shared.consensus.lock().unwrap_or_else(|e| e.into_inner());
+            if *said != Some(now_is) {
+                // (Not of a node that has only just started, in init mode
+                // like every other: that is no news.)
+                if said.is_some() || now_is != (crate::consensus::Mode::Init, None) {
+                    self.shared.say(Event::Consensus { mode: current.mode, file: now_is.1 });
+                }
+                *said = Some(now_is);
+                if !self.shared.forced.load(Ordering::Relaxed) {
+                    let relays = Arc::new(relays_of(current.file.as_ref()));
+                    *self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()) = relays;
+                }
             }
-            *said = Some(now_is);
-            if !self.shared.forced.load(Ordering::Relaxed) {
-                let relays = Arc::new(relays_of(current.file.as_ref()));
-                *self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()) = relays;
+            drop(said);
+            // The leaves that are missing, the newest first; and the
+            // first file voted for that is not held.
+            let missing: Vec<Digest> = running.missing.iter().chain(&decided.missing).rev().map(|m| m.0).collect();
+            let voted: Vec<crate::consensus::Hash> =
+                running.counts.iter().chain(&decided.counts).map(|c| c.0).collect();
+            let wanted = voted.iter().find(|hash| !matches!(self.chain.consensus_file(hash), Ok(Some(_)))).copied();
+            // And those held that nobody votes for any more go: but never
+            // the one this node itself votes for, which it is to hand over
+            // from the first block that says so.
+            if let Ok(own) = self.chain.aux_leaves() {
+                let keep: Vec<crate::consensus::Hash> = voted.iter().copied().chain([own[0]]).collect();
+                let _ = self.chain.keep_consensus_files(&keep);
             }
+            // (As the store is after that, which may have let files go.)
+            let key = (key.0, self.chain.votes_epoch());
+            self.votes = Some((key, missing, wanted));
         }
-        drop(said);
+        let Some((_, missing, wanted)) = &self.votes else { return };
+        if missing.is_empty() && wanted.is_none() {
+            return;
+        }
+        let (missing, wanted) = (missing.clone(), *wanted);
         let peers: Vec<(SocketAddrV4, u64)> = self.peers.able(now).filter_map(|p| Some((p.addr, p.token()?))).collect();
         if peers.is_empty() {
             return;
         }
-        // The leaves that are missing, the newest first: a few at a
-        // time, each of the next peer in turn.
-        for (id, _) in running.missing.iter().chain(&decided.missing).rev().take(LEAVES_AT_ONCE) {
+        // The leaves that are missing: a few at a time, each of the
+        // next peer in turn.
+        for id in missing.iter().take(LEAVES_AT_ONCE) {
             self.votes_turn = self.votes_turn.wrapping_add(1);
             let (peer, token) = peers[self.votes_turn % peers.len()];
             self.leaves_asked.push((*id, peer));
             self.send(peer, &Message::GetLeaves { token, id: *id }, out);
         }
         // The files voted for that are not held: one at a time.
-        let voted = || running.counts.iter().chain(&decided.counts).map(|c| c.0);
-        let wanted = voted().find(|hash| !matches!(self.chain.consensus_file(hash), Ok(Some(_))));
         if let Some(hash) = wanted {
             let object = Object::File(file_id(&hash));
             if !self.fetches.iter().any(|f| f.object == object) {
@@ -2676,13 +2724,6 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let peer = peers[self.votes_turn % peers.len()].0;
                 self.fetch_object(now, object, peer, MAX_CONSENSUS as u32);
             }
-        }
-        // And those held that nobody votes for any more go: but never
-        // the one this node itself votes for, which it is to hand over
-        // from the first block that says so.
-        if let Ok(own) = self.chain.aux_leaves() {
-            let keep: Vec<crate::consensus::Hash> = voted().chain([own[0]]).collect();
-            let _ = self.chain.keep_consensus_files(&keep);
         }
     }
 
@@ -4148,6 +4189,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         }
                         if result.is_ok() {
                             self.counts.states += 1;
+                            // (The chain has a new last block by it,
+                            // for whoever goes by that.)
+                            self.shared.blocks.fetch_add(1, Ordering::Relaxed);
                             self.shared.say(Event::StateTaken { height });
                         }
                     }
@@ -4958,6 +5002,50 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // this peer passed over. Too slowly for the way in: under
             // the least asked, and either another comes four times as
             // fast or all of them together come under that least.
+            // A block whose fetch has brought nothing new for a while,
+            // where another peer has the block and is free: the rest
+            // of it is asked of that one. (What has come is kept. The
+            // blocks after it wait for it, however fast they came; and
+            // a peer may answer everything else and not this.)
+            if let Object::Block(id) = object {
+                let fetch = &self.fetches[i].fetch;
+                let quiet = fetch.quiet(now);
+                let long = self.cfg.sync.fetch_quiet.max(4 * fetch.path().retry());
+                let height = (quiet >= long).then(|| self.chain.known(&id).ok().flatten()).flatten();
+                let other = height.and_then(|known| {
+                    let busy = |addr: &SocketAddrV4| {
+                        let blocks = |f: &&Fetching| matches!(f.object, Object::Block(_)) && f.from == *addr;
+                        self.fetches.iter().filter(blocks).count() >= self.cfg.sync.blocks_per_peer
+                    };
+                    let free = |p: &&super::peers::Peer| {
+                        p.addr != from && !busy(&p.addr) && !self.lacking.contains(&(id, p.addr))
+                    };
+                    let other = self.peers.holders(known.header.height, now).find(free)?;
+                    Some((known.header.height, other.addr, other.path))
+                });
+                if let Some((height, to, path)) = other {
+                    let l = &mut **held.get_or_insert_with(|| write(&list));
+                    fetched(&mut l.fetching, &object, &from);
+                    l.fetching.push((object, to));
+                    let (here, of) = self.fetches[i].fetch.here();
+                    self.peers.set_path(&from, self.fetches[i].fetch.path());
+                    let transfer = Self::number(&self.secret, &mut self.numbers);
+                    self.fetches[i].fetch.resume(transfer, path, now);
+                    self.fetches[i].from = to;
+                    self.counts.fetches_moved += 1;
+                    self.shared.say(Event::FetchMoved { height, from, to, quiet, here, of });
+                    // Once is anyone's line; a peer it happens to
+                    // again is passed over, as one too slow is.
+                    let recent = self.cfg.sync.pass_over;
+                    self.quieted.retain(|q| now.saturating_sub(q.1) < recent);
+                    match self.quieted.iter().any(|q| q.0 == from) {
+                        true => self.peers.failed(&from, now),
+                        false if self.quieted.len() < LACKING => self.quieted.push((from, now)),
+                        false => {}
+                    }
+                    continue;
+                }
+            }
             let slow = {
                 let (rate, grace) = (self.cfg.sync.fetch_rate, self.cfg.sync.fetch_grace);
                 let fetch = &self.fetches[i].fetch;

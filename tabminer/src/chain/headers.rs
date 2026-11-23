@@ -314,7 +314,24 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     pub fn tip(&self) -> Result<Header, Error> {
         let store = self.store();
         let snap = store.view()?;
-        self.header_at_in(snap.pages(), snap.blocks(), snap.tip().0)?.ok_or_else(|| corrupt("the tip has no header"))
+        // (As last read, while the last block is the one it was: this
+        // is asked at every turn by whoever only wants the height, and
+        // is not to be a read of the store each time.)
+        Ok(self.tip_kept(snap.pages(), snap.blocks(), snap.tip())?.header)
+    }
+
+    /// The chain's last block, of height and id `tip`, with its work:
+    /// as last read, while it is the block it was.
+    pub(super) fn tip_kept(&self, pages: &impl ReadPages, blocks: &Blocks, tip: (u32, Digest)) -> Result<Known, Error> {
+        let mut last = self.tip_read.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((was, known)) = *last
+            && was == tip.1
+        {
+            return Ok(known);
+        }
+        let known = self.tip_in(pages, blocks, tip.0)?;
+        *last = Some((tip.1, known));
+        Ok(known)
     }
 
     /// The times of the blocks ending at `tip`, along its own branch.
@@ -435,7 +452,7 @@ impl<B: Backend + 'static, V> Chain<B, V> {
     pub fn best_header(&self) -> Result<Known, Error> {
         let store = self.store();
         let snap = store.view()?;
-        let tip = self.tip_in(snap.pages(), snap.blocks(), snap.tip().0)?;
+        let tip = self.tip_kept(snap.pages(), snap.blocks(), snap.tip())?;
         self.best_in(snap.pages(), snap.blocks(), &tip)
     }
 }

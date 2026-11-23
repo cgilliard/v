@@ -78,6 +78,9 @@ should weigh more in the fee (19).
 
 ### 4. Blocks reach one seed a chunk at a time
 
+- **Done with entry 33:** to be seen on the live network, that the
+  seeds take a block in whole windows.
+
 - **Seen:** same test. The RISC-V seed asked the miner for each block in
   requests of one chunk, about one every 1.3 seconds: 312 such requests
   over 23 blocks. It kept up, a block or two behind at the worst.
@@ -1165,6 +1168,26 @@ these had a test of its own.
 
 ### 33. A node catching up stood still for 38 seconds on one block
 
+- **Done (to be seen on a live network):**
+  - The cause: the time after which what was overtaken is taken for
+    lost is never as long as a silence (half the retry time at the
+    most). With it the answer to the first chunk asked again brings
+    the rest back at once. Tried by
+    `transport::sim::a_lost_end_is_had_again_in_a_few_round_trips`,
+    which without the change took sixty silences. (Taking everything
+    awaited for lost at a silence was tried first and put back: on a
+    line that is only slow it asks twice for what is on its way.)
+  - A block whose fetch brings nothing new for three seconds (four
+    of the path's retry times, if that is longer) goes on with
+    another peer that has it, keeping what has come; the main log
+    says so (`Block 118: nothing more from … for 3.1s, with 290 of
+    its 351 chunks here; the rest is asked of …`). A peer it happens
+    to twice within the time a peer is passed over is passed over.
+    Tried by `a_block_that_stops_coming_is_gone_on_with_by_another_peer`.
+  - Still to do of this entry: the counts in the statistics' lines;
+    whether the node's own fetches are logged; old blocks announced
+    by a node catching up.
+
 - **Seen:** a third node started on the live network (`target/main3`,
   no mining) took headers 1 to 74 in half a second and blocks 1 to 45
   in five. Then nothing for 38.7 s (04:52:31.7 to 04:53:10.4), then
@@ -1369,6 +1392,13 @@ these had a test of its own.
   35), since a miner's wallet is where both are met.
 
 ### 37. A node with nothing to do uses three to four percent of a processor
+
+- **Done (to be measured on a live node):** the votes are counted
+  when the chain's last block or the leaves and files kept have
+  changed, and not otherwise; the header of the chain's last block is
+  kept while that block is the last. In the test
+  (`a_node_with_nothing_to_do_reads_nothing`) a node standing by for a
+  minute went from 1,468 reads of its store to 4.
 
 - **Seen:** with the miner stopped and no blocks coming, a node that
   does not mine stays at 3.7% of a processor (and another the same).

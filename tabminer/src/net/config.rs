@@ -136,6 +136,11 @@ pub struct Sync {
     /// slowly.
     pub fetch_rate: u64,
     pub fetch_grace: Micros,
+    /// How long a block's fetch may bring nothing new before another
+    /// peer that has the block is asked for the rest of it (four of
+    /// the path's retry times at the least: on a slow line nothing new
+    /// for seconds is the line).
+    pub fetch_quiet: Micros,
     /// Attempts at taking a state before every block is applied
     /// instead.
     pub snapshot_attempts: u32,
@@ -200,6 +205,7 @@ impl Default for Sync {
             parts: 32,
             fetch_rate: 4096,
             fetch_grace: 30 * SECOND,
+            fetch_quiet: 3 * SECOND,
             snapshot_attempts: 4,
             leaves_retry: 2 * SECOND,
             leaves_tries: 16,

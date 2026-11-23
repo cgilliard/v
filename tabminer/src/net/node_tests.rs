@@ -70,6 +70,9 @@ struct World {
     /// later than the one before: a peer that sends a little at a time.
     slow: Vec<usize>,
     late: Micros,
+    /// A node that sends so many chunks of what it serves and then no
+    /// more of them, while it goes on answering everything else.
+    stops: Option<(usize, u32)>,
     /// Times the nodes were told the time.
     ticks: u64,
     /// What each datagram a node took was, and when.
@@ -97,6 +100,7 @@ impl World {
             mute: Vec::new(),
             slow: Vec::new(),
             late: 0,
+            stops: None,
             ticks: 0,
             log: Vec::new(),
         }
@@ -150,7 +154,16 @@ impl World {
                 }
                 for (i, to, bytes) in sent {
                     let small_talk = matches!(Message::decode(NET, &bytes), Ok(Message::Ping(_) | Message::Pong(_)));
-                    if self.slow.contains(&i) && matches!(Message::decode(NET, &bytes), Ok(Message::Chunk(_))) {
+                    let chunk = matches!(Message::decode(NET, &bytes), Ok(Message::Chunk(_)));
+                    if let Some((who, left)) = &mut self.stops
+                        && *who == i
+                        && chunk
+                    {
+                        if *left > 0 {
+                            *left -= 1;
+                            self.post(at(i), to, &bytes);
+                        }
+                    } else if self.slow.contains(&i) && chunk {
                         // (One chunk every three seconds.)
                         self.late = self.late.max(self.now) + 3 * SECOND;
                         self.flying.push((self.late, at(i), to, bytes.to_vec()));
@@ -1725,6 +1738,58 @@ fn a_chain_higher_than_any_could_be_is_not_gone_after() {
     assert!(!w.nodes[0].table(&at(1)).may_ask(&at(1), now));
 }
 
+/// A node with nothing to do does next to nothing: with a chain, peers
+/// that say nothing new and a minute gone by, it has read its store a
+/// handful of times (what it says of itself in a ping), not at every
+/// turn. (It once counted the votes for the consensus file afresh at
+/// every turn of every worker, from the leaves of two windows of
+/// blocks: seventeen thousand reads a second, of a node standing by.)
+#[test]
+fn a_node_with_nothing_to_do_reads_nothing() {
+    let chains: Vec<_> = (0..2).map(|_| chain_of(easy())).collect();
+    let made = grow(&chains[0], 20, 1);
+    give(&chains[1], &made);
+    let mut w = World::with(chains, &small_runs());
+    w.nodes[0].add_peer(at(1), false, 0);
+    w.nodes[1].add_peer(at(0), false, 0);
+    // (Time for each to find the other and see there is nothing to
+    // have of it.)
+    w.run(30 * SECOND);
+    let before: Vec<u64> = (0..2).map(|i| w.nodes[i].chain().store_reads()).collect();
+    w.run(60 * SECOND);
+    let after: Vec<u64> = (0..2).map(|i| w.nodes[i].chain().store_reads()).collect();
+    for i in 0..2 {
+        assert!(after[i] - before[i] <= 6, "node {i}: {} reads in a minute", after[i] - before[i]);
+    }
+}
+
+/// A peer sends most of a block and then no more of it, while it goes
+/// on answering everything else (as a peer did whose answers a fetch
+/// did not take: the blocks behind that one waited on it for most of
+/// a minute, whole, while two peers that had it stood by). After a few
+/// seconds of nothing new the rest is asked of another peer that has
+/// the block; what had come is kept; and the peer that stopped is not
+/// held to have done wrong.
+#[test]
+fn a_block_that_stops_coming_is_gone_on_with_by_another_peer() {
+    let chains: Vec<_> = (0..3).map(|_| chain_of(easy())).collect();
+    let made = grow_wide(&chains[0], 6, 300, 1);
+    give(&chains[1], &made);
+    let mut cfg = small_runs();
+    // (One block of a peer at a time: both are asked.)
+    cfg.sync.blocks_per_peer = 1;
+    let mut w = World::with(chains, &cfg);
+    w.stops = Some((0, 10));
+    w.nodes[2].add_peer(at(0), false, 0);
+    w.nodes[2].add_peer(at(1), false, 0);
+    w.run(20 * SECOND);
+    let c = w.nodes[2].counts();
+    assert_eq!(tip(&w, 2), tip(&w, 1), "{c:?}");
+    assert!(c.fetches_moved >= 1 && c.fetches_slow == 0, "{c:?}");
+    let now = w.now;
+    assert!(w.nodes[2].table(&at(0)).may_ask(&at(0), now) && w.nodes[2].table(&at(1)).may_ask(&at(1), now));
+}
+
 /// A peer that sends what it was asked for a little at a time is given
 /// up, and the rest is had from another: one such is not all a node
 /// hears from for as long as it cares to go on.
@@ -1743,7 +1808,9 @@ fn a_peer_that_sends_a_little_at_a_time_is_given_up() {
     w.run(150 * SECOND);
     let c = w.nodes[2].counts();
     assert_eq!(tip(&w, 2), tip(&w, 1), "{c:?}");
-    assert!(c.fetches_slow >= 1, "{c:?}");
+    // (Given up as too slow; or, sooner, for bringing nothing new for
+    // seconds at a time, its blocks gone on with by the other.)
+    assert!(c.fetches_slow + c.fetches_moved >= 1, "{c:?}");
     let now = w.now;
     assert!(w.nodes[2].table(&at(1)).may_ask(&at(1), now));
 }

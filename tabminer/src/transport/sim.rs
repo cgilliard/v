@@ -84,6 +84,10 @@ enum Server {
     Stops(u64),
     /// Sends a chunk claiming another length once this many have gone.
     Lies(u64),
+    /// The first sending of each of the object's last so many chunks
+    /// never arrives: the end of it is lost in one go, with nothing
+    /// asked after it to show the loss.
+    LosesEnd(u32),
 }
 
 struct Setup {
@@ -164,6 +168,7 @@ fn run(s: &Setup) -> Outcome {
     let mut serve = Serve::new(s.rate);
     let mut served = 0u64;
     let mut refused = 0u64;
+    let mut sent_once = vec![false; chunk_count(len) as usize];
     let mut ranges = Ranges::new();
     let mut buf = [0u8; 1 + MAX_CHUNK + MAX_GET];
     // The third party's chunks: the right shape, the right place, the
@@ -231,6 +236,13 @@ fn run(s: &Setup) -> Outcome {
                         serve.cancel(x.to, x.transfer);
                         continue;
                     };
+                    if let Server::LosesEnd(n) = s.server
+                        && x.index + n >= chunk_count(len)
+                        && !std::mem::replace(&mut sent_once[x.index as usize], true)
+                    {
+                        served += 1;
+                        continue;
+                    }
                     let lie = matches!(s.server, Server::Lies(n) if served == n);
                     buf[0] = CHUNK;
                     let n = if lie {
@@ -859,4 +871,32 @@ fn a_fetch_given_up_is_taken_up_where_it_was() {
     assert!(f.chunk(3, &Chunk { transfer: 1, seq: 0, len: 10, index: 0, data: &data[..10] }).is_err());
     assert_eq!(f.chunk(3, &Chunk { transfer: 2, seq: 0, len: 10, index: 0, data: &data[..10] }), Ok(Taken::New));
     assert_eq!(f.finish().unwrap(), data[..10]);
+}
+
+/// The end of an object is lost in one go, on a path that has been
+/// seen to deliver far out of order: sixty chunks, with nothing asked
+/// after them to overtake them. It is had again in a few round trips,
+/// not a chunk each retry time (as it once was: the answer to each
+/// chunk asked again put off the moment the rest were taken for lost,
+/// and a block's last chunks came at under two a second).
+#[test]
+fn a_lost_end_is_had_again_in_a_few_round_trips() {
+    for raised in 0..=6 {
+        for end in [1, 7, 60, 200] {
+            for delay in [20 * MILLI, 75 * MILLI] {
+                let mut s = Setup::new(350 * CHUNK_BYTES, 31 + raised).both(Link { delay, ..CLEAN });
+                s.server = Server::LosesEnd(end);
+                for _ in 0..raised {
+                    s.path.disordered();
+                }
+                let o = run(&s);
+                assert_eq!(o.end, Poll::Done);
+                let trips = o.time / (2 * delay);
+                assert!(trips < 40, "raised {raised}, the last {end}: {trips} round trips, {:?}", o.stats);
+                // One silence shows the loss; the rest follows from
+                // what is then asked again and comes.
+                assert!(o.stats.silences <= 3, "raised {raised}, the last {end}: {:?}", o.stats);
+            }
+        }
+    }
 }

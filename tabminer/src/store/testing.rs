@@ -38,6 +38,8 @@ struct Mem {
     pending: Vec<(u64, Vec<u8>)>,
     /// Writes and syncs so far.
     ops: u64,
+    /// Reads so far.
+    reads: u64,
     /// The operation at which power is lost.
     crash_at: u64,
     crashed: bool,
@@ -71,6 +73,7 @@ impl MemBackend {
             current: image,
             pending: Vec::new(),
             ops: 0,
+            reads: 0,
             crash_at: u64::MAX,
             crashed: false,
         };
@@ -81,6 +84,11 @@ impl MemBackend {
     pub(crate) fn crash_at(&self, n: u64) {
         let mut m = self.inner.lock().unwrap();
         m.crash_at = m.ops + n;
+    }
+
+    /// Reads so far.
+    pub(crate) fn reads(&self) -> u64 {
+        self.inner.lock().unwrap().reads
     }
 
     /// Writes and syncs so far.
@@ -123,7 +131,8 @@ fn power() -> io::Error {
 
 impl Backend for MemBackend {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        let m = self.inner.lock().unwrap();
+        let mut m = self.inner.lock().unwrap();
+        m.reads += 1;
         let end = offset as usize + buf.len();
         let from = m.current.get(offset as usize..end).ok_or(io::ErrorKind::UnexpectedEof)?;
         buf.copy_from_slice(from);

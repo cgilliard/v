@@ -286,6 +286,18 @@ impl Fetch {
         bytes * SECOND / now.saturating_sub(self.started).max(1)
     }
 
+    /// How long it is since anything new of the object arrived (or,
+    /// if nothing has, since the peer was first asked).
+    pub fn quiet(&self, now: Micros) -> Micros {
+        now.saturating_sub(self.last_progress)
+    }
+
+    /// How much of the object is here, in chunks, and of how many (the
+    /// second nothing while the length is not known).
+    pub fn here(&self) -> (u32, u32) {
+        (self.got, if self.len == 0 { 0 } else { self.count })
+    }
+
     /// How long ago the peer was first asked.
     pub fn age(&self, now: Micros) -> Micros {
         now.saturating_sub(self.started)
