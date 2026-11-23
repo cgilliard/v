@@ -708,6 +708,27 @@ these had a test of its own.
   **Change:** the row keeps the height of the block that made the
   output, from when the wallet is first told where it lies.
 - `slates` and `sent`, now that there is `txs`: entry 32.
+- **A fault: `cancel` by the id `txs` shows does not find a payment
+  expected.** Seen on the wallet that is paid, after the one that
+  pays took its payment back:
+
+  ```
+       7  received  pending  1  -  -  159183e8
+  > cancel 159183e8
+  error: no payment begun or sent with an id that starts 159183e8
+  ```
+
+  `cancel 7` is what does it: by the digits of an id, `cancel` looks
+  only among payments begun and payments signed, and the id of a row
+  of what comes to the wallet is its output's. **Change:** the digits
+  are looked for among the ids of all the rows, as `txs` shows them,
+  and what is said when nothing is found names `txs` and the row's
+  number. (The same of `bump` and `resend`.)
+- **To settle, seen in the same:** the one who is paid is not told
+  that the payer took the payment back; its row stays `pending` until
+  it cancels it itself. Whether the row is given up of itself when
+  the chain shows what the payment was to spend spent by another
+  transaction (the wallet that is paid knows the slate's inputs).
 - **`outputs` lists what is unspent, unless asked (decided):** as it
   is, every output the wallet still has a record of is listed, the
   spent among them, and most of a wallet's list is soon of what is
@@ -1070,6 +1091,39 @@ these had a test of its own.
   seventy of them to each peer in five seconds). Nobody wants them:
   a node that is catching up is to announce nothing below where its
   peers already are. (For entry 13.)
+
+### 34. A row is named the same way everywhere: by its number or its id
+
+- **Seen:** which of the two a command takes depends on the command.
+  As it is:
+
+  | command | number of the row | digits of the id |
+  |---|---|---|
+  | `txs N` | yes | no |
+  | `cancel` | yes | only of a payment begun or signed, not of one expected (entry 26) |
+  | `bump`, `resend` | yes | only of a payment signed |
+  | `payment-proof`, `burn-proof` | no | yes, of the transaction |
+
+  And the id `txs` shows of a row is a slate's while the payment is
+  begun, the transaction's once it is signed, an output's for what
+  comes in: a command that looks among one kind does not find the
+  others.
+- **Change (decided: both work wherever a row is meant):**
+  - One way of finding a row, used by every command that takes one:
+    a number is the row of that number; anything else is the first
+    digits of an id, looked for among every id a row has or has had
+    (its slate's, its transaction's, its output's). One row found:
+    that row. None: `no row with that number or an id that starts
+    …; see txs`. Several: they are listed, to say more digits.
+  - Then each command says whether it can do what is asked to that
+    row, in its own words (`row 7 is a payment received: there is
+    nothing to speed up`), not that there is no such thing.
+  - `txs ID` as well as `txs N`; `payment-proof N` and `burn-proof N`
+    as well as by id.
+  - A number that is also the first digits of an id (`12`, and an id
+    that starts `12…`): the number wins; an id is given by enough
+    digits not to be a number of a row, or all of it.
+  - `help` says it once, for all of them.
 
 ## Done
 
