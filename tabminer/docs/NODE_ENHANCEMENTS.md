@@ -795,6 +795,13 @@ these had a test of its own.
       held here, cannot be read) has that after its count:
       `4a27…: 80 (not held)`.
     - Addresses and hashes whole, never cut short: they are copied.
+- **Done, of `consensus` and `relays`:** `consensus` answers in the
+  form decided (`Mode:`, `File:`, `Decided at block:`, `Relays: N
+  (see: relays)`, `Next decision block:`, `Votes:` with each file's
+  count, `Our vote:`); a file that would not count has why after its
+  count. `relays` lists the relays of the file in force, a mark
+  beside those this wallet is reached at; with no file in force, the
+  seeds that stand in. A long list is shown whole for now.
 - **Done so far:** one of a thing and several, in the line of a block's transactions. What a command answers of a payment begins `Payment`, as the log's line does. The going over of everything is still to do: as a list of what is said now and what is proposed, to be read through and agreed.
 
 ### 25. The prompt recalls what was typed, and completes what is begun
@@ -970,6 +977,12 @@ these had a test of its own.
   blocks that are undone.
 
 ### 29. What `verify-proof` says, and names in a proof
+
+- **Done, of what is said:** `verify-proof` answers in lines, as
+  decided (`From:`, `To:`, `Amount:`, `Note:` where there is one,
+  `Block: N (id) (n confirmations)`); a burn in the same form
+  (`Burned:`, `For:`, `Purpose:`, `Block:`). Names in a proof are
+  with entries 30 and 31.
 
 - **Seen:** one long line:
 

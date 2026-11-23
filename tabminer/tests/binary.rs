@@ -768,7 +768,7 @@ fn a_consensus_file_is_voted_for_and_followed() {
     let at = |i: u32| format!("127.0.0.1:{}", port + i);
     let mut first = Prompted::start(&dirs[0], &at(0), &[], true, true);
     let mut second = Prompted::start(&dirs[1], &at(1), &[at(0)], false, true);
-    assert!(first.ask("consensus").starts_with("mode init\nnothing is decided before block 144"));
+    assert!(first.ask("consensus").starts_with("Mode: init\nNext decision block: 144\nVotes: none\n"));
     assert!(first.ask("leaves").starts_with("no leaf is set"));
     // A file that is none is not voted for; one that is, is.
     let file = dirs[0].join("consensus.txt");
@@ -785,11 +785,15 @@ fn a_consensus_file_is_voted_for_and_followed() {
     let began = Instant::now();
     loop {
         let (a, b) = (first.ask("consensus"), second.ask("consensus"));
-        if a.starts_with("mode onion") && b.starts_with("mode onion") {
+        if a.starts_with("Mode: onion") && b.starts_with("Mode: onion") {
             for said in [&a, &b] {
-                assert!(said.contains("decided at block 144, of the votes of blocks 1 to 144"), "{said}");
-                assert!(said.contains("in force: "), "{said}");
-                assert!(relays.iter().all(|id| said.contains(&format!("  relay {id} 10.0.0."))), "{said}");
+                assert!(said.contains("\nFile: ") && said.contains("\nDecided at block: 144 ("), "{said}");
+                assert!(said.contains("\nRelays: 3 (see: relays)\nNext decision block: 288\n"), "{said}");
+            }
+            // (The relays themselves, by the command that lists them.)
+            for listed in [first.ask("relays"), second.ask("relays")] {
+                assert!(listed.starts_with("Relays of ") && listed.contains(": 3\n"), "{listed}");
+                assert!(relays.iter().all(|id| listed.contains(&format!("    {id} 10.0.0."))), "{listed}");
             }
             break;
         }
@@ -930,7 +934,9 @@ fn a_payment_is_sent_to_an_address() {
         std::thread::sleep(Duration::from_millis(300));
     };
     assert!(
-        shown.starts_with(&format!("the proof holds: {own} paid 5 to {to}, note: \"deposit 4821\", in block ")),
+        shown.starts_with(&format!(
+            "the proof holds:\nFrom: {own}\nTo: {to}\nAmount: 5\nNote: \"deposit 4821\"\nBlock: "
+        )),
         "{shown}"
     );
     // (Changed, it does not hold; and what is no proof is none.)
@@ -968,7 +974,7 @@ fn a_payment_is_sent_to_an_address() {
         std::thread::sleep(Duration::from_millis(300));
     };
     assert!(
-        shown.starts_with("the proof holds: 2 was burned for alice@mailhub, for \"a year of hosting\", in block "),
+        shown.starts_with("the proof holds:\nBurned: 2\nFor: alice@mailhub\nPurpose: \"a year of hosting\"\nBlock: "),
         "{shown}"
     );
     assert!(payer.ask("burn 1 nothing").starts_with("error: burn: not what it takes"));

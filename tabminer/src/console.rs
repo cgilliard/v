@@ -39,6 +39,8 @@ pub const HELP: &str = "commands:
                             the vote for a consensus file, which FILE must be
   set-leaf-value INDEX HEX  set leaf INDEX to 32 bytes given in hex (all zero: none)
   consensus                 the consensus file in force, and how it is voted on
+  relays                    the relays of the file in force, with a mark beside those
+                            this wallet is reached at
   mempool                   the transactions waiting to be mined
   address                   this wallet's address: what it is known by, as tab1…
   balance                   what there is to spend; what is confirmed but too new to
@@ -355,6 +357,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             ("set-leaf", [index, file]) => self.set_leaf(index, Some(file), None),
             ("set-leaf-value", [index, value]) => self.set_leaf(index, None, Some(value)),
             ("consensus", []) => self.consensus(),
+            ("relays", []) => self.relays(),
             ("debug-consensus", [file]) if self.debug => self.debug_consensus(file),
             ("subname", ["set", full, to]) => self.subname_set(full, to),
             ("subname", ["delegate", name, signer, file]) => self.subname_delegate(name, signer, "30", file),
@@ -425,7 +428,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 "send" | "status" | "peers" | "mempool" | "fees" | "leaves" | "set-leaf" | "set-leaf-value"
                 | "consensus" | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "cancel"
                 | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit" | "txs" | "supply"
-                | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
+                | "relays" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
                 | "name-transfer" | "mining" | "payments" | "payment-proof" | "burn-proof" | "verify-proof" | "burn",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
@@ -656,103 +659,100 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
     }
 
     fn consensus(&self) -> Said {
-        use crate::consensus::{WINDOW, boundary};
+        use crate::consensus::{Current, Skip, WINDOW, boundary};
         let chain = self.hold.chain();
         let (current, votes) = chain.consensus().map_err(|e| e.to_string())?;
         let hex = |bytes: &[u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // (Why a file voted for does not count, beside its votes: but
+        // for too few votes in all, which the line above them says.)
+        let why = |skip: &Skip| match skip {
+            Skip::TooFew(_) => String::new(),
+            skip => format!(" ({skip})"),
+        };
         let height = self.hold.read().height;
-        let mut lines = vec![format!("mode {}", current.mode)];
-        match boundary(height) {
-            0 => lines.push(format!("nothing is decided before block {WINDOW}: until then the mode is init")),
-            at => lines.push(format!(
-                "decided at block {}, of the votes of blocks {} to {}: {} of {} voted",
-                commas(at as u64),
-                commas(votes.range.0 as u64),
-                commas(votes.range.1 as u64),
+        let mut lines = vec![format!("Mode: {}", current.mode)];
+        if let Some((hash, _)) = &current.winner {
+            lines.push(format!("File: {}", hex(hash)));
+        }
+        // What decided it: nothing, before the first boundary.
+        if boundary(height) > 0 {
+            lines.push(format!(
+                "Decided at block: {} ({} of {} votes)",
+                commas(boundary(height) as u64),
                 commas(votes.cast() as u64),
                 commas(votes.blocks as u64)
-            )),
-        }
-        lines.push(format!("the next is decided at block {}", commas((boundary(height) + WINDOW) as u64)));
-        if let Some((hash, n)) = &current.winner {
-            lines.push(format!("in force: {} ({} votes)", hex(hash), commas(*n as u64)));
-        }
-        for (hash, n, why) in &current.skipped {
-            lines.push(format!("not counted: {} ({} votes): {why}", hex(hash), commas(*n as u64)));
-        }
-        if let Some(file) = &current.file {
-            for relay in &file.relays {
-                lines.push(format!("  relay {} {}", crate::address::encode(&relay.id), relay.addr));
+            ));
+            for (hash, n, skip) in current.skipped.iter().filter(|s| !matches!(s.2, Skip::TooFew(_))) {
+                lines.push(format!("    not counted: {}: {}{}", hex(hash), commas(*n as u64), why(skip)));
             }
         }
-        // Where this node's wallet is reached, by what is in force.
-        if let Some((by_ways, nodes)) = self.hold.rendezvous() {
-            let reached = nodes.iter().filter(|node| node.1).count();
-            let each: Vec<String> = nodes
-                .iter()
-                .map(|(node, reached)| format!("{node}{}", if *reached { "" } else { " (not reached)" }))
-                .collect();
-            let how = match by_ways {
-                true => "relays of the file in force, by ways through the others",
-                false => "the seeds: no file names relays",
-            };
-            lines.push(match nodes.is_empty() {
-                true => format!("rendezvous points: none ({how})"),
-                false => {
-                    format!("rendezvous points ({how}), reached at {reached} of {}: {}", nodes.len(), each.join(", "))
-                }
-            });
+        if let Some(file) = &current.file {
+            lines.push(format!("Relays: {} (see: relays)", commas(file.relays.len() as u64)));
         }
-        // What is being voted for now, towards the next boundary.
-        let running = chain.consensus_votes(height + 1 - boundary(height)).map_err(|e| e.to_string())?;
-        for (hash, n, _) in &running.counts {
-            lines.push(format!("since then: {} has {} votes", hex(hash), commas(*n as u64)));
-        }
-        // And what that would come to, were it decided as it stands:
-        // so that a file that is not held, or is no file, is found out
-        // now and not at the boundary.
         let next = boundary(height) + WINDOW;
+        lines.push(format!("Next decision block: {}", commas(next as u64)));
+        // What is being voted for now, towards the next boundary; and
+        // of each file, whether it would count were it decided as it
+        // stands: so that a file that is not held, or is no file, is
+        // found out now and not at the boundary.
+        let running = chain.consensus_votes(height + 1 - boundary(height)).map_err(|e| e.to_string())?;
         match running.counts.is_empty() {
-            true => lines.push(format!(
-                "no valid votes received since then: init mode will be used from block {} unless a file receives votes",
-                commas(next as u64)
-            )),
+            true => lines.push("Votes: none".to_string()),
             false => {
-                let would = crate::consensus::Current::decide(&running, WINDOW, |hash| {
-                    chain.consensus_file(hash).ok().flatten()
-                });
-                let needed = crate::consensus::Current::needed(WINDOW);
-                for (hash, n, why) in &would.skipped {
-                    lines.push(format!(
-                        "  as it stands not counted: {} ({} votes): {why}",
-                        hex(hash),
-                        commas(*n as u64)
-                    ));
-                }
-                match would.winner {
-                    Some((hash, _)) => lines.push(format!(
-                        "as the votes stand, from block {} the mode will be {}, by {}",
-                        commas(next as u64),
-                        would.mode,
-                        hex(&hash)
-                    )),
-                    None => lines.push(format!(
-                        "as the votes stand, from block {} the mode will be init: {} of the {WINDOW} blocks have voted, \
-                         and {needed} must for a file to be in force",
-                        commas(next as u64),
-                        commas(running.cast() as u64)
-                    )),
+                let would = Current::decide(&running, WINDOW, |hash| chain.consensus_file(hash).ok().flatten());
+                lines.push(format!("Votes ({} needed):", Current::needed(WINDOW)));
+                for (hash, n, _) in &running.counts {
+                    let skipped = would.skipped.iter().find(|s| s.0 == *hash).map_or(String::new(), |s| why(&s.2));
+                    lines.push(format!("    {}: {}{skipped}", hex(hash), commas(*n as u64)));
                 }
             }
         }
         // What the blocks made here vote for: of those begun since it
         // was set (one being made when it was set does not carry it).
-        match chain.aux_leaves().map_err(|e| e.to_string())?[0] {
-            vote if vote == [0u8; 32] => {
-                lines.push("the blocks made here vote for nothing (set-leaf 0 FILE)".to_string())
+        lines.push(match chain.aux_leaves().map_err(|e| e.to_string())?[0] {
+            vote if vote == [0u8; 32] => "Our vote: none".to_string(),
+            vote => format!("Our vote: {}", hex(&vote)),
+        });
+        Ok(lines.join("\n"))
+    }
+
+    /// The relays of the consensus file in force, one a line: there may
+    /// be thousands, so they are not part of what `consensus` says.
+    /// With a mark beside those this node's wallet is to be reached at,
+    /// and whether it is; while no file names relays, the seeds that
+    /// stand in for them.
+    fn relays(&self) -> Said {
+        let (current, _) = self.hold.chain().consensus().map_err(|e| e.to_string())?;
+        let hex = |bytes: &[u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // Where this node's wallet is reached, by what is in force.
+        let points = self.hold.rendezvous().map(|(_, nodes)| nodes).unwrap_or_default();
+        let mark = |addr: &str| match points.iter().find(|(node, _)| node.to_string() == addr) {
+            Some((_, true)) => "  *",
+            Some((_, false)) => "  * (not reached)",
+            None => "",
+        };
+        let reached = points.iter().filter(|node| node.1).count();
+        let own = match (self.wallet.is_some(), points.len()) {
+            (false, _) => None,
+            (true, 0) => Some("This wallet is reached nowhere yet".to_string()),
+            (true, n) => Some(format!("This wallet is reached at {reached} of its {n} (marked *)")),
+        };
+        let mut lines = Vec::new();
+        match (&current.winner, &current.file) {
+            (Some((hash, _)), Some(file)) => {
+                lines.push(format!("Relays of {}: {}", hex(hash), commas(file.relays.len() as u64)));
+                lines.extend(own);
+                for relay in &file.relays {
+                    let id = crate::address::encode(&relay.id);
+                    lines.push(format!("    {id} {}{}", relay.addr, mark(&relay.addr)));
+                }
             }
-            vote => {
-                lines.push(format!("the blocks made here vote for {}: each one begun since that was set", hex(&vote)))
+            _ => {
+                lines.push("No file is in force: the seeds stand in for relays".to_string());
+                lines.extend(own);
+                for (node, _) in &points {
+                    lines.push(format!("    {node}{}", mark(&node.to_string())));
+                }
             }
         }
         Ok(lines.join("\n"))
@@ -1377,23 +1377,26 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         proof.check(&header.state_root).map_err(|e| format!("the proof does not hold: {e}"))?;
         let confirmations = self.hold.read().height.saturating_sub(proof.height) + 1;
         let block = format!(
-            "block {} ({}), which has {} confirmations",
+            "Block: {} ({}) ({} confirmation{})",
             commas(proof.height as u64),
             short(&digest_to_bytes(&header.hash())),
-            commas(confirmations as u64)
+            commas(confirmations as u64),
+            if confirmations == 1 { "" } else { "s" }
         );
+        // (Of a payment, both wallets say so, each by its own key; of
+        // a burn, nobody can spend it: that is what holding means.)
         Ok(match &proof.claim {
             Claim::Payment { note, receipt, payer, .. } => {
-                let note = if note.is_empty() { String::new() } else { format!(", note: \"{}\"", shown(note)) };
+                let note = if note.is_empty() { String::new() } else { format!("Note: \"{}\"\n", shown(note)) };
                 format!(
-                    "the proof holds: {} paid {} to {}{note}, in {block}. Both wallets say so, each by its own key",
+                    "the proof holds:\nFrom: {}\nTo: {}\nAmount: {}\n{note}{block}",
                     crate::address::encode(&payer.recipient()),
+                    crate::address::encode(&receipt.recipient()),
                     coins(proof.amount as u128),
-                    crate::address::encode(&receipt.recipient())
                 )
             }
             Claim::Burn(burn) => format!(
-                "the proof holds: {} was burned for {}, for \"{}\", in {block}. Nobody can spend it",
+                "the proof holds:\nBurned: {}\nFor: {}\nPurpose: \"{}\"\n{block}",
                 coins(proof.amount as u128),
                 burn.beneficiary.said(),
                 burn.purpose
@@ -2455,7 +2458,8 @@ mod tests {
             assert!(!said(&bare, line).is_empty(), "{line}");
         }
         assert!(said(&bare, "status").starts_with("block 2 ("), "{}", said(&bare, "status"));
-        assert!(said(&bare, "consensus").starts_with("mode init\nnothing is decided before block 144"));
+        assert_eq!(said(&bare, "consensus"), "Mode: init\nNext decision block: 144\nVotes: none\nOur vote: none");
+        assert_eq!(said(&bare, "relays"), "No file is in force: the seeds stand in for relays");
         assert!(said(&bare, "leaves").starts_with("no leaf is set"));
         assert!(said(&bare, "mempool").starts_with("0 transactions, 0 bytes; the pool asks 25,000 a unit of weight"));
         assert!(said(&bare, "fees").contains("a simple payment weighs 7 (an input 1, an output 3 by default)"));
@@ -2711,8 +2715,10 @@ mod tests {
         // Whoever has the file and the chain can say what it proves.
         for anyone in [&payer, &paid] {
             let holds = said(anyone, &format!("verify-proof {file}"));
-            assert!(holds.starts_with("the proof holds: tab1") && holds.contains(" paid 7 to tab1"), "{holds}");
-            assert!(holds.contains("in block 3 (") && holds.contains("which has 2 confirmations"), "{holds}");
+            let lines: Vec<&str> = holds.lines().collect();
+            assert_eq!((lines.len(), lines[0], lines[3]), (5, "the proof holds:", "Amount: 7"), "{holds}");
+            assert!(lines[1].starts_with("From: tab1") && lines[2].starts_with("To: tab1"), "{holds}");
+            assert!(lines[4].starts_with("Block: 3 (") && lines[4].ends_with(") (2 confirmations)"), "{holds}");
         }
         assert_eq!(
             wrong(&payer, "payment-proof 0000000000"),
@@ -2737,7 +2743,7 @@ mod tests {
         let burn =
             listed.lines().find(|l| l.contains("burned")).unwrap().split_whitespace().next().unwrap().to_string();
         assert_eq!(said(&payer, &format!("burn-proof {burn} {file}")), format!("the proof of {burn}, in block 5"));
-        assert!(said(&paid, &format!("verify-proof {file}")).starts_with("the proof holds: "));
+        assert!(said(&paid, &format!("verify-proof {file}")).starts_with("the proof holds:\nBurned: "));
         assert_eq!(said(&payer, "balance"), "spendable   8,991");
         let outputs = said(&payer, "outputs");
         assert!(outputs.contains("  spent ") && outputs.contains("  confirmed "), "{outputs}");
@@ -2849,11 +2855,12 @@ mod tests {
         let voted = said(&payer, &format!("set-leaf 0 {file}"));
         assert!(voted.contains("vote for") && voted.contains("mode onion"), "{voted}");
         assert!(said(&payer, "leaves").contains("(the vote for a consensus file)"));
-        assert!(said(&payer, "consensus").starts_with("mode init\n"));
+        assert!(said(&payer, "consensus").starts_with("Mode: init\n"));
         // (Debugging: the file in force at once, with no vote.)
         let forced = payer.run(&format!("debug-consensus {file}"));
         assert!(matches!(&forced, Reply::Said(_)), "{forced:?}");
-        assert!(said(&payer, "consensus").contains("the blocks made here vote for "));
+        let forced = said(&payer, "consensus");
+        assert!(forced.contains("\nOur vote: ") && !forced.ends_with("Our vote: none"), "{forced}");
         // A payment to an address goes to its wallet by the message
         // layer; to what is no address, nowhere.
         assert_eq!(wrong(&payer, "send 1 nobody"), "'nobody' is no address (tab1…) and no @name");
