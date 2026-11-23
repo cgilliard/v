@@ -21,7 +21,7 @@ one batch, last.
 | **C. The wallet** | 8, 9, 24 | 9 is checked against what 8 makes of the wallet; all three change what the wallet or the store keeps | the tests, once |
 | **D. The network** | 11, 17, 15, 10 (memory of a fixed size), 4, 21, 13 | they change what nodes say to each other: one upgrade of every node. 13 is run on the live network once they are in | the tests, once; every node started again |
 | **E. The proof** | 14, and what of 19 touches a circuit | the only work on circuits | the setups, once; the tests, once |
-| **Open** | 16 | to be thought about further; with D, if it is settled by then | |
+| **Won't fix** | 16 | the rule stays as it is, and is documented | |
 
 In that order, because:
 
@@ -155,8 +155,53 @@ Two entries are in two places:
     before the sender has signed, as in Grin.
   - The numbers are the wallet's own. A wallet made again from its
     phrase numbers afresh what it finds on the chain.
-- **Still to decide:** the exact columns and words of `txs` and
-  `outputs`, and which of the present commands stay as other names.
+- **Decided, of the columns:**
+
+  ```
+  txs
+    #  kind          state          amount   fee      block   id
+    1  reward        confirmed      1,500    -        12      a41c9e02
+    2  sent          confirmed      100      0.00002  11      3a856bc3
+    3  received      confirmed      100      -        11      3a856bc3
+    4  name commit   pooled         -        0.00002  -       77b0c1d4   @alice
+    6  sent          replaced by 7  40       0.00002  -       5d1e88b0
+    7  cancel of 6   pooled         -        0.00004  -       c2a97f13
+
+  outputs
+    id        amount   state      block  position  sigs       made by  spent by
+    8f02ab1c  1,500    confirmed  12     40        0          1        -
+    7a30c9e1  250      confirmed  9      31        0          -        -
+    c09a4412  1,400    pending    -      -         7 *last*   2        -
+  ```
+
+  - Kinds: sent, received, reward, burn, name commit, name reveal,
+    name update, name transfer, cancel of N, bump of N. States: begun,
+    answered, pooled, confirmed, cancelled, replaced by N, orphaned,
+    and to be made again (of a payment whose input lies elsewhere
+    after the chain went over to another branch).
+  - A payment of which this wallet is both sides is two rows, one
+    sent and one received.
+  - `position` is where the output lies among all the chain's outputs
+    (what a signature is of), not its place in a block. Kept.
+  - `sigs`: signatures are counted for each output, not each address:
+    every output has a key of its own that signs eight times. The
+    column says how many have been used, and `*last*` beside it when
+    one is left (room is kept for that, so that the rows stay in
+    line). An output is signed for once as a rule; each cancelling,
+    bumping or making again of a payment that spends it is one more.
+  - `made by` and `spent by` are numbers of `txs`. A dash where the
+    wallet does not know, and never a guess: a wallet made again from
+    its phrase finds its outputs on the chain and not what made them;
+    and after the chain has gone over to another branch an output may
+    be there by a block the wallet has no row for.
+  - `txs N`: all of one. `txs pending`, `txs mined`: parts of the
+    list. The present commands stay for now as other names.
+- **How it is to be built:** a table of numbers beside the tables
+  there are (payments begun, signed, in a block; rewards; steps of
+  names), each number of one record of theirs; the state is worked out
+  from those tables. `cancel N`, `bump N`, `resend N` find the record
+  by its number. What `prune` did is done by the thread that follows
+  the chain, at each block.
 
 ### 9. The wallet through a reorganization
 
@@ -426,115 +471,6 @@ Two entries are in two places:
   - The sizes: how large the pool is to be on a node that holds
     everything, how much a low-memory node keeps whole, and how this
     sits with memory of a fixed size (entry 10).
-
-### 16. A consensus file stays in force until another is voted in
-
-**Open: to be thought about further before anything is built.** The
-idea is wanted, and how to do it is not settled.
-
-- **The concern that holds it up:** nodes that mean harm can give
-  what is asked to some nodes and not to others. Votes and files a
-  long way back are held by fewer nodes and asked for more rarely, so
-  the further back the answer lies, the easier it is to keep it from
-  some and so to have nodes of one network hold different files to be
-  in force. As the rule is now, everything wanted is within the last
-  144 to 288 blocks, which every node has just fetched: some node
-  always has it.
-- **What is known about it so far:** votes are checked against headers
-  and a file against its hash, so what is handed over cannot be made
-  up, only kept back. A node that has not been given what it needs
-  knows that it lacks it, if it does not take "not found" for an
-  answer. That leaves: what such a node does meanwhile; how it tells
-  being kept from the answer from there being none; and whether what
-  must be kept can be held to something recent (a vote said again
-  from time to time, a bound on how long a file stands unrenewed), so
-  that the last windows always say it.
-
-- **The concern:** init mode (the seeds standing in for relays) is for
-  a network that is very small. Once the network is in onion mode and
-  has grown, going back to init mode could bring the seeds down. As
-  the rule is (`consensus::Current::decide`), a window of 144 blocks
-  in which no more than half voted puts the network in init mode,
-  whatever was in force. So: two pools, one voting steadily for its
-  file and one never voting; the second comes to make most of the
-  blocks; and the network goes back to init mode though nobody voted
-  for that.
-- **The rule to have:**
-  - At a boundary, if more than half the window's blocks voted, the
-    most voted file that is held and valid is in force: as now.
-  - If no more than half voted, the file that was in force stays in
-    force.
-  - The network is in init mode only before any file was ever voted
-    in, or when a file that says `mode init` is itself voted in by
-    more than half: then the miners have said so, knowing what it
-    means.
-- **To settle:**
-  1. Every node must come to the same file, and a node that takes its
-     state from others has not seen the vote that put the file in
-     force, which may be long past. As things are, the votes are kept
-     and served only for the last window. **Proposed:**
-     - Every node has every header from the first, whether it took
-       its state from others or not, and a header commits to its
-       block's vote (one of the sixteen values it commits to beside
-       it). A vote handed over is checked against a header the node
-       has.
-     - The *deciding window* is the last window of 144 blocks in which
-       more than half voted: the chain alone says which it is, the
-       same for everyone. Every node keeps and serves the votes from
-       that window on; what is older can go, and never counts again.
-     - A new node, its headers in, goes back a window at a time: it
-       fetches the window's votes, checks each against its header, and
-       counts. The first window with more than half voting says the
-       file. None, back to the first block: init mode.
-     - What it costs: a block's sixteen values are 549 bytes (seen in
-       the live test), so 79 KB a window and 29 MB for a year in which
-       nobody voted; one vote by more than half brings it back to one
-       window. A new node fetches as much once, which is little beside
-       the state.
-     - Checked from the headers alone: nothing rests on what recent
-       blocks say that they do not vote on, and no rule of a block
-       changes.
-     - To be seen to: the file in force must be had by its hash for as
-       long as it stands (nodes keep and serve consensus files by hash
-       now; this one is kept); votes are fetched a block at a time now,
-       and are to be had a window at once, and of old blocks; and a
-       node that has not yet gone back far enough says that it does
-       not know the file yet, and does not take it for init mode.
-  2. A file whose relays have gone is not replaced while most do not
-     vote: a pool that no longer makes most of the blocks cannot renew
-     its own list. That follows from the rule, and is the price of it;
-     wallets go round a relay that does not answer.
-  3. "More than half" is 73 of 144, as the code has it.
-- **It is more than it looked.** The rule is a line; the work is all
-  in how a node that was not there finds out what is in force (1
-  above): a way to fetch old votes a window at once, a rule for what
-  is kept, and a state of not yet knowing. It could be built in two
-  steps, the rule first with nodes remembering, the going back after.
-- **Another rule, which needs nothing of the past** (to choose between
-  the two):
-  - Of the last 144 blocks, the file with the most votes is in force,
-    if at least some few blocks voted (15, say: a tenth). Only if
-    fewer voted is the network in init mode.
-  - The two pools: the one that votes has the most votes though it
-    makes fewer blocks, and its file stays. No going back to init
-    mode.
-  - Init mode on purpose: a file that says `mode init` has the most
-    votes, as any file would.
-  - All of it is said by the last 144 blocks, as now: nothing more to
-    keep, nothing to go back for, a few lines to write.
-  - What it gives up: not to vote is to leave it to those who do. A
-    pool with fewer blocks can change the file whenever the rest say
-    nothing, down to the few; with the file that stays, it never can.
-    And if nearly nobody votes, it is init mode still, though one pool
-    that goes on voting is enough to prevent it.
-
-  | | the file that stays | most votes, of a few at least |
-  |---|---|---|
-  | most do not vote | nothing changes | those who vote say |
-  | fewer blocks can change the file | never | yes, if the rest say nothing |
-  | init mode unasked | never | only if nearly nobody votes |
-  | a new node needs the past | yes, to the last deciding window | no |
-  | to build | a good deal | a few lines |
 
 ### 17. Can a consensus file, or the votes for it, be kept from some nodes?
 
@@ -883,3 +819,118 @@ these had a test of its own.
 - **Why it matters:** a node of the live network that stops catching
   up and says nothing is wrong would be this.
 - **Found, and done:** a fetch of a block that comes to nothing (given up for silence, or as too slow) has its peer passed over for ten minutes, so that another is asked in its place. A node with one peer that can give the block then asked nobody for ten minutes: ten blocks and then none. Now, where nobody else holds the block, a peer that has been passed over for a little while (`sync.header_wait`) is asked again. Tried by `a_node_with_one_peer_asks_it_again_after_a_fetch_fails`, which stands at block 8 of 40 without the change. Why a fetch should fail at all between two nodes of one machine on the Windows runner is not known (datagrams lost on a machine doing much else, most likely); with the change it costs seconds, and the other test of real sockets no longer asks that no fetch fail.
+
+## Won't fix
+
+### 16. A consensus file stays in force until another is voted in
+
+**Won't fix.** The rule stays as it is: a window of 144 blocks in
+which no more than half voted puts the network in init mode, whatever
+was in force. It is to be said plainly where the consensus file is
+documented, so that those who make most of the blocks know that not to
+vote is to send the network back to init mode. What was thought about
+is kept below, for whoever comes back to it.
+
+- **The concern that holds it up:** nodes that mean harm can give
+  what is asked to some nodes and not to others. Votes and files a
+  long way back are held by fewer nodes and asked for more rarely, so
+  the further back the answer lies, the easier it is to keep it from
+  some and so to have nodes of one network hold different files to be
+  in force. As the rule is now, everything wanted is within the last
+  144 to 288 blocks, which every node has just fetched: some node
+  always has it.
+- **What is known about it so far:** votes are checked against headers
+  and a file against its hash, so what is handed over cannot be made
+  up, only kept back. A node that has not been given what it needs
+  knows that it lacks it, if it does not take "not found" for an
+  answer. That leaves: what such a node does meanwhile; how it tells
+  being kept from the answer from there being none; and whether what
+  must be kept can be held to something recent (a vote said again
+  from time to time, a bound on how long a file stands unrenewed), so
+  that the last windows always say it.
+
+- **The concern:** init mode (the seeds standing in for relays) is for
+  a network that is very small. Once the network is in onion mode and
+  has grown, going back to init mode could bring the seeds down. As
+  the rule is (`consensus::Current::decide`), a window of 144 blocks
+  in which no more than half voted puts the network in init mode,
+  whatever was in force. So: two pools, one voting steadily for its
+  file and one never voting; the second comes to make most of the
+  blocks; and the network goes back to init mode though nobody voted
+  for that.
+- **The rule to have:**
+  - At a boundary, if more than half the window's blocks voted, the
+    most voted file that is held and valid is in force: as now.
+  - If no more than half voted, the file that was in force stays in
+    force.
+  - The network is in init mode only before any file was ever voted
+    in, or when a file that says `mode init` is itself voted in by
+    more than half: then the miners have said so, knowing what it
+    means.
+- **To settle:**
+  1. Every node must come to the same file, and a node that takes its
+     state from others has not seen the vote that put the file in
+     force, which may be long past. As things are, the votes are kept
+     and served only for the last window. **Proposed:**
+     - Every node has every header from the first, whether it took
+       its state from others or not, and a header commits to its
+       block's vote (one of the sixteen values it commits to beside
+       it). A vote handed over is checked against a header the node
+       has.
+     - The *deciding window* is the last window of 144 blocks in which
+       more than half voted: the chain alone says which it is, the
+       same for everyone. Every node keeps and serves the votes from
+       that window on; what is older can go, and never counts again.
+     - A new node, its headers in, goes back a window at a time: it
+       fetches the window's votes, checks each against its header, and
+       counts. The first window with more than half voting says the
+       file. None, back to the first block: init mode.
+     - What it costs: a block's sixteen values are 549 bytes (seen in
+       the live test), so 79 KB a window and 29 MB for a year in which
+       nobody voted; one vote by more than half brings it back to one
+       window. A new node fetches as much once, which is little beside
+       the state.
+     - Checked from the headers alone: nothing rests on what recent
+       blocks say that they do not vote on, and no rule of a block
+       changes.
+     - To be seen to: the file in force must be had by its hash for as
+       long as it stands (nodes keep and serve consensus files by hash
+       now; this one is kept); votes are fetched a block at a time now,
+       and are to be had a window at once, and of old blocks; and a
+       node that has not yet gone back far enough says that it does
+       not know the file yet, and does not take it for init mode.
+  2. A file whose relays have gone is not replaced while most do not
+     vote: a pool that no longer makes most of the blocks cannot renew
+     its own list. That follows from the rule, and is the price of it;
+     wallets go round a relay that does not answer.
+  3. "More than half" is 73 of 144, as the code has it.
+- **It is more than it looked.** The rule is a line; the work is all
+  in how a node that was not there finds out what is in force (1
+  above): a way to fetch old votes a window at once, a rule for what
+  is kept, and a state of not yet knowing. It could be built in two
+  steps, the rule first with nodes remembering, the going back after.
+- **Another rule, which needs nothing of the past** (to choose between
+  the two):
+  - Of the last 144 blocks, the file with the most votes is in force,
+    if at least some few blocks voted (15, say: a tenth). Only if
+    fewer voted is the network in init mode.
+  - The two pools: the one that votes has the most votes though it
+    makes fewer blocks, and its file stays. No going back to init
+    mode.
+  - Init mode on purpose: a file that says `mode init` has the most
+    votes, as any file would.
+  - All of it is said by the last 144 blocks, as now: nothing more to
+    keep, nothing to go back for, a few lines to write.
+  - What it gives up: not to vote is to leave it to those who do. A
+    pool with fewer blocks can change the file whenever the rest say
+    nothing, down to the few; with the file that stays, it never can.
+    And if nearly nobody votes, it is init mode still, though one pool
+    that goes on voting is enough to prevent it.
+
+  | | the file that stays | most votes, of a few at least |
+  |---|---|---|
+  | most do not vote | nothing changes | those who vote say |
+  | fewer blocks can change the file | never | yes, if the rest say nothing |
+  | init mode unasked | never | only if nearly nobody votes |
+  | a new node needs the past | yes, to the last deciding window | no |
+  | to build | a good deal | a few lines |

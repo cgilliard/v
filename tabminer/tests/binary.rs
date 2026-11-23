@@ -232,7 +232,7 @@ fn two_nodes_make_blocks_and_take_each_others() {
         // (Not of the first block, which one of them may have had from the
         // other before its own was proven.)
         let told = ["] Proving block ", "] Mining block ", ": proved in ", "] Won block ", " hashes in "];
-        let told = told.into_iter().chain(["] Received block ", ") from 127.0.0.1:"]);
+        let told = told.into_iter().chain(["] Received block ", " bytes from 127.0.0.1:"]);
         for said in told.chain(["] Peer 127.0.0.1:", " connected (height "]) {
             assert!(main.contains(said), "{said}: {main}");
         }
@@ -332,7 +332,7 @@ fn a_payment_is_made_at_the_prompt_and_mined() {
     // block carried it.
     wait("the payment is not confirmed", &mut || confirmed(&mut other) == "12.5");
     let log = std::fs::read_to_string(dirs[0].join("tabernacle.log")).unwrap();
-    assert!(log.contains("carries 1 transactions of the pool (1 signatures)"), "{log}");
+    assert!(log.contains("carries 1 transaction of the pool (1 signature)"), "{log}");
     // And each node's log says what its own wallet did, and nothing of
     // the other's.
     let theirs = std::fs::read_to_string(dirs[1].join("tabernacle.log")).unwrap();
