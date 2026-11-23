@@ -716,26 +716,37 @@ harder.
 
 ### 22. Changes made that nothing tries directly
 
-The code is in, and the tests there are pass with it; none of these
-has a test of its own.
+The code was in, and the tests there were passed with it; none of
+these had a test of its own.
 
-- A state being taken that would wait for ever at one of two steps
-  (it is now looked to at every turn).
-- The work of a header whose block is waited for being confirmed over
-  and over.
-- What it costs to make the state as of an earlier block, counted for
-  all workers together.
-- The rule for a fetch that is too slow (slower than a quarter of the
-  fastest, or all of them together too slow).
-- A state taken though blocks could be had, let be after three rounds
-  of nobody giving it.
-- A chain that leaves this one far down and is weighed and found to
-  have no more work (the case of more work is tried).
-- From before: a block that cannot be read when it is asked for; the
-  short wait of a socket on Windows; the watch on workers that have
-  stopped looking up; the bound on chains that leave this one far
-  down; two changes to the pool.
-
+- **Tried now**, each by a test that fails with the change taken out:
+  - A state being taken that would wait for ever at a step
+    (`a_state_being_taken_goes_on_when_what_it_waited_for_is_done`).
+  - The work of a header whose block is waited for being confirmed
+    over and over (counted in
+    `a_header_whose_block_nobody_has_sends_no_node_back`: once in a
+    minute).
+  - The rule for a fetch that is too slow
+    (`a_fetch_is_slow_against_the_others_not_by_itself`; the rule is a
+    function of its own now, `too_slow`).
+  - A state taken though blocks could be had, let be after three
+    rounds of nobody giving it
+    (`a_state_nobody_gives_is_let_be_for_the_blocks`).
+  - A chain that leaves this one far down and is weighed and found to
+    have no more work (`a_chain_far_down_with_no_more_work_is_not_kept`).
+  - A node with one peer, after a fetch from it failed (entry 20).
+- **Still not tried:**
+  - What it costs to make the state as of an earlier block, counted
+    for all workers together: wants several workers asked for states
+    as of different blocks at once.
+  - A block that cannot be read when it is asked for.
+  - The short wait of a socket on Windows.
+  - The watch on workers that have stopped looking up, on a worker
+    that really has.
+  - The bound on chains that leave this one far down (one at a time).
+  - Two changes to the pool: other announcers of a transaction kept
+    while it is fetched; a pooled transaction whose policy input no
+    longer holds, dropped.
 ### 23. The wording of what the node says
 
 - **Asked for:** to go over everything the node says, and put right

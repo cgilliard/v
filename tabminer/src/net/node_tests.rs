@@ -1351,6 +1351,66 @@ fn a_node_far_behind_takes_the_state_though_the_blocks_could_be_had() {
     }
 }
 
+/// A fetch is too slow for the way in, or the way in is slow: which,
+/// by how the others come.
+#[test]
+fn a_fetch_is_slow_against_the_others_not_by_itself() {
+    use crate::net::node::too_slow;
+    let least = 4096;
+    // Fast enough is never too slow; nor is anything where no least is
+    // asked.
+    assert!(!too_slow(4096, 1 << 20, 1 << 21, least));
+    assert!(!too_slow(0, 1 << 20, 1 << 20, 0));
+    // Twenty-four fetches at 2 KB a second each over a way in of 48 KB
+    // a second: each is under the least, none is four times faster
+    // than another, and together they come well over it. Nobody's
+    // fault.
+    assert!(!too_slow(2000, 2000, 48_000, least));
+    assert!(!too_slow(1000, 3999, 48_000, least));
+    // One that trickles beside one that runs: its peer's.
+    assert!(too_slow(100, 1 << 20, (1 << 20) + 100, least));
+    assert!(too_slow(999, 4000, 48_000, least));
+    // One alone that trickles, or all of them together under what one
+    // should bring: given up, and asked of another.
+    assert!(too_slow(100, 100, 100, least));
+    assert!(too_slow(1000, 1000, 3000, least));
+    assert!(!too_slow(1400, 1400, 4200, least));
+}
+
+/// A chain that leaves this one far down and is said to have more work
+/// is weighed before any of it is kept; one that comes to no more than
+/// there is leaves nothing behind it, and whoever told of it is passed
+/// over.
+#[test]
+fn a_chain_far_down_with_no_more_work_is_not_kept() {
+    // (This node can undo eight blocks and has twenty; the other has
+    // ten from the first block, another ten, and says it has more work
+    // than anyone.)
+    let ours = Chain::open(MemBackend::new(), 8, easy(), seed(), AcceptAllProofs).unwrap();
+    ours.set_dataset(table());
+    let ours = Arc::new(ours);
+    grow_wide(&ours, 20, 20, 2);
+    let other = chain_of(easy());
+    grow_wide(&other, 10, 20, 1);
+    let mut w = World::with(vec![other, ours], &small_runs());
+    w.nodes[0].boast = Some(U256::MAX);
+    w.nodes[1].add_peer(at(0), false, 0);
+    let before = (tip(&w, 1), w.best(1));
+    // (The other chain's headers as they are now: that node, which
+    // hears of more work than it has, goes over to this one's chain.)
+    let theirs: Vec<Header> = (1..=10).map(|h| w.nodes[0].chain().header_at(h).unwrap().unwrap()).collect();
+    w.run(30 * SECOND);
+    let c = w.nodes[1].counts();
+    assert_eq!((c.weighed, c.headers, c.states), (1, 0, 0));
+    assert_eq!((tip(&w, 1), w.best(1)), before);
+    // Nothing of the other chain is kept here.
+    let kept = theirs.iter().filter(|h| w.nodes[1].chain().known(&h.hash()).unwrap().is_some()).count();
+    assert_eq!(kept, 0);
+    let now = w.now;
+    assert!(!w.nodes[1].table(&at(0)).may_ask(&at(0), now));
+    assert!(w.nodes[1].list().aim.is_none());
+}
+
 /// A node with one peer goes on asking it. A fetch that came to
 /// nothing has its peer passed over, so that another is asked in its
 /// place; with no other, the node asks that one again after a little
@@ -1409,6 +1469,62 @@ fn a_node_that_cannot_go_back_to_the_fork_takes_the_state() {
     // headers were weighed whole, none kept, before they were fetched
     // again and kept, having come to more work.)
     assert_eq!((c.weighed, c.headers), (1, 30));
+}
+
+/// A state being taken waits for nothing that may never come. Its
+/// block and the top of its state arrive while the work of other
+/// headers is being confirmed, so that its own cannot be yet; when
+/// that is done with, the taking goes on at the next turn, though
+/// nothing more arrives to set it going.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn a_state_being_taken_goes_on_when_what_it_waited_for_is_done() {
+    let (ahead, _) = long_chain(50);
+    let mut cfg = Config::default();
+    (cfg.sync.sync_point, cfg.sync.sync_behind) = (10, 30);
+    let mut w = World::with(vec![ahead, chain_of(easy())], &cfg);
+    w.nodes[1].add_peer(at(0), false, 0);
+    // (Something else is being confirmed, for as long as the test
+    // says.)
+    w.nodes[1].with_list(|_, l| l.confirming = true);
+    let mut waited = 0;
+    while !w.nodes[1].list().join.as_ref().is_some_and(|j| j.block.is_some() && j.manifest.is_some()) {
+        w.run(SECOND / 10);
+        waited += 1;
+        assert!(waited < 600, "the state's block and its top never came");
+    }
+    // It has what it asked for, and can go no further.
+    w.run(5 * SECOND);
+    assert!(w.nodes[1].list().join.as_ref().is_some_and(|j| !j.worked && !j.begun));
+    assert_eq!(w.nodes[1].counts().states, 0);
+    // The other is done with: no outcome of it is of this state, and
+    // nothing more is on its way. The taking goes on all the same.
+    w.nodes[1].with_list(|_, l| l.confirming = false);
+    w.run(90 * SECOND);
+    assert_eq!(tip(&w, 1), tip(&w, 0));
+    assert_eq!(w.nodes[1].counts().states, 1);
+    assert!(w.nodes[1].list().join.is_none() && !w.nodes[1].chain().receiving());
+}
+
+/// A node far enough behind to take the state, whose only peer says it
+/// has the state and hands none of it over, does not wait for it for
+/// ever: after a few rounds of asking it lets the state be and takes
+/// the blocks, which that peer does give.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "builds long chains; run with --release")]
+fn a_state_nobody_gives_is_let_be_for_the_blocks() {
+    let (ahead, _) = long_chain(50);
+    let mut cfg = Config::default();
+    (cfg.sync.sync_point, cfg.sync.sync_behind) = (10, 30);
+    let mut w = World::with(vec![ahead, chain_of(easy())], &cfg);
+    w.nodes[0].withhold = true;
+    w.nodes[1].add_peer(at(0), false, 0);
+    // (Three rounds of asking, each after a longer wait: some minutes.)
+    w.run(600 * SECOND);
+    assert_eq!(tip(&w, 1), tip(&w, 0));
+    let c = w.nodes[1].counts();
+    assert_eq!((c.states, c.blocks, c.blocks_refused), (0, 50, 0));
+    assert!(!w.nodes[1].chain().receiving());
 }
 
 /// A node with an old state, further behind than anyone's bodies reach,
@@ -1475,6 +1591,9 @@ fn a_header_whose_block_nobody_has_sends_no_node_back() {
         let c = w.nodes[i].counts();
         assert_eq!((c.states, c.states_moved), (0, 0), "node {i}");
         assert!(w.nodes[i].list().join.is_none() && !w.nodes[i].chain().receiving(), "node {i}");
+        // (The work of the header waited for was looked at once, in a
+        // minute of waiting: not at every turn.)
+        assert_eq!(c.confirms, 1, "node {i}");
     }
 }
 

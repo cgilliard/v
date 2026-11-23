@@ -110,6 +110,9 @@ pub struct Counts {
     pub sent: u64,
     /// Times a peer was asked where its chain leaves ours.
     pub forks_asked: u64,
+    /// Times the work of a best header whose block is waited for was
+    /// given to be confirmed in full.
+    pub confirms: u64,
     /// Objects fetched whole, and fetches given up.
     pub fetched: u64,
     pub fetches_failed: u64,
@@ -140,6 +143,7 @@ impl Counts {
         self.strangers += o.strangers;
         self.sent += o.sent;
         self.forks_asked += o.forks_asked;
+        self.confirms += o.confirms;
         self.fetched += o.fetched;
         self.fetches_failed += o.fetches_failed;
         self.fetches_slow += o.fetches_slow;
@@ -372,6 +376,18 @@ fn apply<B: Backend + 'static, V: ProofVerifier + Sync>(chain: &Chain<B, V>, job
             Outcome::Announced { header, len, from, verdict }
         }
     })
+}
+
+/// Whether a fetch that comes at `own` bytes a second comes too slowly
+/// for the way in, where the fastest fetch comes at `fastest`, all of
+/// them together at `together`, and `least` is the least asked of one
+/// (none asked, if nothing): under the least, and either another comes
+/// four times as fast, or all of them together come under that least.
+/// Many fetches at once over a slow way in are each slow, and that is
+/// no peer's fault; one that is slow while another is fast is its
+/// peer's.
+fn too_slow(own: u64, fastest: u64, together: u64, least: u64) -> bool {
+    least > 0 && own < least && (own.saturating_mul(4) < fastest || together < least)
 }
 
 /// Tokens of those that are no peers kept at the most
@@ -1181,6 +1197,10 @@ pub struct Worker<B: Backend + 'static, V> {
     pub(crate) boast: Option<U256>,
     #[cfg(test)]
     pub(crate) spoil: bool,
+    /// Tests: nothing of a state is handed over, though the node says
+    /// it can.
+    #[cfg(test)]
+    pub(crate) withhold: bool,
     /// Tests: a height claimed that the chain has not.
     #[cfg(test)]
     pub(crate) tall: Option<u32>,
@@ -1257,6 +1277,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             counts: Counts::default(),
             #[cfg(test)]
             boast: None,
+            #[cfg(test)]
+            withhold: false,
             #[cfg(test)]
             tall: None,
             #[cfg(test)]
@@ -4501,6 +4523,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             // node did while the block is not to be had.)
             if !l.confirming && l.waited != Some(best.hash()) {
                 (l.confirming, l.waited) = (true, Some(best.hash()));
+                self.counts.confirms += 1;
                 self.work(l, Job::Confirm { best, from: height.saturating_add(1), target: None });
             }
             return false;
@@ -4766,6 +4789,10 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
 
     fn make(&self, object: &Object) -> Option<Vec<u8>> {
         #[cfg(test)]
+        if self.withhold && of_state(object) && !matches!(object, Object::Block(_)) {
+            return None;
+        }
+        #[cfg(test)]
         if let (Object::Block(id), Some((foisted, body))) = (object, &self.foist)
             && id == foisted
         {
@@ -4943,9 +4970,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                         | Object::Part { .. }
                         | Object::Names { .. }
                 );
-                let own = fetch.rate(now);
-                let behind = own.saturating_mul(4) < fastest || together < rate;
-                of_chain && rate > 0 && fetch.age(now) >= grace && own < rate && behind
+                of_chain && fetch.age(now) >= grace && too_slow(fetch.rate(now), fastest, together, rate)
             };
             if slow {
                 let l = &mut **held.get_or_insert_with(|| write(&list));
@@ -5367,6 +5392,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
         let (first, rest) = self.workers.split_first_mut().expect("a worker");
         for w in rest {
             (w.boast, w.spoil, w.foist, w.tall) = (first.boast, first.spoil, first.foist.clone(), first.tall);
+            w.withhold = first.withhold;
             if w.cfg != first.cfg {
                 w.cfg = first.cfg.clone();
             }
