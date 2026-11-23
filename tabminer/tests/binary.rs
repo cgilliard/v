@@ -589,7 +589,7 @@ fn a_payment_survives_the_chain_going_over_to_another_branch() {
     assert!(a.contains("Reorganized to block"), "{a}");
     assert!(a.contains("The wallet: 1 payments sent are in no block any more"), "{a}");
     assert!(b.contains("The wallet: 1 outputs are in no block any more"), "{b}");
-    assert!(log(2).contains("carries 1 transactions"), "{}", log(2));
+    assert!(log(2).contains("carries 1 transaction of the pool"), "{}", log(2));
     // The second spent the reward of a block of the branch given up
     // (the largest the maker had, with the first payment's fee): there
     // is no such output now, and no block will ever have that payment.
