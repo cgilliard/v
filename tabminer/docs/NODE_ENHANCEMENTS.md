@@ -700,16 +700,30 @@ these had a test of its own.
     Mode: onion
     File: 4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb492
     Decided at block: 144 (137 of 144 votes)
-    Relays (reached at 3 of 3):
-        tab1qljpy98457gl0gx6hyujq4lsyftwt4aen5pwd44yuft84kafupwq9ddpxd 62.210.163.171:3737
-        tab1rz4cvn33nqqrmmuxma3jl00r4rqaqaej2t8a8w7z0c8kk5uenn9q55swum 159.54.172.190:3737
-        tab1t4rwy27j3c6p9a33xx8kfq97e3t2nzxuuajp5j9tekzau3hwuqtszjxy2n 146.235.230.124:3737
+    Relays: 3 (see: relays)
     Next decision block: 288
     Votes (73 needed):
         4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb492: 2
     Our vote: none
     ```
 
+    - The relays of the file in force are not listed here (decided):
+      a file may name thousands. `consensus` says how many, and a
+      command of their own lists them, one a line:
+
+      ```
+      > relays
+      Relays of 4a278d9830685488a1c2e2cfdb5f11b89da7664e5a68dea3f1df06ca9abbb492: 3
+      Rendezvous points of this wallet: reached at 3 of 3
+          tab1qljpy98457gl0gx6hyujq4lsyftwt4aen5pwd44yuft84kafupwq9ddpxd 62.210.163.171:3737  *
+          tab1rz4cvn33nqqrmmuxma3jl00r4rqaqaej2t8a8w7z0c8kk5uenn9q55swum 159.54.172.190:3737  *
+          tab1t4rwy27j3c6p9a33xx8kfq97e3t2nzxuuajp5j9tekzau3hwuqtszjxy2n 146.235.230.124:3737  *
+      ```
+
+      with a mark beside those this wallet is reached at. To settle:
+      the command's name (`relays`, or `consensus relays`); and, of a
+      long list, whether it is shown whole or a screen at a time (or
+      `relays FILE` writes it to a file).
     - `File`, `Decided at block` and `Relays` only where a file is in
       force; in init mode they are not there, as in the first form.
     - `Votes (73 needed)` says in three words what the two long lines
