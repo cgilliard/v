@@ -816,6 +816,16 @@ these had a test of its own.
   **Change:** the row keeps the height of the block that made the
   output, from when the wallet is first told where it lies.
 - `slates` and `sent`, now that there is `txs`: entry 32.
+- **Seen with a payment to the wallet itself, and right:** a row
+  `sent` and a row `received` of the same block; the output paid and
+  the change both `made by` the row sent; the block's reward larger
+  by the fee. **Small things in it, to settle:**
+  - Two rows for one payment to oneself. Whether it is one row of a
+    kind of its own (`to self`), with the amount and the fee.
+  - A miner's `outputs` always ends in a line `1,500 pending`, with
+    no block and no row: the reward of the block being made, which
+    may never be. Whether it is said as that (`reward of the block
+    being made`), or left out until the block is won.
 - **Seen in the live test, and right:** a node stopped and started
   has the same `txs`; a wallet made again from its words has the
   same balance, its outputs, and a row for each, numbered afresh.
@@ -1281,6 +1291,49 @@ these had a test of its own.
   - To one's own address it goes by the message layer like any
     payment, so the wallet has to be reached; whether a payment to
     oneself is signed at once, with no slate.
+
+### 36. A miner's wallet, at the size it grows to
+
+- **Asked for:** to try the wallet at the size a miner's reaches. One
+  reward a block is 144 rows and outputs a day, some 52,000 a year;
+  the live test's miner had 166 rows and spent 142 outputs at once
+  after two hours.
+- **What is known from the code to grow badly** (none of it
+  measured):
+  - The list of `txs` is never cut, and is written to the wallet's
+    file whole whenever a row changes: at every block, for a miner.
+    At some 100 bytes a row that is megabytes a block after a year.
+  - Every change to the wallet copies all its tables in memory
+    first, and writes whole each table it touched (the outputs among
+    them).
+  - Finding a row goes through the list from its start; bringing the
+    list up to date does that for every record. `outputs` does it
+    for every output, and looks through every transaction signed for
+    each. With tens of thousands of rows these are the square of
+    that.
+  - `txs` and `outputs` print everything: thousands of lines.
+  - Choosing what to spend, and `balance`, go through every output
+    and ask the chain of each.
+  - A look through the chain after a restore, with tens of thousands
+    of outputs to find.
+- **To do:**
+  1. A test that makes a wallet of a year of rewards (some 50,000
+     rows and outputs, spent down in batches as a miner would), and
+     times each thing: a block's reward taken in, `balance`, `send`,
+     `txs`, `outputs`, opening the file, the file's size. Run on CI,
+     with the other tests of size.
+  2. Put right what it shows. Most likely: rows written one at a
+     time, not the table whole; an index from an id to its row; the
+     tables changed in place; `outputs` and `txs` keeping what they
+     look up.
+  3. `txs` and `outputs` show the last screenful unless asked for
+     more (`txs 100`, `txs --all`), as entry 26 has `outputs` list
+     only what is unspent.
+  4. Whether rows of rewards long settled are kept for good, or
+     folded into a count after a time (`4,320 rewards before block
+     …`).
+- **With it:** sending all, and how many signatures at once (entry
+  35), since a miner's wallet is where both are met.
 
 ## Done
 
