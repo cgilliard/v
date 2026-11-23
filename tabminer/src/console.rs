@@ -27,6 +27,10 @@ pub const OFFER_MARKER: &str = "TAB NAME OFFER";
 /// What the prompt says its commands are.
 pub const HELP: &str = "commands:
   status                    the chain's last block, peers, the pool, the wallet's total
+  supply                    what the blocks so far have paid, by the schedule, and what
+                            the unspent outputs come to: the two are the same, or it
+                            says by how much they are not (it reads every output:
+                            slow on a long chain)
   peers                     how many peers are known, and how many are live
   fees                      what a payment is to pay for its weight, to be in a block soon, by
                             the hour, or within the day
@@ -341,6 +345,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             ("quit" | "exit", []) => return Reply::Quit,
             ("help", []) => Ok(HELP.to_string()),
             ("status", []) => self.status(),
+            ("supply", []) => self.supply(),
             ("peers", []) => self.peers(),
             ("mempool", []) => self.mempool(),
             ("fees", []) => self.fees(),
@@ -419,8 +424,9 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 "send" | "status" | "peers" | "mempool" | "fees" | "leaves" | "set-leaf" | "set-leaf-value"
                 | "consensus" | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "slates"
                 | "sent" | "cancel" | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit"
-                | "txs" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
-                | "name-transfer" | "mining" | "payments" | "payment-proof" | "burn-proof" | "verify-proof" | "burn",
+                | "txs" | "supply" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update"
+                | "name-offer" | "name-transfer" | "mining" | "payments" | "payment-proof" | "burn-proof"
+                | "verify-proof" | "burn",
                 _,
             ) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
@@ -461,6 +467,47 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
     fn wallet(&self) -> Result<MutexGuard<'_, Wallet<W>>, String> {
         let wallet = self.wallet.as_ref().ok_or("this node has no wallet (it was started with --no-wallet)")?;
         Ok(wallet.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// What the chain's blocks have paid by the schedule, against what
+    /// the unspent outputs come to, added up one by one: the same, or
+    /// something is wrong, and it says so. (Coins burned are in outputs
+    /// nobody can spend, which are among the unspent: said apart.)
+    fn supply(&self) -> Said {
+        let chain = self.hold.chain();
+        let state = chain.whole().map_err(|e| e.to_string())?;
+        let snap = state.snapshot().map_err(|e| e.to_string())?;
+        let height = snap.tip().0;
+        let expected = chain.params().issued(height);
+        let (mut unspent, mut burned, mut outputs) = (0u128, 0u128, 0u64);
+        let walked = snap.outputs().for_each(snap.pages(), &mut |_, record, live| {
+            if live {
+                outputs += 1;
+                unspent += record.amount as u128;
+                let nobodys = crate::output::key_commitment(&crate::proofs::BURN_KEY_HASH, record.amount);
+                if record.commitment == nobodys {
+                    burned += record.amount as u128;
+                }
+            }
+        });
+        walked.map_err(|e| e.to_string())?;
+        let said = format!(
+            "block {}\nexpected: {}\nunspent:  {} in {} outputs\nburned:   {} of them\ncirculating: {}",
+            commas(height as u64),
+            coins(expected),
+            coins(unspent),
+            commas(outputs),
+            coins(burned),
+            coins(unspent - burned),
+        );
+        match unspent == expected {
+            true => Ok(format!("{said}\nthe supply is as expected")),
+            false => {
+                let (more, by) = (unspent > expected, coins(unspent.abs_diff(expected)));
+                let which = if more { "more" } else { "less" };
+                Err(format!("{said}\nTHE SUPPLY IS WRONG: the unspent outputs come to {by} {which} than was paid"))
+            }
+        }
     }
 
     fn status(&self) -> Said {
@@ -1873,6 +1920,25 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                         "a block has it: a commit cannot be cancelled. Left unrevealed, it is swept later".into()
                     );
                 }
+                // What is to come by another's payment, and is in no
+                // block: no longer expected.
+                (Kind::Received, Stage::Begun) => {
+                    let c = crate::hash::digest_from_bytes(&row.id).ok_or("not an output")?;
+                    let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
+                    let snap = state.snapshot().map_err(|e| e.to_string())?;
+                    wallet.cancel_received(&c, &snap).map_err(|e| match e {
+                        crate::wallet::WalletError::Landed => {
+                            "a block has made it already: it is this wallet's".to_string()
+                        }
+                        e => e.to_string(),
+                    })?;
+                    let done = format!(
+                        "row {}: the payment is no longer expected. Whoever pays can still sign it: \
+                         if they do, `scan` finds it",
+                        row.number
+                    );
+                    return Ok(done);
+                }
                 (Kind::Received | Kind::Reward, _) => {
                     return Err("it is not this wallet's to cancel: it came to it".into());
                 }
@@ -2699,6 +2765,10 @@ mod tests {
             let line = text.lines().find(|l| l.split_whitespace().next() == Some(&n.to_string()));
             line.unwrap_or_else(|| panic!("no row {n}: {text}")).split_whitespace().map(str::to_string).collect()
         };
+        // (What the two blocks paid is what the outputs come to.)
+        let supply = said(&payer, "supply");
+        let as_paid = "block 2\nexpected: 3,000\nunspent:  3,000 in 2 outputs\nburned:   0 of them";
+        assert!(supply.starts_with(as_paid) && supply.ends_with("the supply is as expected"), "{supply}");
         let listed = said(&payer, "txs");
         assert_eq!(row(&listed, 1)[..4], ["1", "reward", "confirmed", "1,500"], "{listed}");
         assert_eq!(row(&listed, 3)[..4], ["3", "sent", "begun", "5"], "{listed}");
@@ -2724,6 +2794,16 @@ mod tests {
             outputs.lines().any(|l| l.contains("pending") && l.split_whitespace().rev().nth(1) == Some("1")),
             "{outputs}"
         );
+        // (A second payment begun to it, answered, and then no longer
+        // wanted: its row says so, and its output is gone.)
+        let file = desk.file("unwanted.slate");
+        said(&payer, &format!("send-file 1 {file}"));
+        said(&paid, &format!("receive {file}"));
+        assert!(said(&paid, "cancel 2").starts_with("row 2: the payment is no longer expected"));
+        assert_eq!(row(&said(&paid, "txs"), 2)[..4], ["2", "received", "cancelled", "1"]);
+        assert_eq!(said(&paid, "outputs").lines().count(), 2);
+        let slate_id = said(&payer, "txs").lines().last().unwrap().split_whitespace().last().unwrap().to_string();
+        assert!(said(&payer, &format!("cancel {slate_id}")).ends_with("given up"));
         let (_, answer) = last_post(&desk, KIND_SLATE);
         assert_ne!(answer, slate);
         // One that came by no node cannot be answered.
@@ -2768,8 +2848,8 @@ mod tests {
         // It keeps its row, which says what became of it; and a row
         // that is done with is not cancelled again.
         let listed = said(&payer, "txs");
-        assert_eq!(row(&listed, 4)[..4], ["4", "sent", "cancelled", "2"], "{listed}");
-        assert_eq!(payer.run("cancel 4"), Reply::Wrong("row 4 is done with already".to_string()));
+        assert_eq!(row(&listed, 5)[..4], ["5", "sent", "cancelled", "2"], "{listed}");
+        assert_eq!(payer.run("cancel 5"), Reply::Wrong("row 5 is done with already".to_string()));
         // Nor is what came to the wallet.
         assert_eq!(payer.run("cancel 1"), Reply::Wrong("it is not this wallet's to cancel: it came to it".to_string()));
         // One begun in a file is finalized from a file.

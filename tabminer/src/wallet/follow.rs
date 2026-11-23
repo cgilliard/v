@@ -282,6 +282,11 @@ mod tests {
         let (a, b) = (balance(&ours, &alice).unwrap(), balance(&ours, &bob).unwrap());
         assert_eq!((a.locked, b.confirmed), (0, 100 * COIN as u128));
         assert!(a.confirmed > 0 && a.confirmed < 1400 * COIN as u128);
+        // (Their lists say the same: sent and in a block, received.)
+        use crate::wallet::list::{Kind, Stage};
+        let rows = |w: &Wallet<MemBackend>| w.list().iter().map(|r| (r.kind, r.stage)).collect::<Vec<_>>();
+        assert_eq!(rows(&alice), [(Kind::Sent, Stage::Confirmed)]);
+        assert_eq!(rows(&bob), [(Kind::Received, Stage::Confirmed)]);
 
         // Their branch is longer, and has no such block: ours is undone.
         give(&ours, &grow(&theirs, 2, 7));
@@ -295,6 +300,8 @@ mod tests {
         let undone = balance(&ours, &alice).unwrap();
         assert_eq!((undone.confirmed, undone.locked, undone.lost), (0, reward as u128, a.confirmed));
         assert_eq!(balance(&ours, &bob).unwrap(), Balance { lost: 100 * COIN as u128, ..Default::default() });
+        assert_eq!(rows(&alice), [(Kind::Sent, Stage::Pooled)]);
+        assert_eq!(rows(&bob), [(Kind::Received, Stage::Orphaned)]);
         // The payment is there to be mined again, at where what it
         // spends is now.
         let again = {
@@ -311,6 +318,8 @@ mod tests {
         let (did_a, did_b) = both(&mut alice, &mut bob);
         assert_eq!((did_a.changed.returned, did_b.changed.returned), (1, 1));
         assert_eq!((balance(&ours, &alice).unwrap(), balance(&ours, &bob).unwrap()), (a, b));
+        assert_eq!(rows(&alice), [(Kind::Sent, Stage::Confirmed)]);
+        assert_eq!(rows(&bob), [(Kind::Received, Stage::Confirmed)]);
         // And bob spends what he was paid, from where it is.
         let state = ours.state();
         let back = bob.send(50 * COIN, None, &state.snapshot().unwrap(), NOW).unwrap();
@@ -321,5 +330,7 @@ mod tests {
         give(&ours, &grow(&theirs, 64, 9));
         assert_eq!(follow(&ours, &mut alice, NOW).unwrap().changed, Reconciled { settled: 1, ..Default::default() });
         assert!(alice.sent().is_empty());
+        // (Done with, its row stays as it was.)
+        assert_eq!(rows(&alice), [(Kind::Sent, Stage::Confirmed)]);
     }
 }

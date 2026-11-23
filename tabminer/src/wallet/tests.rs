@@ -867,3 +867,48 @@ fn payments_are_receipted_and_kept_to_be_proven() {
     assert!(!alice.prove_payment(&txid, height, position, &[1; 20], path).unwrap());
     assert!(alice.payments_to_prove().is_empty());
 }
+
+/// The chain goes over to a branch on which what a payment spends lies
+/// elsewhere. Where an output lies is signed, so the payment spends
+/// nothing there: the wallet's list says it is to be made again, it is
+/// not sent again as it was, and taking it back frees what it was to
+/// spend, from where that now is.
+#[test]
+fn a_payment_whose_input_moved_is_to_be_made_again() {
+    use super::list::{Kind, Stage};
+    let mut chain = Outputs::default();
+    let mut alice = funded(&mut chain, 100 * COIN);
+    let mut bob = new();
+    let mut slate = alice.send(30 * COIN, None, &chain, NOW).unwrap();
+    bob.receive_slate(&mut slate, NOW).unwrap();
+    let signed = alice.finalize(&slate, NOW).unwrap();
+    let stages = |w: &Wallet<MemBackend>| w.list().iter().map(|r| (r.kind, r.stage)).collect::<Vec<_>>();
+    assert_eq!(stages(&alice), [(Kind::Sent, Stage::Pooled)]);
+    assert_eq!(signed.tx.spent_positions(), [0]);
+
+    // The other branch makes her output after another's.
+    let hers = chain.0[0];
+    chain.0 = vec![([7; 32], hers.1, 1, true), hers];
+    alice.locate(1, &[hers.0], 1, &[0; 32], 2).unwrap();
+    assert_eq!(alice.reconcile(&chain, 5, 10, Some(0)).unwrap(), Reconciled::default());
+    // What she has is what the chain has: all of it locked in the
+    // payment, none of it lost.
+    let b = alice.balance(&chain).unwrap();
+    assert_eq!((b.locked, b.lost, b.confirmed), (100 * COIN as u128, 0, 0));
+    assert_eq!(stages(&alice)[0], (Kind::Sent, Stage::Remake));
+    assert!(alice.resend(&signed.tx.txid()).is_err());
+
+    // Taken back: signed for where the output now is, and mined.
+    let back = alice.cancel_sent(&signed.tx.txid(), None, &chain, NOW).unwrap();
+    assert_eq!(back.tx.spent_positions(), [1]);
+    let rows = alice.list().to_vec();
+    assert_eq!((rows[0].stage, rows[0].by), (Stage::Replaced, 2));
+    assert_eq!((rows[1].kind, rows[1].stage, rows[1].of), (Kind::Cancel, Stage::Pooled, 1));
+    chain.take(&back.tx, &mut [&mut alice]);
+    alice.reconcile(&chain, 6, 10, None).unwrap();
+    let b = alice.balance(&chain).unwrap();
+    assert_eq!((b.locked, b.confirmed), (0, (100 * COIN - back.tx.balance() as u64) as u128));
+    assert_eq!(alice.list()[1].stage, Stage::Confirmed);
+    // The list is there, as it was, when the file is opened again.
+    assert_eq!(reopened(&alice, "").unwrap().list(), alice.list());
+}

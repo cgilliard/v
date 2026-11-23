@@ -2182,6 +2182,26 @@ impl<B: Backend> Wallet<B> {
         self.prune_pending_of(chain, keep, true)
     }
 
+    /// Forgets an output this wallet added to another's payment, while
+    /// no block has made it: the wallet no longer expects it. (Whoever
+    /// pays can sign all the same, having the answer; the output is
+    /// then found only by a look through the chain, `scan`.)
+    pub fn cancel_received(&mut self, commitment: &Commitment, chain: &impl Unspent) -> Result<()> {
+        let id = digest_to_bytes(commitment);
+        let o = self.t.outputs.get(&id).copied().ok_or(WalletError::Unknown)?;
+        if !self.t.answered.contains(&id) || o.state != State::Unspent {
+            return Err(WalletError::Unknown);
+        }
+        if self.held(&o, chain)? {
+            return Err(WalletError::Landed);
+        }
+        let mut t = self.t.clone();
+        t.outputs.remove(&id);
+        t.answered.remove(&id);
+        t.notes.remove(&id);
+        self.commit(t, &[T_OUTPUTS, T_ANSWERED, T_NOTES])
+    }
+
     /// [`Wallet::prune_pending`]; with `answered` false, what this
     /// wallet added to others' payments is kept whether a pool has it
     /// or not: whoever pays may sign days later, and nobody asked for

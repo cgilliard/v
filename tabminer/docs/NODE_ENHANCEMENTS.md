@@ -96,145 +96,6 @@ Two entries are in two places:
   for it or dropped.
 - **Done so far:** `seed` answers with the one line, and `help` calls it the recovery phrase. The command's name is as it was.
 
-### 8. The wallet by two commands, `txs` and `outputs`, and one `cancel`
-
-- **Seen:** using the wallet. Cancelling is hard to follow, more so
-  with names. What the wallet has done is shown by stage, each stage a
-  command of its own: `slates` (begun), `sent` (signed, not in a
-  block), `payments` (in a block), `mining` (rewards), `names`
-  (registrations under way). `cancel` is two things by the stage: of a
-  payment begun it frees what was to be spent; of one sent it sends
-  another that pays it back, which wants a fee and then `prune` by
-  hand. A name is registered by two transactions (a commit, and a
-  reveal some blocks later), and which of them is being cancelled is
-  not plain.
-- **Aim:** as the Grin wallet: to use the wallet by `txs` and
-  `outputs`. Names keep the few commands of their own.
-- **Proposal:**
-  1. `txs`: one list of everything the wallet did or was paid:
-     payments sent and received, rewards, burns, each step of a name
-     (commit, reveal, update, transfer), what was cancelled. Each with
-     a short number that does not change (1, 2, 3, …), its kind, its
-     state (begun, pooled, confirmed, cancelled, replaced), amount, fee
-     and height. `txs N` says all of one: what it spent and made, its
-     note, its id in full, whether its proof is ready.
-  2. `outputs`: each output with its state and the number of the
-     transaction that made it, and of the one that spent it.
-     - Both say how many signatures are left to the key an output is
-       under. An address is a key that signs so many times and no
-       more, and the wallet refuses to sign when none is left
-       (`WalletError::Exhausted`): today nothing at the prompt says
-       how many are left, or that they are running out. In `outputs`,
-       beside each output (or each address); in `txs`, what a payment
-       used up.
-  3. `cancel N`: undo this, if it can still be undone. The wallet
-     chooses how by the state: frees the outputs of one begun; replaces
-     one that is pooled (asking the fee); refuses one confirmed, and
-     says why.
-  4. No `prune` by hand: after a replacement the wallet sees which of
-     the two is in a block and puts itself right. The list says
-     "replaced by N".
-  5. `bump N` and `resend N` take the same numbers.
-  6. A command on a name says the number of the transaction it made;
-     `names` shows the number of the last step; `txs` has rows such as
-     "name commit @alice". To cancel a step of a name is to cancel that
-     row.
-  7. The commands there are now become parts of `txs` (`txs pending`,
-     `txs mined`, say), their names kept for a while as other names
-     for those.
-- **Decided:**
-  - `prune` goes: it was confusing. What it did is done by the wallet
-    itself (4 above).
-  - Cancelling a reveal that has been sent: the wallet first warns
-    that the name has been said, that taking the reveal back does not
-    unsay it, and that another may register the name.
-  - A commit that is in a block cannot be cancelled, and `cancel` says
-    so: it can only be left unrevealed, and is swept later. The name
-    is not marked as given up; nothing else changes.
-  - Payments received are listed in `txs`, and one can be given up
-    before the sender has signed, as in Grin.
-  - The numbers are the wallet's own. A wallet made again from its
-    phrase numbers afresh what it finds on the chain.
-- **Decided, of the columns:**
-
-  ```
-  txs
-    #  kind          state          amount   fee      block   id
-    1  reward        confirmed      1,500    -        12      a41c9e02
-    2  sent          confirmed      100      0.00002  11      3a856bc3
-    3  received      confirmed      100      -        11      3a856bc3
-    4  name commit   pooled         -        0.00002  -       77b0c1d4   @alice
-    6  sent          replaced by 7  40       0.00002  -       5d1e88b0
-    7  cancel of 6   pooled         -        0.00004  -       c2a97f13
-
-  outputs
-    id        amount   state      block  position  sigs       made by  spent by
-    8f02ab1c  1,500    confirmed  12     40        0          1        -
-    7a30c9e1  250      confirmed  9      31        0          -        -
-    c09a4412  1,400    pending    -      -         7 *last*   2        -
-  ```
-
-  - Kinds: sent, received, reward, burn, name commit, name reveal,
-    name update, name transfer, cancel of N, bump of N. States: begun,
-    answered, pooled, confirmed, cancelled, replaced by N, orphaned,
-    and to be made again (of a payment whose input lies elsewhere
-    after the chain went over to another branch).
-  - A payment of which this wallet is both sides is two rows, one
-    sent and one received.
-  - `position` is where the output lies among all the chain's outputs
-    (what a signature is of), not its place in a block. Kept.
-  - `sigs`: signatures are counted for each output, not each address:
-    every output has a key of its own that signs eight times. The
-    column says how many have been used, and `*last*` beside it when
-    one is left (room is kept for that, so that the rows stay in
-    line). An output is signed for once as a rule; each cancelling,
-    bumping or making again of a payment that spends it is one more.
-  - `made by` and `spent by` are numbers of `txs`. A dash where the
-    wallet does not know, and never a guess: a wallet made again from
-    its phrase finds its outputs on the chain and not what made them;
-    and after the chain has gone over to another branch an output may
-    be there by a block the wallet has no row for.
-  - `txs N`: all of one. `txs pending`, `txs mined`: parts of the
-    list. The present commands stay for now as other names.
-- **How it is to be built:** a table of numbers beside the tables
-  there are (payments begun, signed, in a block; rewards; steps of
-  names), each number of one record of theirs; the state is worked out
-  from those tables. `cancel N`, `bump N`, `resend N` find the record
-  by its number. What `prune` did is done by the thread that follows
-  the chain, at each block.
-
-### 9. The wallet through a reorganization
-
-- **Asked for:** to look into how the wallet comes through the chain
-  going over to another branch, by tests, and to put right what is
-  found. The list of transactions may be less than perfect after one;
-  the outputs must always be right: what the wallet says it has is
-  what the chain it is now on says it has.
-- **What to look at:**
-  - Outputs made by blocks that were undone: gone, or back at another
-    place if the new branch makes them again. Outputs spent by blocks
-    that were undone: spendable again.
-  - Rewards of blocks this node won that were undone (`mining` shows
-    them as orphaned today).
-  - A payment sent whose input lies elsewhere on the new branch. Where
-    an output lies is signed now, so such a payment cannot be sent
-    again as it was: the wallet says it is to be made again
-    (`resend`). Whether that is said clearly, and whether what it was
-    to spend is free to be spent.
-  - A payment received in a block that was undone, and one that is in
-    both branches at different heights.
-  - Names: a commit or a reveal in a block that was undone, and a
-    reveal whose commit is at another height on the new branch (its
-    age is counted from there).
-  - The balance at each step, against the outputs.
-  - A reorganization deeper than the node can undo, after which the
-    node takes the state whole: the wallet then has to find its
-    outputs again.
-- **Tests there are:** `wallet::tests::what_a_block_undone_took_with_it_is_put_right`,
-  and, with real nodes, `a_payment_survives_the_chain_going_over_to_another_branch`
-  (`tests/binary.rs`). What they cover of the above is the first thing
-  to find out.
-
 ### 10. What `status` says of memory and the store; memory of a fixed size
 
 - **Seen:** `status` on a node that does not mine:
@@ -703,25 +564,6 @@ these had a test of its own.
   (but for the plural), and `reached at: 2 of 2 nodes` in `status`.
 - **Done so far:** one of a thing and several, in the line of a block's transactions. The going over of everything is still to do: as a list of what is said now and what is proposed, to be read through and agreed.
 
-### 24. A `supply` command
-
-- **Asked for:** a command that says what the supply should be at the
-  chain's height, by the emission (the sum of what each block so far
-  pays), and what the outputs that are unspent come to. The two should
-  be the same. It is there to show a fault if there is one.
-- **To settle:**
-  - Coins burned: a burn makes an output nobody can spend, which is
-    among the unspent. Said apart, so that the line reads: expected,
-    unspent, of which burned.
-  - What it costs: to add up every unspent output is to read the
-    whole set, which is millions of outputs on a chain of any age.
-    Either the command is slow and says so as it goes, or the sum is
-    kept with the state and changed with each block (then the command
-    is instant, and adding it all up from the outputs is the check of
-    that, asked for by an option).
-  - What is said when they differ: both numbers and the difference,
-    plainly, as an error.
-
 ## Done
 
 ### 1. The miner builds a template before the pool has dropped what just confirmed
@@ -819,6 +661,53 @@ these had a test of its own.
 - **Why it matters:** a node of the live network that stops catching
   up and says nothing is wrong would be this.
 - **Found, and done:** a fetch of a block that comes to nothing (given up for silence, or as too slow) has its peer passed over for ten minutes, so that another is asked in its place. A node with one peer that can give the block then asked nobody for ten minutes: ten blocks and then none. Now, where nobody else holds the block, a peer that has been passed over for a little while (`sync.header_wait`) is asked again. Tried by `a_node_with_one_peer_asks_it_again_after_a_fetch_fails`, which stands at block 8 of 40 without the change. Why a fetch should fail at all between two nodes of one machine on the Windows runner is not known (datagrams lost on a machine doing much else, most likely); with the change it costs seconds, and the other test of real sockets no longer asks that no fetch fail.
+
+### 8. The wallet by two commands, `txs` and `outputs`, and one `cancel`
+
+- **Done:** the wallet keeps a list of everything it has done and been
+  paid, a row each with a number that stays (`src/wallet/list.rs`):
+  payments sent and received, rewards, burns, the steps of names, and
+  what was taken back or sped up (rows of their own, which say of
+  which row; the row replaced says by which).
+  - `txs`, `txs N` (all of one row: what it spends, with the
+    signatures used of each key, and what it makes), `txs pending`,
+    `txs mined`.
+  - `outputs`: id, amount, state, block, position, sigs (the number
+    used, `*last*` beside it when one is left), made by, spent by (a
+    dash where the wallet does not know: an output found by a scan).
+  - `cancel N`, `bump N`, `resend N` take a row's number (the first
+    digits of an id still work). `cancel` refuses what a block has (a
+    commit: "left unrevealed, it is swept later"), what is done with
+    already and rewards; asks for `yes` before taking back a reveal
+    that was sent; and, of a payment expected that no block has, stops
+    expecting it.
+  - What will not be made is let go at every block; `prune` remains
+    and does the same at once, with what was added to others' payments.
+  - A wallet made again from its words numbers afresh what it finds.
+  - `sent` and `slates` are still there, as they were.
+
+### 9. The wallet through a reorganization
+
+- **Found:** outputs lost and found again at another place, payments
+  undone and mined again, and rewards orphaned were handled already,
+  and tested (`wallets_follow_the_chain_over_to_another_branch`, which
+  now also holds the list's states to it: confirmed, orphaned or
+  pooled, confirmed again).
+- **Added:** a payment whose input lies elsewhere on the new branch
+  says `to be made again` in `txs`; it is not sent again as it was;
+  `cancel N` signs for where the output now is and frees it
+  (`a_payment_whose_input_moved_is_to_be_made_again`).
+- **Not tried yet:** names through a branch change, and a branch
+  change deeper than the node can undo (entry 22's list).
+
+### 24. A `supply` command
+
+- **Done:** `supply` says what the blocks so far have paid by the
+  schedule, what the unspent outputs come to and in how many, how much
+  of that is burned, and whether the two agree; if not, both and the
+  difference, as an error. It reads every output each time it is
+  asked; a sum kept with the state would make it instant, if it is
+  ever wanted on a long chain.
 
 ## Won't fix
 
