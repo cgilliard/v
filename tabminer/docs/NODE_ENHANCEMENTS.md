@@ -998,48 +998,67 @@ these had a test of its own.
     trip to that seed and back.
   - The peers answered pings and other requests throughout. The two
     local nodes were not asked for block 46.
-- **What that fits:** a fetch that waits in silence asks again for
-  what it waits for, one chunk, then two, four, … up to 64, waiting
-  twice as long each time (`transport/fetch.rs`). With the 150 ms
-  that seed's trip takes, eight such waits are 38 s, and the eighth
-  asks for 64 chunks. So: the last chunks of block 46 were asked for
-  again seven times, and nothing came, until the eighth.
-- **Not known:** why seven askings brought nothing. Either they did
-  not go out, or did not arrive, or the seed did not answer, or its
-  answers were lost. What would say which is the seed's own request
-  log for those 40 seconds (every `get block` from 74.244.51.185
-  and what was done with it). It has not been read: to be fetched
-  from the seed.
-  - If the seed refused them (it refuses, saying nothing, what is
-    over its bounds for one host: 32 requests, 4,096 chunks, counted
-    over every port of an address; the three nodes here are one
-    address to it), the log says `-> refused`.
-  - If the seed has no line of them, they were lost on the way or
-    never sent. The node here does not log what it asks: see below.
-- **Whatever the cause, three things are wrong on this side:**
-  1. One block's last chunks held up 28 blocks for 38 s while two
-     other peers that had the block stood idle. A fetch that is
-     silent is given eight doublings before anything else is tried;
-     the check for a fetch that is too slow goes by its rate over
-     its whole age, which a fetch that came fast and then stopped
-     passes for a long time. **Change:** a block (or run of headers)
-     that has had nothing for a few seconds, while another peer that
+- **The cause, from the seed's own log** (`tmp/riscvlogs`): the seed
+  refused nothing and lost nothing. For the whole 38 s the node here
+  asked it for block 46 **one chunk at a time, one request every 0.6
+  s**: 62 requests of `get block, 1 chunks`, each answered. The last
+  62 chunks of the block came at under two a second.
+- **Why one at a time** (`transport/fetch.rs`, `path.rs`):
+  1. The end of the block was lost on the way in, in the rush of 24
+     blocks at once: some 62 chunks, with nothing asked after them.
+  2. A chunk awaited is known to be lost in two ways: when enough
+     chunks asked after it have arrived (`reorder` places, 8 on a
+     path that keeps order), or, with fewer, when nothing more has
+     arrived for a while (`grace`). After that everything overtaken
+     is asked again at once. With nothing asked after the lost end,
+     there is only silence: after the retry time (0.6 s here) the
+     one chunk awaited longest is asked for again, as a probe.
+  3. The probe comes back. That should show the rest as overtaken
+     and bring them all back in one go. But this path had been seen
+     to deliver out of order in the rush, and the places allowed had
+     been raised (up to 512); the `grace` is raised by as much, to
+     seconds: longer than the retry time. And it is counted from the
+     last arrival, which each probe's answer moves on.
+  4. So the silence always comes first: one more chunk is probed,
+     its answer puts the grace off again, and the count of silences
+     starts over with every arrival, so the probe never grows past
+     one chunk. One chunk each retry time, to the end of the block.
+- **This is entry 4 too.** The seed that takes blocks from the local
+  miner `1 chunks` at a time, one request every two seconds, is the
+  same thing on a path with a longer retry time. One cause, one fix.
+- **Change (not made yet):**
+  1. After a silence, everything still awaited is taken for lost,
+     not the probed chunk alone: when the probe is answered, the
+     rest is asked for again as the window allows, at once.
+  2. The `grace` never longer than the retry time, and counted from
+     when a chunk was first overtaken, not from the last arrival.
+  3. A test of exactly this: the last 60 chunks of an object lost on
+     a path whose places allowed are raised; the fetch is to end in
+     a few round trips, not sixty retry times.
+- **And on the node's side, whatever a peer does:**
+  1. One block's end held up 28 blocks for 38 s while two other
+     peers that had the block stood idle. The check for a fetch that
+     is too slow goes by its rate over its whole age, which a fetch
+     that came fast and then crawled passes for a long time.
+     **Change:** a block (or run of headers) the chain waits on that
+     has gained little for a few seconds, while another peer that
      holds it is free, is asked of that peer as well; whichever
-     comes first is taken. What has come of it so far is kept.
+     comes first is taken.
   2. Nothing says it happened. The main log has no line for a fetch
      given up, too slow or silent; the statistics do not show the
-     counts the node keeps of them (`fetches_failed`,
-     `fetches_slow`, silences). **Change:** the counts in the
+     counts the node keeps of them. **Change:** the counts in the
      statistics' lines, and a line in the main log when the chain
      waits on one block for more than a few seconds: which block,
      asked of whom, how much of it is here.
   3. The request log says what is asked of this node, not what it
-     asks of others. **Change:** to settle whether its own requests
-     for blocks are logged too (one line a fetch, not one a
-     request).
-- **To do first:** the seed's log, then the cause; then the changes
-  above, with a test of a peer that stops answering one fetch near
-  its end while it answers everything else.
+     asks of others: this could not be found without the seed's log.
+     **To settle:** whether its own fetches are logged too (a line a
+     fetch, not a line a request).
+- **Seen beside it:** a node catching up tells its peers of every old
+  block as it joins it to its chain (`block height 4 … -> unheard`,
+  seventy of them to each peer in five seconds). Nobody wants them:
+  a node that is catching up is to announce nothing below where its
+  peers already are. (For entry 13.)
 
 ## Done
 
