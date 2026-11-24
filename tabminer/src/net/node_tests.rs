@@ -2591,6 +2591,144 @@ fn wallets_by_ways(loss: u64) {
     assert_eq!(posted, [(nobody, crate::msg::KIND_SLATE, [9; 32], Posted::Offline)]);
 }
 
+/// One consensus file gives way to the next at a block, and each node
+/// goes over when it has that block: not all at the same moment. So
+/// for a few blocks a wallet is reached by the relays of both, and
+/// whoever sends goes by the old ones for the first two blocks and the
+/// new ones after. A message crosses whichever of the two nodes has
+/// gone over, and at every block of the change; and when the change is
+/// over the wallet is reached by the new relays alone.
+#[test]
+fn a_wallet_is_reached_by_both_files_while_one_gives_way_to_the_next() {
+    let chains: Vec<_> = (0..8).map(|_| chain_of(easy())).collect();
+    let made = grow(&chains[0], 10, 1);
+    chains[1..].iter().for_each(|chain| give(chain, &made));
+    let mut w = World::with(chains.clone(), &Config { relay: true, ..Config::default() });
+    // Two wallets that are no relays; three relays of one file, and
+    // three others of the next.
+    let ids: Vec<(Digest, SocketAddrV4)> = (0..8).map(|i| relay_of(&w, i)).collect();
+    let file = |of: &[(Digest, SocketAddrV4)]| crate::consensus::File {
+        mode: crate::consensus::Mode::Onion,
+        relays: of.iter().map(|(id, at)| crate::consensus::Relay { id: *id, addr: at.to_string() }).collect(),
+    };
+    let (old, new) = (file(&ids[2..5]), file(&ids[5..8]));
+    let hold: Vec<_> = w.nodes.iter().map(|n| n.hold()).collect();
+    hold.iter().for_each(|h| h.force_consensus(&old));
+    let reached = |w: &mut World, who: usize, at: usize, what: &str| {
+        let began = w.now;
+        while hold[who].sessions().1 != at {
+            assert!(w.now - began < 240 * SECOND, "{what}: {:?}", hold[who].sessions());
+            w.run(50 * MILLI);
+        }
+    };
+    let mut nth = 0u8;
+    let mut crosses = |w: &mut World, what: &str| {
+        nth += 1;
+        let began = w.now;
+        hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [nth; 32], vec![nth]);
+        w.woken();
+        let mut came = Vec::new();
+        while came.is_empty() {
+            assert!(w.now - began < 240 * SECOND, "{what}: nothing comes");
+            w.run(20 * MILLI);
+            came = hold[1].take_messages();
+        }
+        assert_eq!(came[0].body, [nth], "{what}");
+    };
+    reached(&mut w, 0, 3, "the first is not reached");
+    reached(&mut w, 1, 3, "the second is not reached");
+    crosses(&mut w, "before any change");
+    // The wallet that is to be paid has the block that decides (the
+    // tenth, say), and the one that pays has not: reached by the
+    // relays of both files, it is found where the old file says.
+    hold[1].change_consensus(&new, 10);
+    reached(&mut w, 1, 6, "not reached by the relays of both");
+    crosses(&mut w, "the one that is paid has gone over");
+    // Both have it: whoever sends still goes by the old relays.
+    hold[0].change_consensus(&new, 10);
+    crosses(&mut w, "both have gone over, at the block that decided");
+    // Two blocks on: by the new ones, where the wallet is too.
+    let more = grow(&chains[0], 2, 2);
+    chains[1..].iter().for_each(|chain| give(chain, &more));
+    crosses(&mut w, "two blocks on");
+    assert_eq!(hold[1].sessions().1, 6);
+    // And the other way about: the one that pays is two blocks on, and
+    // the one that is paid has only now the block that decided.
+    // (Here: gone over as of the twelfth.)
+    hold[1].force_consensus(&old);
+    hold[1].change_consensus(&new, 12);
+    crosses(&mut w, "the one that is paid goes over later");
+    // The change over: the old relays are let go of, and the wallet
+    // is where the new file says, and nowhere else.
+    let more = grow(&chains[0], 6, 3);
+    chains[1..].iter().for_each(|chain| give(chain, &more));
+    reached(&mut w, 1, 3, "still reached by the old relays");
+    crosses(&mut w, "after the change");
+}
+
+/// The first file to come into force: until it does, wallets are
+/// reached at the seeds, with no ways; after, by ways to its relays,
+/// which may be those same seeds. In the blocks of the change a wallet
+/// that has gone over is reached both ways, and one that has not finds
+/// it at a seed as before: a relay passes on what comes for a wallet
+/// whichever way it came, and whichever way the wallet is held.
+#[test]
+fn a_wallet_is_reached_at_the_seeds_while_the_first_file_comes_into_force() {
+    let chains: Vec<_> = (0..7).map(|_| chain_of(easy())).collect();
+    let made = grow(&chains[0], 10, 1);
+    chains[1..].iter().for_each(|chain| give(chain, &made));
+    let mut w = World::with(chains.clone(), &Config { relay: true, ..Config::default() });
+    let ids: Vec<(Digest, SocketAddrV4)> = (0..7).map(|i| relay_of(&w, i)).collect();
+    // Two seeds; and a file of three relays, one of which is a seed.
+    for i in 0..7 {
+        (2..4).filter(|seed| *seed != i).for_each(|seed| {
+            w.nodes[i].add_seed(at(seed), 0);
+        });
+    }
+    let relays = ids[3..6].iter().map(|(id, at)| crate::consensus::Relay { id: *id, addr: at.to_string() });
+    let file = crate::consensus::File { mode: crate::consensus::Mode::Onion, relays: relays.collect() };
+    let hold: Vec<_> = w.nodes.iter().map(|n| n.hold()).collect();
+    let reached = |w: &mut World, who: usize, at: usize, what: &str| {
+        let began = w.now;
+        while hold[who].sessions().1 != at {
+            assert!(w.now - began < 240 * SECOND, "{what}: {:?}", hold[who].sessions());
+            w.run(50 * MILLI);
+        }
+    };
+    let mut nth = 0u8;
+    let mut crosses = |w: &mut World, what: &str| {
+        nth += 1;
+        let began = w.now;
+        hold[0].post(ids[1].0, crate::msg::KIND_SLATE, [nth; 32], vec![nth]);
+        w.woken();
+        let mut came = Vec::new();
+        while came.is_empty() {
+            assert!(w.now - began < 240 * SECOND, "{what}: nothing comes");
+            w.run(20 * MILLI);
+            came = hold[1].take_messages();
+        }
+        assert_eq!(came[0].body, [nth], "{what}");
+    };
+    reached(&mut w, 0, 2, "the first is not reached at the seeds");
+    reached(&mut w, 1, 2, "the second is not reached at the seeds");
+    crosses(&mut w, "before any file");
+    // The wallet to be paid goes over: by ways to the three relays,
+    // and still at the seed that is no relay.
+    hold[1].change_consensus(&file, 10);
+    reached(&mut w, 1, 4, "not reached by the relays and the seed");
+    crosses(&mut w, "the one that is paid has gone over");
+    hold[0].change_consensus(&file, 10);
+    crosses(&mut w, "both have gone over, at the block that decided");
+    let more = grow(&chains[0], 2, 2);
+    chains[1..].iter().for_each(|chain| give(chain, &more));
+    crosses(&mut w, "two blocks on");
+    // The change over: by the relays alone.
+    let more = grow(&chains[0], 6, 3);
+    chains[1..].iter().for_each(|chain| give(chain, &more));
+    reached(&mut w, 1, 3, "still reached at the seeds");
+    crosses(&mut w, "after the change");
+}
+
 #[test]
 fn wallets_are_reached_and_send_by_ways_through_relays() {
     wallets_by_ways(0);

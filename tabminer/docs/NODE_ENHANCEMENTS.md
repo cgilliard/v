@@ -563,8 +563,25 @@ should weigh more in the fee (19).
     mode (`reached at: 3 of 3 nodes`), and a payment sent at block
     144 was answered, signed and pooled at once. So with blocks
     arriving as they should, the change of file works as it is.
-  - Done with the rest of this entry, since both are of nodes
-    agreeing on the file about a boundary.
+  - **Done:** while a change lasts a wallet is reached by the nodes
+    of both files: by ways to the relays of whichever names relays,
+    and at the seeds for whichever names none (a node that is both
+    is reached by a way; a relay passes on what comes for a wallet
+    whichever way it came). From the block that decided, `B`, until
+    `B + grace - 2`; six blocks unless `--consensus-grace` says
+    otherwise (three at the least). Whoever sends goes by the old
+    nodes until `B + 2` and by the new ones from there. A relay of
+    the file before is still taken for one while the change lasts.
+    Tried from one file to another, and from no file to the first
+    with a seed that is also a relay
+    (`a_wallet_is_reached_by_both_files_while_one_gives_way_to_the_next`,
+    `a_wallet_is_reached_at_the_seeds_while_the_first_file_comes_into_force`).
+  - Not covered: a node started in the blocks of a change knows only
+    the file in force (it was not running when the other was); and
+    whoever sends does not try the other file's nodes when the first
+    do not answer.
+  - The rest of this entry (a file kept back from some nodes) is as
+    it was.
 
 ### 19. How long a block takes to prove, and more with a transaction in it
 

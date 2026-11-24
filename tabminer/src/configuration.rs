@@ -154,6 +154,11 @@ const OPTIONS: &[(&str, &[Opt])] = &[
                 help: "stand between wallets on the message layer: hold sessions\nfor those that are reached here, and pass on what is sealed\nto them. A node not told to does neither",
             },
             Opt {
+                name: "consensus-grace",
+                takes: Takes::Value("N"),
+                help: "blocks, from the one at which another consensus file comes\ninto force, for which the wallet goes on being reached by\nthe nodes of the file before as well (default 6; 3 at the\nleast)",
+            },
+            Opt {
                 name: "max-sessions",
                 takes: Takes::Value("N"),
                 help: "with --relay: wallets a session is held for at the most\n(default 10000)",
@@ -861,6 +866,9 @@ impl Configuration {
         })
         .with_max_tx_size(given.size("max-tx-size", 1)?.map_or(was.max_tx_size, |bytes| bytes as usize));
         net.relay = given.flag("relay");
+        // (Never fewer than whoever sends takes to go over, and one.)
+        let least = u64::from(crate::consensus::SWITCH) + 1;
+        net.grace = given.number("consensus-grace", least)?.map_or(net.grace, |n| n.min(u32::MAX as u64) as u32);
         net.sessions.most = count("max-sessions", 1)?.unwrap_or(net.sessions.most);
         if given.one("max-sessions").is_some() && !net.relay {
             return Err(Refused::Wrong("--max-sessions needs --relay".into()));
@@ -1051,6 +1059,7 @@ impl Configuration {
                     "no".to_string()
                 },
             ),
+            ("Consensus Grace", format!("{} blocks", commas(self.net.grace as u64))),
             ("Data Directory", self.data_dir.display().to_string()),
             ("Main Log", self.main_log.display().to_string()),
             ("Request Log", self.request_log.display().to_string()),

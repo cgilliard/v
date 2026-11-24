@@ -47,6 +47,13 @@ pub struct Config {
     /// How often a wallet says, to a node it is reached at, that it is
     /// there.
     pub keepalive: Micros,
+    /// For how many blocks from the one at which another consensus
+    /// file comes into force a wallet goes on being reached by the
+    /// nodes of the one before as well
+    /// ([`crate::consensus::GRACE`], unless said: never fewer than
+    /// whoever sends takes to go over to the new ones,
+    /// [`crate::consensus::SWITCH`], and one more).
+    pub grace: u32,
     pub peers: Peers,
     pub sync: Sync,
     pub serve: Serve,
@@ -251,6 +258,7 @@ impl Default for Config {
             sessions: super::sessions::Limits::default(),
             circuits: super::circuits::Limits::default(),
             keepalive: 30 * SECOND,
+            grace: crate::consensus::GRACE,
             peers: Peers::default(),
             sync: Sync::default(),
             serve: Serve::default(),

@@ -781,6 +781,11 @@ pub(crate) struct Shared {
     /// mode is init. Wallets are then reached at the end of ways
     /// through them, and no longer at the seeds.
     relays: Mutex<Arc<Relays>>,
+    /// The relays of the file that was in force before this one (none,
+    /// of a time of no file), and the height of the block at which
+    /// this one came into force: while the change lasts
+    /// ([`Worker::changing`]).
+    relays_before: Mutex<Option<(Arc<Relays>, u32)>>,
     /// Relays that did not answer the opening of a way, and when: ways
     /// go by others for a while.
     suspect: Mutex<Vec<(SocketAddrV4, Micros)>>,
@@ -1521,23 +1526,61 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// comes to it first says so: what is due is due once.)
     fn keep_sessions(&mut self, now: Micros, out: Out<'_>) {
         let relays = self.relays();
-        if !relays.is_empty() {
-            return self.keep_sessions_by_ways(now, &relays);
-        }
-        // (No way is kept of a time when wallets were reached by them.)
-        let mut ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
-        ways.give_up(|w| w.purpose != super::circuits::Purpose::Asked);
-        drop(ways);
+        // While a change of consensus file lasts, the wallet is
+        // reached by the nodes of both files: by ways to the relays of
+        // whichever names relays, and at the seeds for whichever names
+        // none. (A node that is both is reached by a way: it passes on
+        // what comes for the wallet whichever way that came.)
+        let before = self.changing().map(|c| c.0);
+        let named: Vec<Arc<Relays>> =
+            [Some(Arc::clone(&relays)), before.clone()].into_iter().flatten().filter(|list| !list.is_empty()).collect();
+        let seeds_too = relays.is_empty() || before.as_ref().is_some_and(|list| list.is_empty());
         let seeds: Vec<SocketAddrV4> =
             self.shared.seeds.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
         let height = self.chain.tip().map_or(0, |tip| tip.height);
+        let ids: Vec<Digest> = {
+            let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(own) = wallet.as_ref() else { return };
+            [own.id()].into_iter().chain(own.aliases().into_iter().map(|alias| alias.0)).collect()
+        };
+        // Where each of them has the wallet: the relays' addresses,
+        // and the seeds that are none of those.
+        let mut by_ways: Vec<SocketAddrV4> = Vec::new();
+        for list in &named {
+            for id in &ids {
+                for epoch in crate::msg::reached_epochs(height) {
+                    by_ways.extend(Self::points_among(id, epoch, list).into_iter().map(|point| point.1));
+                }
+            }
+        }
+        let at_seeds: Vec<SocketAddrV4> = match seeds_too {
+            true => ids
+                .iter()
+                .flat_map(|id| crate::msg::reached_points(id, height, seeds.len()))
+                .map(|i| seeds[i])
+                .filter(|seed| !by_ways.contains(seed))
+                .collect(),
+            false => Vec::new(),
+        };
+        if !named.is_empty() {
+            self.keep_sessions_by_ways(now, &named, &at_seeds);
+        }
+        if !seeds_too {
+            return;
+        }
+        // (No way is kept of a time when wallets were reached by them.)
+        if named.is_empty() {
+            let mut ways = self.shared.ways.lock().unwrap_or_else(|e| e.into_inner());
+            ways.give_up(|w| w.purpose != super::circuits::Purpose::Asked);
+        }
         let mut wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
         let Some(own) = wallet.as_mut() else { return };
         // (The nodes the wallet is reached at: by its id, and by the id
         // of each full name it is. At every one of them it says it is
         // there; at those of a name, that it is that name too.)
         let at = |id: &Digest| -> Vec<SocketAddrV4> {
-            crate::msg::reached_points(id, height, seeds.len()).into_iter().map(|i| seeds[i]).collect()
+            let points = crate::msg::reached_points(id, height, seeds.len()).into_iter().map(|i| seeds[i]);
+            points.filter(|seed| !by_ways.contains(seed)).collect()
         };
         let mut points = at(&own.id());
         let names: Vec<(Digest, u64, Vec<SocketAddrV4>)> =
@@ -1547,7 +1590,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 points.push(*node);
             }
         }
-        own.keep(&points);
+        // (Kept at those, and at the relays it is reached at by ways.)
+        let kept: Vec<SocketAddrV4> = points.iter().chain(&by_ways).copied().collect();
+        own.keep(&kept);
         let mut chance = [0u8; 64];
         if crate::random::fill(&mut chance).is_ok() {
             own.rotate(&chance, now);
@@ -1708,7 +1753,11 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 let wallet = self.shared.participant.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(own) = wallet.as_ref() else { return };
                 let chance: &[u8; 32] = chance[..32].try_into().expect("32 bytes");
-                let listed = self.relays().iter().any(|r| r.1 == Some(from));
+                // (Of the file in force, or of the one before while
+                // the change lasts.)
+                let before = self.changing().map(|c| c.0);
+                let listed =
+                    self.relays().iter().chain(before.iter().flat_map(|b| b.iter())).any(|r| r.1 == Some(from));
                 relayed.open(own.identity(), from, circuit, bytes, chance, listed, now)
             }
             FORWARD => match relayed.forward(from, circuit, count, bytes.to_vec(), fresh, now) {
@@ -1801,6 +1850,42 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         Arc::clone(&self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// While a change of consensus file lasts: the relays of the file
+    /// before (none, if there was no file), and whether whoever sends
+    /// still goes by those.
+    ///
+    /// A file comes into force at a block `B`, and each node goes over
+    /// to it when it has that block, which is not the same moment for
+    /// all. So for a few blocks a wallet is reached by the nodes of
+    /// both files (from `B` until `B + grace - 2`), and whoever sends
+    /// goes by the old ones until `B +` [`crate::consensus::SWITCH`]
+    /// and by the new ones after: whichever of two nodes is a block or
+    /// two ahead, the one looks where the other is.
+    fn changing(&self) -> Option<(Arc<Relays>, bool)> {
+        use crate::consensus::SWITCH;
+        let mut before = self.shared.relays_before.lock().unwrap_or_else(|e| e.into_inner());
+        let (was, at) = before.clone()?;
+        let height = self.chain.tip().map_or(0, |tip| tip.height);
+        let grace = self.cfg.grace.max(SWITCH + 1);
+        // (Over; or the chain has gone back under the block that
+        // decided it, and what is in force is decided afresh.)
+        if height + 2 > at + grace || height < at {
+            *before = None;
+            return None;
+        }
+        Some((was, height < at + SWITCH))
+    }
+
+    /// The relays whoever sends goes by: those in force, or, in the
+    /// first blocks of a change, those of the file before
+    /// ([`Worker::changing`]).
+    fn relays_to_send_by(&self) -> Arc<Relays> {
+        match self.changing() {
+            Some((before, true)) => before,
+            _ => self.relays(),
+        }
+    }
+
     /// Which of `relays` the wallet of id `id` is reached at in the
     /// epoch `epoch`: those of them that are known where they are.
     fn points_among(id: &Digest, epoch: u32, relays: &Relays) -> Vec<(Digest, SocketAddrV4)> {
@@ -1854,8 +1939,21 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// if there is none, said along as often as is due, and opened
     /// again if nothing comes back along it. (Whichever worker comes
     /// to it: what the ways are is the node's.)
-    fn keep_sessions_by_ways(&mut self, now: Micros, relays: &Relays) {
+    ///
+    /// `lists` are the relays of the file in force and, while a change
+    /// lasts, of the one before, whichever of them names any; `also`
+    /// the seeds the wallet is reached at besides, as before relays
+    /// were in force, which are kept by whoever keeps those.
+    fn keep_sessions_by_ways(&mut self, now: Micros, lists: &[Arc<Relays>], also: &[SocketAddrV4]) {
         use super::circuits::{HERE, Purpose, STILL};
+        // (Ways go through the relays of either.)
+        let mut all: Relays = Vec::new();
+        for relay in lists.iter().flat_map(|list| list.iter()) {
+            if !all.iter().any(|r| r.0 == relay.0) {
+                all.push(*relay);
+            }
+        }
+        let relays = &all;
         let shared = Arc::clone(&self.shared);
         let height = self.chain.tip().map_or(0, |tip| tip.height);
         let mut wallet = shared.participant.lock().unwrap_or_else(|e| e.into_inner());
@@ -1872,7 +1970,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         for (nth, of) in ids.enumerate() {
             let mut its = Vec::new();
             for epoch in crate::msg::reached_epochs(height) {
-                for point in Self::points_among(&of, epoch, relays) {
+                for point in lists.iter().flat_map(|list| Self::points_among(&of, epoch, list)) {
                     its.push(point.1);
                     if !points.contains(&point) {
                         points.push(point);
@@ -1884,7 +1982,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             }
         }
         let at: Vec<SocketAddrV4> = points.iter().map(|p| p.1).collect();
-        own.keep(&at);
+        let kept: Vec<SocketAddrV4> = at.iter().chain(also).copied().collect();
+        own.keep(&kept);
         let mut chance = [0u8; 64];
         if crate::random::fill(&mut chance).is_ok() {
             own.rotate(&chance, now);
@@ -2383,7 +2482,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
 
     /// The nodes the wallet of id `id` is reached at now.
     fn points_of(&self, id: &Digest) -> Vec<SocketAddrV4> {
-        let relays = self.relays();
+        let relays = self.relays_to_send_by();
         if !relays.is_empty() {
             let epoch = self.chain.tip().map_or(0, |tip| tip.height / crate::consensus::EPOCH);
             return Self::points_among(id, epoch, &relays).into_iter().map(|p| p.1).collect();
@@ -2401,7 +2500,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// node if it is not known.
     fn send_posts(&mut self, now: Micros, out: Out<'_>) {
         use super::sessions::POST_RETRY;
-        let relays = self.relays();
+        let relays = self.relays_to_send_by();
         if !relays.is_empty() {
             return self.send_posts_by_ways(now, &relays);
         }
@@ -2670,6 +2769,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             let now_is = (current.mode, current.winner.map(|w| w.0));
             let mut said = self.shared.consensus.lock().unwrap_or_else(|e| e.into_inner());
             if *said != Some(now_is) {
+                let changed = said.is_some();
                 // (Not of a node that has only just started, in init mode
                 // like every other: that is no news.)
                 if said.is_some() || now_is != (crate::consensus::Mode::Init, None) {
@@ -2678,7 +2778,19 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                 *said = Some(now_is);
                 if !self.shared.forced.load(Ordering::Relaxed) {
                     let relays = Arc::new(relays_of(current.file.as_ref()));
-                    *self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()) = relays;
+                    let before = std::mem::replace(
+                        &mut *self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()),
+                        Arc::clone(&relays),
+                    );
+                    // Another file than the one this node was going by
+                    // (not what a node finds in force when it starts):
+                    // the nodes of the one before go on being used for
+                    // a few blocks, since not every node has the block
+                    // that decided it at the same moment.
+                    if changed && *before != *relays {
+                        let at = crate::consensus::boundary(self.chain.tip().map_or(0, |tip| tip.height));
+                        *self.shared.relays_before.lock().unwrap_or_else(|e| e.into_inner()) = Some((before, at));
+                    }
                 }
             }
             drop(said);
@@ -5361,6 +5473,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             relayed: Mutex::new(super::circuits::Relayed::new(cfg.circuits)),
             ways: Mutex::default(),
             relays: Mutex::default(),
+            relays_before: Mutex::default(),
             suspect: Mutex::default(),
             delivering: Mutex::default(),
             givers: Mutex::default(),
@@ -5845,6 +5958,18 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     pub fn force_consensus(&self, file: &crate::consensus::File) {
         self.shared.forced.store(true, Ordering::Relaxed);
         *self.shared.relays.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(relays_of(Some(file)));
+    }
+
+    /// Puts `file` in force here in the place of the one that is, as
+    /// decided at the block of height `at`: as a node does when the
+    /// chain's votes decide another, for the tests of the blocks in
+    /// which one file gives way to the next.
+    #[cfg(test)]
+    pub(crate) fn change_consensus(&self, file: &crate::consensus::File, at: u32) {
+        self.shared.forced.store(true, Ordering::Relaxed);
+        let now = Arc::new(relays_of(Some(file)));
+        let before = std::mem::replace(&mut *self.shared.relays.lock().unwrap(), now);
+        *self.shared.relays_before.lock().unwrap() = Some((before, at));
     }
 
     /// Says what a name says, in the chain's place.
