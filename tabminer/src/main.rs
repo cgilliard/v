@@ -407,12 +407,36 @@ fn make_block(
         if let Some((height, parent)) = &on {
             let took = short_seconds(took.as_millis() as u64);
             // (And where the time went, part by part.)
-            let parts: Vec<String> = tabminer::prover::parts_timed()
-                .iter()
-                .map(|(name, took)| format!("{name} {}", short_seconds(took.as_millis() as u64)))
-                .collect();
+            let timed = tabminer::prover::parts_timed();
+            let parts: Vec<String> =
+                timed.iter().map(|p| format!("{} {}", p.name, short_seconds(p.took.as_millis() as u64))).collect();
             let parts = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
             main.log(&format!("Mining block {height} on {parent}: proved in {took}{parts}"));
+            // (And what it held, part by part: the most proving held
+            // while each was made, and what is held whatever is made.)
+            let megabytes = |bytes: usize| format!("{} MB", commas(bytes as u64 / 1_000_000));
+            let most: Vec<String> = timed.iter().map(|p| format!("{} {}", p.name, megabytes(p.most))).collect();
+            if !most.is_empty() {
+                use tabminer::heap::{Part, held};
+                let beside = match timed.iter().any(|p| p.beside) {
+                    true => "; a block given up was still being proven beside it, and is counted in these",
+                    false => "",
+                };
+                main.log(&format!(
+                    "Mining block {height} on {parent}: the most memory proving held: {}{beside}; held besides: {} {}, {} {}, {} {}, {} {}, {} {}",
+                    most.join(", "),
+                    Part::Setup.name(),
+                    megabytes(held(Part::Setup)),
+                    Part::Table.name(),
+                    megabytes(held(Part::Table)),
+                    Part::Pool.name(),
+                    megabytes(held(Part::Pool)),
+                    Part::Wallet.name(),
+                    megabytes(held(Part::Wallet)),
+                    Part::Node.name(),
+                    megabytes(held(Part::Node)),
+                ));
+            }
         }
     };
     // What the block carries of the pool: none, if it cannot be
@@ -1018,6 +1042,8 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
     if let Some(wallet) = &wallet {
         let (hold, wallet, main) = (hold.clone(), Arc::clone(wallet), Arc::clone(&main));
         let following = move || {
+            // (What this thread keeps is the wallet's.)
+            let _in = tabminer::heap::enter(tabminer::heap::Part::Wallet);
             let began = Instant::now();
             let mut failed = false;
             let mut refused: Vec<tabminer::hash::Digest> = Vec::new();
@@ -1161,7 +1187,16 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
         let (wallet, unix, names) = (wallet.clone(), socket::unix, Arc::clone(&names));
         let console = Console { hold: hold.clone(), wallet, unix, log, debug, max_names: c.max_names, names };
         let main = Arc::clone(&main);
-        std::thread::Builder::new().name("prompt".into()).spawn(move || prompt(&console, &main)).map_err(threads)?;
+        std::thread::Builder::new()
+            .name("prompt".into())
+            .spawn(move || {
+                // (What is kept of what is asked at the prompt is the
+                // wallet's, near enough: the pool's is said to be the
+                // pool's where it is put there.)
+                let _in = tabminer::heap::enter(tabminer::heap::Part::Wallet);
+                prompt(&console, &main)
+            })
+            .map_err(threads)?;
     }
 
     // What comes for the wallet over the message layer is taken as it

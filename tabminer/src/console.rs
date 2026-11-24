@@ -647,6 +647,16 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             out.push_str(&format!("\nsessions: {} wallets are reached here", commas(sessions as u64)));
         }
         out.push_str(&format!("\nmemory: {} MB", commas(crate::heap::now() as u64 / 1_000_000)));
+        // (And the parts of it that are a megabyte or more.)
+        let parts: Vec<String> = crate::heap::Part::ALL
+            .iter()
+            .map(|part| (part.name(), crate::heap::held(*part) as u64 / 1_000_000))
+            .filter(|(_, held)| *held > 0)
+            .map(|(name, held)| format!("{name} {}", commas(held)))
+            .collect();
+        if parts.len() > 1 {
+            out.push_str(&format!(" ({})", parts.join(", ")));
+        }
         // (Of the store's file, what is in use and how long it is: the
         // rest is space inside it, taken again before the file grows.)
         if let Ok(state) = self.hold.chain().whole() {

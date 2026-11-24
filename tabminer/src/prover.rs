@@ -91,25 +91,81 @@ pub struct Level {
 /// How long each part of proving took, since this was last asked:
 /// the parts of a block's proof, in the order they were made. For
 /// whoever says how long a block took, to say where the time went.
-static PARTS: std::sync::Mutex<Vec<(&'static str, Duration)>> = std::sync::Mutex::new(Vec::new());
+static PARTS: std::sync::Mutex<Vec<Timed>> = std::sync::Mutex::new(Vec::new());
+
+/// How many blocks are being proven now: more than one where a block
+/// given up has not yet let go beside the one begun after it.
+static PROVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The most memory proving has held in any part of it ([`most_held`]).
+static MOST_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The most memory proving has held, in bytes, in any part of it that
+/// has ended, since the program began.
+pub fn most_held() -> usize {
+    MOST_HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A part of proving, as it went.
+#[derive(Clone, Copy, Debug)]
+pub struct Timed {
+    pub name: &'static str,
+    /// How long it took (of a part done more than once, together).
+    pub took: Duration,
+    /// The most memory proving held while it was made, in bytes
+    /// ([`crate::heap::Part::Proving`]): this part's, with what the
+    /// parts before it left to be held.
+    pub most: usize,
+    /// Whether another block was being proven beside it, whose memory
+    /// is then counted in `most` too.
+    pub beside: bool,
+}
+
+/// Proving, on this thread, until it is dropped: what is allocated is
+/// counted as proving's, and the block as one being proven.
+struct Proving(#[allow(dead_code)] crate::heap::Entered);
+
+impl Proving {
+    fn begin() -> Proving {
+        PROVING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Proving(crate::heap::enter(crate::heap::Part::Proving))
+    }
+}
+
+impl Drop for Proving {
+    fn drop(&mut self) {
+        PROVING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// What `part` gives, the time it took added to [`PARTS`] under `name`
 /// (to what is there under that name already, of a part done more
-/// than once).
+/// than once), with the most memory proving held meanwhile.
 fn timed<T>(name: &'static str, part: impl FnOnce() -> T) -> T {
+    use crate::heap::{Part, most, reset_most};
+    let alone = || PROVING.load(std::sync::atomic::Ordering::Relaxed) <= 1;
     let began = std::time::Instant::now();
+    let mut beside = !alone();
+    reset_most(Part::Proving);
     let out = part();
+    let held = most(Part::Proving);
+    MOST_HELD.fetch_max(held, std::sync::atomic::Ordering::Relaxed);
+    beside |= !alone();
     let mut parts = PARTS.lock().unwrap_or_else(|e| e.into_inner());
-    match parts.iter_mut().find(|p| p.0 == name) {
-        Some(p) => p.1 += began.elapsed(),
-        None => parts.push((name, began.elapsed())),
+    match parts.iter_mut().find(|p| p.name == name) {
+        Some(p) => {
+            p.took += began.elapsed();
+            p.most = p.most.max(held);
+            p.beside |= beside;
+        }
+        None => parts.push(Timed { name, took: began.elapsed(), most: held, beside }),
     }
     out
 }
 
-/// The parts of proving timed since this was last asked, and how long
-/// each took.
-pub fn parts_timed() -> Vec<(&'static str, Duration)> {
+/// The parts of proving timed since this was last asked, and how each
+/// went.
+pub fn parts_timed() -> Vec<Timed> {
     std::mem::take(&mut *PARTS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -871,6 +927,7 @@ impl Setup {
     /// begins made again. `None` if the parts are not this build's: that
     /// proof is of another program, or of other sizes, than they say.
     pub fn from_parts(level: Level, emission: Emission, pow: crate::pow::PowParams, parts: &Parts) -> Option<Setup> {
+        let _in = crate::heap::enter(crate::heap::Part::Setup);
         let shapes = 1 + (level.trees + 1) * (level.runs.len() + level.joins);
         if parts.shapes.len() != shapes || parts.nodes.len() < level.trees || parts.joins.len() < level.joins {
             return None;
@@ -908,6 +965,7 @@ impl Setup {
         if signings.is_empty() || tree > self.level.trees {
             return None;
         }
+        let _proving = Proving::begin();
         timed("the signatures", || sign(&self.level, &self.tables, &mut self.signed.clone(), signings, tree))
     }
 
@@ -1135,6 +1193,7 @@ impl Setup {
         contents: &Contents<'_>,
         proven: Option<&SignedProof>,
     ) -> Option<Vec<u8>> {
+        let _proving = Proving::begin();
         let set = proven.map_or(signed::empty_roots()[signed::DEPTH], SignedProof::set);
         let kept = witness.clone();
         let run = Self::runs_of(start, &set, &mut witness, contents, proven, None)?.remove(0);

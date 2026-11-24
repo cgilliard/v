@@ -379,6 +379,7 @@ impl<'a> LazyDataset<'a> {
     /// without room for it fails here and not while mining.
     pub fn new(seed: &SeedText<'a>, log_items: u32) -> std::io::Result<LazyDataset<'a>> {
         assert!(seed.params.has_table(log_items), "no epoch has a table of 2^{log_items} items");
+        let _in = crate::heap::enter(crate::heap::Part::Table);
         let no_room = |_| std::io::Error::new(std::io::ErrorKind::OutOfMemory, "no memory for the dataset");
         let (n, pairs) = (16usize << log_items, 1usize << (log_items - 1));
         let mut words = Vec::new();

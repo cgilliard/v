@@ -56,12 +56,16 @@ pub const STATS: &[(&str, Kind)] = &[
     ("HeapMB", Kind::Level),
     ("PeakHeapMB", Kind::Level),
     ("Refetched", Kind::Count),
+    ("PoolMB", Kind::Level),
+    ("SetupMB", Kind::Level),
+    ("TableMB", Kind::Level),
+    ("PeakProvingMB", Kind::Level),
 ];
 /// The node's stats. The log shows these of them, each in a column
 /// this wide; the rest are counted all the same.
 ///
 /// ```text
-/// Uptime: 0:00:00           Requests___Packets____AvgLatency(us)_HeapMB_PeakHeapMB_Peers_PeersLive_Height_Blocks_Refetched_Mined
+/// Uptime: 0:00:00           Requests___Packets____AvgLatency(us)_HeapMB_PeakHeapMB_PoolMB_SetupMB_TableMB_PeakProvingMB_Peers_PeersLive_Height_Blocks_Refetched_Mined
 /// ```
 pub fn stats() -> Stats {
     Stats::new(STATS).showing(&[
@@ -70,6 +74,10 @@ pub fn stats() -> Stats {
         (LATENCY, 15),
         (HEAP, 7),
         (HEAP_PEAK, 11),
+        (HEAP_POOL, 7),
+        (HEAP_SETUP, 8),
+        (HEAP_TABLE, 8),
+        (HEAP_PROVING, 14),
         (PEERS, 6),
         (PEERS_LIVE, 10),
         (HEIGHT, 7),
@@ -93,6 +101,13 @@ pub fn set_levels<B: Backend + 'static, V>(stats: &Stats, hold: &Handle<B, V>) {
     // does not count what it holds.)
     stats.set(HEAP, crate::heap::now() as u64 / 1_000_000);
     stats.set(HEAP_PEAK, crate::heap::peak() as u64 / 1_000_000);
+    // (Part by part: what is held now; and of proving, which comes
+    // and goes within a line, the most it has held.)
+    use crate::heap::Part;
+    stats.set(HEAP_POOL, crate::heap::held(Part::Pool) as u64 / 1_000_000);
+    stats.set(HEAP_SETUP, crate::heap::held(Part::Setup) as u64 / 1_000_000);
+    stats.set(HEAP_TABLE, crate::heap::held(Part::Table) as u64 / 1_000_000);
+    stats.set(HEAP_PROVING, crate::prover::most_held() as u64 / 1_000_000);
 }
 
 /// Datagrams taken, of whatever kind: the requests, and the chunks of
@@ -126,6 +141,13 @@ pub const HEAP_PEAK: usize = 13;
 /// too slow, or gone on with by another. Now and then is any network;
 /// many is a peer, or a line, that is not what it should be.
 pub const REFETCHED: usize = 14;
+/// The memory held for the pool, the proofs' setup and the table of
+/// the proof of work; and the most proving has held
+/// ([`crate::heap::Part`]), in megabytes.
+pub const HEAP_POOL: usize = 15;
+pub const HEAP_SETUP: usize = 16;
+pub const HEAP_TABLE: usize = 17;
+pub const HEAP_PROVING: usize = 18;
 
 /// What the main log says when datagrams are dropped.
 pub const DROPPING: &str = "dropped requests: a worker's queue is full";

@@ -721,6 +721,7 @@ impl Mempool {
     }
 
     pub fn with_policy(capacity: usize, policy: Policy) -> Mempool {
+        let _in = crate::heap::enter(crate::heap::Part::Pool);
         Mempool {
             txs: HashMap::new(),
             spends: HashMap::new(),
@@ -950,6 +951,7 @@ impl Mempool {
 
     /// A confirmation seen before a restart, or just now.
     pub fn remember_confirmed(&mut self, rate: u64, waited: u64, at: u64) {
+        let _in = crate::heap::enter(crate::heap::Part::Pool);
         self.confirmed.push_back((rate, waited, at));
         if self.confirmed.len() > CONFIRMED_KEPT {
             self.confirmed.pop_front();
@@ -960,6 +962,7 @@ impl Mempool {
     /// `now`, remembering their ids for as long again, and forgets the ids
     /// whose time is up; returns those dropped.
     pub fn expire(&mut self, now: u64) -> Vec<Digest> {
+        let _in = crate::heap::enter(crate::heap::Part::Pool);
         self.settle(now);
         let limit = self.policy.expiry_secs;
         let old: Vec<Digest> =
@@ -987,6 +990,7 @@ impl Mempool {
 
     /// An id expired before a restart, refused until `until`.
     pub fn remember_expired(&mut self, id: Digest, until: u64) {
+        let _in = crate::heap::enter(crate::heap::Part::Pool);
         if self.expired.len() < MAX_EXPIRED {
             self.expired.insert(id, until);
         }
@@ -1053,6 +1057,7 @@ impl Mempool {
     /// its age. Returns how many were taken. What is of another form,
     /// or cut short, is passed over from there on.
     pub fn load(&mut self, saved: &[u8], ledger: &impl Ledger, height: u32, now: u64) -> usize {
+        let _in = crate::heap::enter(crate::heap::Part::Pool);
         let Some(rest) = saved.strip_prefix(SAVED_TAG) else { return 0 };
         let mut r = crate::codec::Reader(rest);
         let mut taken = 0;
@@ -1089,6 +1094,7 @@ impl Mempool {
         arrived: u64,
         now: u64,
     ) -> Result<Digest, Reject> {
+        let _in = crate::heap::enter(crate::heap::Part::Pool);
         // (Before it is read at all: what is too large is not read.)
         if bytes.len() > self.policy.max_tx_size {
             return Err(Reject::TooLarge(bytes.len()));
@@ -1260,6 +1266,7 @@ impl Mempool {
         created: &HashMap<Commitment, u64>,
         now: u64,
     ) -> Result<(usize, usize), Error> {
+        let _in = crate::heap::enter(crate::heap::Part::Pool);
         let mut gone = Vec::new();
         for e in self.txs.values() {
             // One only known of: gone when what it spends is no longer

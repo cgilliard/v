@@ -185,6 +185,43 @@ should weigh more in the fee (19).
     test). Whether that is to be of a fixed size too, kept between
     blocks, or left as it is and said apart in `status`.
 - **Done so far:** what `status` says: `memory: N MB`, and the store as one number (the file's length only where it is another). Memory of a fixed size is to come (batch D).
+- **Done, memory by part:** every allocation is counted to the part
+  of the node it was made for (`heap::Part`: the node, the pool, the
+  wallet, the proofs' setup, the table of the proof of work, proving),
+  whichever thread frees it. Said in three places:
+  - `status`: `memory: 1,126 MB (the node 7, the table of the proof
+    of work 1,074, proving 41)`, the parts of a megabyte or more.
+  - The stats log: columns `PoolMB`, `SetupMB`, `TableMB` (held now)
+    and `PeakProvingMB` (the most proving has held in a part of it).
+  - The main log, with every block proven: the most memory proving
+    held while each part of the proof was made, and what was held
+    besides.
+- **Measured with it** (a node that mines alone, six threads, the
+  table of the proof of work of 1,074 MB):
+
+  | part of the proof | a block of a reward alone | a block with one signature |
+  |---|---|---|
+  | the signatures | - | 3,404 MB |
+  | the work | 1,488 MB | 1,489 MB |
+  | the run | 181 MB | 2,887 MB |
+  | signatures and work together | - | 8,225 MB |
+  | the block's root | 4,113 MB | 4,114 MB |
+  | the chain's step | 4,382 MB | 4,383 MB |
+  | the most the node held | 5,466 MB | 9,310 MB |
+
+  - The parts are made one after another: the most held is the
+    largest part and the table, not their sum. The same from block to
+    block, to the megabyte.
+  - The 5.5 GB and the 9.4 GB of the live tests are these two: the
+    first is the chain's step and the table; the second is
+    "signatures and work together" and the table, from the first
+    block that carried a transaction on.
+  - Held between blocks besides the table: the node 7 MB, the setup
+    2 MB, and 41 MB of proving's that stay.
+  - Not measured yet: a block of many signatures (more than one proof
+    of signatures, and runs joined), and a full one.
+- **To come:** the budget as a table in the code, said at the start;
+  each part of a fixed size; and a test that holds the node to it.
 
 ### 11. One node is counted as two peers when it is reached at two addresses
 

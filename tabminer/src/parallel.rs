@@ -107,7 +107,8 @@ pub fn par_map_min<T: Send, F: Fn(usize) -> T + Sync>(n: usize, min_per_thread: 
     }
     let f = &f;
     let parts: Vec<Vec<T>> = std::thread::scope(|s| {
-        let handles: Vec<_> = ranges.into_iter().map(|r| s.spawn(move || r.map(f).collect::<Vec<T>>())).collect();
+        let handles: Vec<_> =
+            ranges.into_iter().map(|r| s.spawn(crate::heap::within(move || r.map(f).collect::<Vec<T>>()))).collect();
         handles.into_iter().map(|h| h.join().expect("worker panicked")).collect()
     });
     let mut out = Vec::with_capacity(n);
@@ -134,10 +135,10 @@ pub fn par_map_with<S, T: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) -> T +
         let handles: Vec<_> = ranges
             .into_iter()
             .map(|r| {
-                s.spawn(move || {
+                s.spawn(crate::heap::within(move || {
                     let mut state = init();
                     r.map(|i| f(&mut state, i)).collect::<Vec<T>>()
-                })
+                }))
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("worker panicked")).collect()
@@ -172,11 +173,11 @@ pub fn par_fill_min<T: Send, F: Fn(usize) -> T + Sync>(out: &mut [T], min_per_th
     let f = &f;
     std::thread::scope(|s| {
         for (k, run) in out.chunks_mut(per).enumerate() {
-            s.spawn(move || {
+            s.spawn(crate::heap::within(move || {
                 for (i, x) in run.iter_mut().enumerate() {
                     *x = f(k * per + i);
                 }
-            });
+            }));
         }
     });
 }
@@ -199,11 +200,11 @@ pub fn par_chunks_mut<T: Send, F: Fn(usize, &mut [T]) + Sync>(data: &mut [T], ch
     let f = &f;
     std::thread::scope(|s| {
         for (k, run) in data.chunks_mut(per * chunk).enumerate() {
-            s.spawn(move || {
+            s.spawn(crate::heap::within(move || {
                 for (i, c) in run.chunks_mut(chunk).enumerate() {
                     f(k * per + i, c);
                 }
-            });
+            }));
         }
     });
 }
@@ -225,11 +226,11 @@ pub fn par_chunks2_mut<T: Send, F: Fn(usize, &mut [T], &mut [T]) + Sync>(a: &mut
     let f = &f;
     std::thread::scope(|s| {
         for (k, (ra, rb)) in a.chunks_mut(per * chunk).zip(b.chunks_mut(per * chunk)).enumerate() {
-            s.spawn(move || {
+            s.spawn(crate::heap::within(move || {
                 for (i, (x, y)) in ra.chunks_mut(chunk).zip(rb.chunks_mut(chunk)).enumerate() {
                     f(k * per + i, x, y);
                 }
-            });
+            }));
         }
     });
 }
@@ -265,7 +266,7 @@ where
     let (f, items) = (&f, &items);
     std::thread::scope(|s| {
         for _ in 0..threads() {
-            s.spawn(move || {
+            s.spawn(crate::heap::within(move || {
                 loop {
                     let next = items.lock().unwrap_or_else(|e| e.into_inner()).next();
                     match next {
@@ -273,7 +274,7 @@ where
                         None => break,
                     }
                 }
-            });
+            }));
         }
     });
 }

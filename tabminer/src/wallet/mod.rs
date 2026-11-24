@@ -1206,6 +1206,7 @@ impl<B: Backend> Wallet<B> {
     /// one is made, of a fresh phrase. Returns the wallet and, if it was
     /// just made, its phrase.
     pub fn open_with(backend: B, ask: &mut dyn FnMut(Ask) -> Result<String>) -> Result<(Wallet<B>, Option<String>)> {
+        let _in = crate::heap::enter(crate::heap::Part::Wallet);
         let mut records = Records::open(backend)?;
         let mut t = Tables::read(&records)?;
         let (secret, created) = match t.secret.is_empty() {
