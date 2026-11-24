@@ -59,6 +59,14 @@ const PAYMENT_MARKER: &str = "TAB PAYMENT PROOF";
 const BURN_MARKER: &str = "TAB BURN PROOF";
 const FORMAT_PAYMENT: u8 = 1;
 const FORMAT_BURN: u8 = 2;
+/// A payment made to a name: with the name, and what shows whose a
+/// name under a name is.
+const FORMAT_NAMED: u8 = 3;
+/// What marks, in what a receipt signs, that a name follows.
+const NAMED: &[u8] = b"paid as";
+/// The longest a name a payment is made to is, as it is written
+/// (`@name`, or `label@name`).
+pub const MAX_PAID_AS: usize = 2 * crate::name::NAME_MAX + 1;
 
 /// What a paying wallet is known by in a slate and a receipt: the hash
 /// of its address and of a secret it keeps. Nobody has the address
@@ -82,26 +90,75 @@ impl Receipt {
 
     /// What is signed: the output (its commitment, which is of its key
     /// and amount; the amount; its memo), the slate, the tag of whoever
-    /// pays, and the slate's note.
-    fn message(output: &Output, slate: &[u8; 32], sender: &Digest, note: &[u8]) -> [u8; 64] {
+    /// pays, and the slate's note; and, of a payment made to a name
+    /// that the paid wallet says is its own, that name (`@name`, or
+    /// `label@name`: nothing, for a payment to an address, which is
+    /// then signed as it always was).
+    fn message(output: &Output, slate: &[u8; 32], sender: &Digest, note: &[u8], name: &[u8]) -> [u8; 64] {
         let mut h = Sponge::shake256();
         h.absorb(&digest_to_bytes(&output.commitment)).absorb(&output.amount.to_le_bytes());
         h.absorb(&memo_to_bytes(&output.memo)).absorb(slate).absorb(&digest_to_bytes(sender));
         h.absorb(&(note.len() as u32).to_le_bytes()).absorb(note);
+        if !name.is_empty() {
+            h.absorb(NAMED).absorb(&(name.len() as u32).to_le_bytes()).absorb(name);
+        }
         h.squeezed()
+    }
+
+    /// [`Receipt::sign`], of a payment made to `name`, which the wallet
+    /// that signs says is its own.
+    pub fn sign_as(
+        key: &mldsa::SecretKey,
+        output: &Output,
+        slate: &[u8; 32],
+        sender: &Digest,
+        note: &[u8],
+        name: &[u8],
+    ) -> Receipt {
+        let signature = key.sign(&Self::message(output, slate, sender, note, name), CTX_RECEIPT).to_vec();
+        Receipt { key: key.public_key().to_vec(), signature }
+    }
+
+    /// [`Receipt::verify`], of a payment made to `name`.
+    pub fn verify_as(&self, output: &Output, slate: &[u8; 32], sender: &Digest, note: &[u8], name: &[u8]) -> bool {
+        mldsa::verify(&self.key, &Self::message(output, slate, sender, note, name), CTX_RECEIPT, &self.signature)
+    }
+
+    /// [`Receipt::sign_as_payer`], of a payment made to `name`.
+    pub fn sign_as_payer_to(
+        key: &mldsa::SecretKey,
+        output: &Output,
+        slate: &[u8; 32],
+        sender: &Digest,
+        note: &[u8],
+        name: &[u8],
+    ) -> Receipt {
+        let signature = key.sign(&Self::message(output, slate, sender, note, name), CTX_PAYER).to_vec();
+        Receipt { key: key.public_key().to_vec(), signature }
+    }
+
+    /// [`Receipt::verify_as_payer`], of a payment made to `name`.
+    pub fn verify_as_payer_to(
+        &self,
+        output: &Output,
+        slate: &[u8; 32],
+        sender: &Digest,
+        note: &[u8],
+        name: &[u8],
+    ) -> bool {
+        mldsa::verify(&self.key, &Self::message(output, slate, sender, note, name), CTX_PAYER, &self.signature)
     }
 
     /// The receipt of the wallet whose key is `key`, for `output` of
     /// the slate of id `slate`.
     pub fn sign(key: &mldsa::SecretKey, output: &Output, slate: &[u8; 32], sender: &Digest, note: &[u8]) -> Receipt {
-        let signature = key.sign(&Self::message(output, slate, sender, note), CTX_RECEIPT).to_vec();
-        Receipt { key: key.public_key().to_vec(), signature }
+        Self::sign_as(key, output, slate, sender, note, &[])
     }
 
     /// Whether it is a receipt for that output of that slate, to
     /// whoever has that tag, with that note.
     pub fn verify(&self, output: &Output, slate: &[u8; 32], sender: &Digest, note: &[u8]) -> bool {
-        mldsa::verify(&self.key, &Self::message(output, slate, sender, note), CTX_RECEIPT, &self.signature)
+        self.verify_as(output, slate, sender, note, &[])
     }
 
     /// The address of the wallet that signed it.
@@ -119,13 +176,12 @@ impl Receipt {
         sender: &Digest,
         note: &[u8],
     ) -> Receipt {
-        let signature = key.sign(&Self::message(output, slate, sender, note), CTX_PAYER).to_vec();
-        Receipt { key: key.public_key().to_vec(), signature }
+        Self::sign_as_payer_to(key, output, slate, sender, note, &[])
     }
 
     /// Whether it is the paying wallet's word for that payment.
     pub fn verify_as_payer(&self, output: &Output, slate: &[u8; 32], sender: &Digest, note: &[u8]) -> bool {
-        mldsa::verify(&self.key, &Self::message(output, slate, sender, note), CTX_PAYER, &self.signature)
+        self.verify_as_payer_to(output, slate, sender, note, &[])
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -248,7 +304,24 @@ pub enum Claim {
     /// slate of this id and note, to the wallet whose address with
     /// `secret` is the tag it signed; and that wallet says it is its
     /// own (`payer`, whose key its address is the hash of).
-    Payment { secret: [u8; 32], slate: [u8; 32], note: Vec<u8>, receipt: Receipt, payer: Receipt },
+    ///
+    /// `name` is the name the payment was made to, if it was made to
+    /// one and the paid wallet signed that it is its own (`@name`, or
+    /// `label@name`: nothing, of a payment to an address). The paid
+    /// wallet's word is not the chain's: whoever reads the proof holds
+    /// the name against the chain as it then is, and of a name under a
+    /// name against `bundle`, its certificate, if it still holds. A
+    /// name that no longer holds is no part of what the proof shows;
+    /// the address is, always.
+    Payment {
+        secret: [u8; 32],
+        slate: [u8; 32],
+        note: Vec<u8>,
+        name: Vec<u8>,
+        bundle: Vec<u8>,
+        receipt: Receipt,
+        payer: Receipt,
+    },
     /// A burn: what its memo is the hash of.
     Burn(Burn),
 }
@@ -311,12 +384,12 @@ impl Proof {
             return Err(ProofError::NotInBlock);
         }
         match &self.claim {
-            Claim::Payment { secret, slate, note, receipt, payer } => {
+            Claim::Payment { secret, slate, note, name, receipt, payer, .. } => {
                 // (The tag the paid wallet signed is of the paying
                 // wallet's address: the one whose key signs here.)
                 let tag = sender_tag(&payer.recipient(), secret);
-                let paid = self.key_hash != BURN_KEY_HASH && receipt.verify(&output, slate, &tag, note);
-                let sound = paid && payer.verify_as_payer(&output, slate, &tag, note);
+                let paid = self.key_hash != BURN_KEY_HASH && receipt.verify_as(&output, slate, &tag, note, name);
+                let sound = paid && payer.verify_as_payer_to(&output, slate, &tag, note, name);
                 sound.then_some(()).ok_or(ProofError::Receipt)
             }
             Claim::Burn(_) if self.key_hash != BURN_KEY_HASH => Err(ProofError::NotBurned),
@@ -325,7 +398,8 @@ impl Proof {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = vec![match self.claim {
+        let mut out = vec![match &self.claim {
+            Claim::Payment { name, .. } if !name.is_empty() => FORMAT_NAMED,
             Claim::Payment { .. } => FORMAT_PAYMENT,
             Claim::Burn(_) => FORMAT_BURN,
         }];
@@ -336,11 +410,17 @@ impl Proof {
         out.extend_from_slice(&memo_to_bytes(&self.memo));
         self.path.iter().for_each(|sibling| out.extend_from_slice(&digest_to_bytes(sibling)));
         match &self.claim {
-            Claim::Payment { secret, slate, note, receipt, payer } => {
+            Claim::Payment { secret, slate, note, name, bundle, receipt, payer } => {
                 out.extend_from_slice(secret);
                 out.extend_from_slice(slate);
                 out.push(note.len() as u8);
                 out.extend_from_slice(note);
+                if !name.is_empty() {
+                    out.push(name.len() as u8);
+                    out.extend_from_slice(name);
+                    out.extend_from_slice(&(bundle.len() as u16).to_le_bytes());
+                    out.extend_from_slice(bundle);
+                }
                 out.extend_from_slice(&receipt.to_bytes());
                 out.extend_from_slice(&payer.to_bytes());
             }
@@ -370,13 +450,22 @@ impl Proof {
             *sibling = digest_from_bytes(take(32)?)?;
         }
         let claim = match *format {
-            FORMAT_PAYMENT => {
+            FORMAT_PAYMENT | FORMAT_NAMED => {
                 let (secret, slate) = (take(32)?.try_into().ok()?, take(32)?.try_into().ok()?);
                 let n = take(1)?[0] as usize;
                 let note = take(n)?.to_vec();
+                let (name, bundle) = match *format {
+                    FORMAT_NAMED => {
+                        let n = Some(take(1)?[0] as usize).filter(|n| (1..=MAX_PAID_AS).contains(n))?;
+                        let name = take(n)?.to_vec();
+                        let n = u16::from_le_bytes(take(2)?.try_into().ok()?) as usize;
+                        (name, take(Some(n).filter(|n| *n <= crate::subnames::MAX_BUNDLE)?)?.to_vec())
+                    }
+                    _ => (Vec::new(), Vec::new()),
+                };
                 let receipt = Receipt::from_bytes(take(Receipt::SIZE)?)?;
                 let payer = Receipt::from_bytes(take(Receipt::SIZE)?)?;
-                Claim::Payment { secret, slate, note, receipt, payer }
+                Claim::Payment { secret, slate, note, name, bundle, receipt, payer }
             }
             FORMAT_BURN => Claim::Burn(Burn::read_bytes(&mut r)?),
             _ => return None,
@@ -472,7 +561,7 @@ mod tests {
         let tag = sender_tag(&id_of(payer_key.public_key()), &secret);
         let receipt = Receipt::sign(&paid_key, &output, &slate, &tag, &note);
         let payer = Receipt::sign_as_payer(&payer_key, &output, &slate, &tag, &note);
-        let claim = Claim::Payment { secret, slate, note, receipt, payer };
+        let claim = Claim::Payment { secret, slate, note, name: Vec::new(), bundle: Vec::new(), receipt, payer };
         let (proof, root) = alone(&output, 77, 12_345, claim);
         assert_eq!(proof.check(&root), Ok(()));
         // As text, with whatever is around it; and as bytes.
@@ -495,10 +584,11 @@ mod tests {
         }
         // In the block, and not what the proof says: another secret,
         // another note, another slate.
-        let Claim::Payment { secret, slate, note, receipt, payer } = proof.claim.clone() else { unreachable!() };
+        let Claim::Payment { secret, slate, note, receipt, payer, .. } = proof.claim.clone() else { unreachable!() };
         let with = |secret, slate, note: &[u8], payer: &Receipt| {
-            let claim =
-                Claim::Payment { secret, slate, note: note.to_vec(), receipt: receipt.clone(), payer: payer.clone() };
+            let (name, bundle) = (Vec::new(), Vec::new());
+            let (note, receipt, payer) = (note.to_vec(), receipt.clone(), payer.clone());
+            let claim = Claim::Payment { secret, slate, note, name, bundle, receipt, payer };
             Proof { claim, ..proof.clone() }.check(&root)
         };
         assert_eq!(with(secret, slate, &note, &payer), Ok(()));
@@ -553,5 +643,46 @@ mod tests {
         for not in ["", "Alice@mailhub", "@", "tab1nothing", "a@b@c"] {
             assert_eq!(Beneficiary::read(not), None, "{not}");
         }
+    }
+
+    /// A payment made to a name: the paid wallet signs the name with
+    /// the rest, the proof carries it, and it is as much a part of
+    /// what is proven as the note. A proof of a payment to an address
+    /// is, to the byte, what it was before there were names in them.
+    #[test]
+    fn a_payment_to_a_name_is_proven_with_the_name() {
+        let (paid_key, payer_key) = (mldsa::keygen(&[1; 32]), mldsa::keygen(&[2; 32]));
+        let output = Output::to_key_hash(&[9; 32], 5000);
+        let (secret, slate, note) = ([3u8; 32], [4u8; 32], b"rent".to_vec());
+        let tag = sender_tag(&id_of(payer_key.public_key()), &secret);
+        let named = |name: &[u8], signed_as: &[u8], bundle: &[u8]| {
+            let receipt = Receipt::sign_as(&paid_key, &output, &slate, &tag, &note, signed_as);
+            let payer = Receipt::sign_as_payer_to(&payer_key, &output, &slate, &tag, &note, signed_as);
+            let (note, name, bundle) = (note.clone(), name.to_vec(), bundle.to_vec());
+            alone(&output, 77, 12_345, Claim::Payment { secret, slate, note, name, bundle, receipt, payer })
+        };
+        let (proof, root) = named(b"alice@hub", b"alice@hub", b"a certificate");
+        assert_eq!(proof.check(&root), Ok(()));
+        let again = Proof::from_text(&proof.to_text()).unwrap();
+        assert_eq!((again.check(&root), &again), (Ok(()), &proof));
+        // Another name than was signed for, or none: not that payment.
+        assert_eq!(named(b"mallory@hub", b"alice@hub", b"").0.check(&root), Err(ProofError::Receipt));
+        assert_eq!(named(b"", b"alice@hub", b"").0.check(&root), Err(ProofError::Receipt));
+        assert_eq!(named(b"alice@hub", b"", b"").0.check(&root), Err(ProofError::Receipt));
+        // To an address: as it always was, and a byte shorter for it.
+        let (plain, root) = named(b"", b"", b"");
+        assert_eq!(plain.check(&root), Ok(()));
+        assert_eq!((plain.to_bytes()[0], proof.to_bytes()[0]), (FORMAT_PAYMENT, FORMAT_NAMED));
+        let receipt = Receipt::sign(&paid_key, &output, &slate, &tag, &note);
+        assert!(
+            receipt.verify_as(&output, &slate, &tag, &note, b"")
+                && !receipt.verify_as(&output, &slate, &tag, &note, b"@a")
+        );
+        // What is no name of a length there is, is no proof.
+        let mut long = proof.to_bytes();
+        let at = long.len() - 2 * Receipt::SIZE - 2 - 13 - 9 - 1;
+        assert_eq!(long[at], 9);
+        long[at] = 0;
+        assert!(Proof::from_bytes(&long).is_none());
     }
 }

@@ -406,6 +406,12 @@ pub(super) fn relist(t: &mut Tables) -> bool {
     // (No more of them than a node's branches are long.)
     let over = waiting.len().saturating_sub(4096);
     t.located = waiting.split_off(over);
+    // The names payments were made to, for their rows.
+    for (id, name) in std::mem::take(&mut t.named) {
+        if let Some(at) = t.row_of(&id) {
+            t.list[at].name = name;
+        }
+    }
     // The first rows that are at rest now: done with, as they stand.
     // Of a transaction, when the wallet has let go of its record; of
     // an output, when it is gone, or so deep in the chain that no

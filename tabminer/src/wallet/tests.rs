@@ -828,7 +828,7 @@ fn payments_are_receipted_and_kept_to_be_proven() {
     let kept = alice.payments();
     assert_eq!((kept.len(), kept[0].txid, kept[0].proven, kept[0].landed), (1, signed.tx.txid(), false, None));
     assert!(alice.payments_to_prove().is_empty());
-    let Claim::Payment { secret, slate: of, note, receipt: held, payer } = kept[0].proof.claim.clone() else {
+    let Claim::Payment { secret, slate: of, note, receipt: held, payer, .. } = kept[0].proof.claim.clone() else {
         panic!()
     };
     assert_eq!((of, &note[..], held), (slate.id, &b"deposit 4821"[..], receipt));
@@ -1169,4 +1169,103 @@ fn a_payment_whose_input_is_undone_is_not_taken_for_mined() {
     assert_eq!(carol.reconcile(&chain, 2, 10, None).unwrap(), Reconciled::default());
     assert_eq!(stage(&carol), Stage::Confirmed);
     let _ = signed;
+}
+
+/// A payment is made to a name. Whoever pays says the name in the
+/// slate; the wallet that is paid signs for it if the name is its
+/// own, and takes it out if it is not, and the payment is made all
+/// the same, to its address. What was signed for is in the proof, with
+/// the certificate of a name under a name, and both wallets' rows are
+/// known by it. A payment is not signed that comes back as another
+/// name than it was made to, nor with a name the receipt is not for.
+#[test]
+fn a_payment_is_made_to_a_name() {
+    use crate::proofs::Claim;
+    let mut chain = Outputs::default();
+    let mut names = Names::default();
+    let mut alice = funded(&mut chain, 100 * COIN);
+    let mut bob = funded(&mut chain, 100 * COIN);
+    let mut carol = new();
+    // Bob registers a name that says his own address; and is given a
+    // name under another's.
+    let op = bob.name_commit(b"bob", bob.id(), NOW).unwrap();
+    let signed = bob.carry(vec![op], None, &chain, NOW).unwrap();
+    names.take(&signed.tx, 10);
+    chain.take(&signed.tx, &mut [&mut bob]);
+    assert_eq!(bob.own_name(b"@bob", NOW), None);
+    let op = bob.name_reveal(b"bob", 0, 3, &names, 13, NOW).unwrap();
+    let signed = bob.carry(vec![op], None, &chain, NOW).unwrap();
+    names.take(&signed.tx, 13);
+    chain.take(&signed.tx, &mut [&mut bob]);
+    bob.sync_names(&names).unwrap();
+    let hub = crate::mldsa::keygen(&[5; 32]);
+    let certificate = crate::subnames::certify(&hub, b"bob", b"hub", &bob.id(), 1, NOW + 1000);
+    let bundle = crate::subnames::bundle(&certificate, None);
+    let checked = crate::subnames::read(&bundle, NOW).unwrap();
+    assert!(bob.hold_name(&checked, &bundle, 8).unwrap());
+    assert_eq!(bob.own_name(b"@bob", NOW), Some(Vec::new()));
+    assert_eq!(bob.own_name(b"bob@hub", NOW), Some(bundle.clone()));
+    // (Not his: a name he does not hold; one under a name he was not
+    // given; one whose certificate has run out; what is no name.)
+    for (name, at) in [(&b"@alice"[..], NOW), (b"alice@hub", NOW), (b"bob@hub", NOW + 1000), (b"bob", NOW), (b"", NOW)]
+    {
+        assert_eq!(bob.own_name(name, at), None, "{}", String::from_utf8_lossy(name));
+    }
+    let name_of = |w: &Wallet<MemBackend>, txid: &Digest| match &w
+        .payments()
+        .iter()
+        .find(|p| p.txid == *txid)
+        .unwrap()
+        .proof
+        .claim
+    {
+        Claim::Payment { name, bundle, .. } => (name.clone(), bundle.clone()),
+        _ => panic!(),
+    };
+    let row_name = |w: &Wallet<MemBackend>| String::from_utf8(w.list().last().unwrap().name.clone()).unwrap();
+
+    // To his name, and to his name under a name.
+    for (name, shown_by) in [(&b"@bob"[..], Vec::new()), (b"bob@hub", bundle.clone())] {
+        let mut slate = alice.send(5 * COIN, None, &chain, NOW).unwrap();
+        alice.name_payment(&mut slate, name).unwrap();
+        assert_eq!(Slate::from_text(&slate.to_text()).unwrap(), slate);
+        bob.receive_slate(&mut slate, NOW).unwrap();
+        assert_eq!((&slate.name[..], &slate.bundle), (name, &shown_by));
+        assert_eq!(Slate::from_text(&slate.to_text()).unwrap(), slate);
+        assert_eq!(row_name(&bob).as_bytes(), name);
+        // Not signed as another name, nor without the name the
+        // receipt is for.
+        let other = Slate { name: b"@mallory".to_vec(), ..slate.clone() };
+        assert!(matches!(alice.finalize(&other, NOW), Err(WalletError::BadSlate(m)) if m.contains("another name")));
+        let none = Slate { name: Vec::new(), ..slate.clone() };
+        assert!(matches!(alice.finalize(&none, NOW), Err(WalletError::BadSlate("no receipt for this payment"))));
+        let signed = alice.finalize(&slate, NOW).unwrap();
+        assert_eq!(name_of(&alice, &signed.tx.txid()), (name.to_vec(), shown_by));
+        assert_eq!(row_name(&alice).as_bytes(), name);
+        assert_eq!(alice.paid_to(&digest_to_bytes(&signed.tx.txid())), Some(bob.id()));
+        chain.take(&signed.tx, &mut [&mut alice, &mut bob]);
+        // (And it is all there when the files are opened again.)
+        assert_eq!(reopened(&alice, "").unwrap().list(), alice.list());
+        assert_eq!(reopened(&bob, "").unwrap().list(), bob.list());
+    }
+    // To a name that is not the wallet's that is paid (the name says
+    // another address than it was found at, or the slate went astray):
+    // paid all the same, as to an address, and known by no name.
+    let mut slate = alice.send(5 * COIN, None, &chain, NOW).unwrap();
+    alice.name_payment(&mut slate, b"@bob").unwrap();
+    carol.receive_slate(&mut slate, NOW).unwrap();
+    assert!(slate.name.is_empty() && slate.bundle.is_empty());
+    let signed = alice.finalize(&slate, NOW).unwrap();
+    assert_eq!(name_of(&alice, &signed.tx.txid()), (Vec::new(), Vec::new()));
+    assert_eq!((row_name(&alice), row_name(&carol)), (String::new(), String::new()));
+    assert_eq!(alice.paid_to(&digest_to_bytes(&signed.tx.txid())), Some(carol.id()));
+    chain.take(&signed.tx, &mut [&mut alice, &mut carol]);
+    // And to an address, a slate is what it always was but for two
+    // empty lengths; a name is said only of a payment just begun.
+    let mut slate = alice.send(5 * COIN, None, &chain, NOW).unwrap();
+    assert!(slate.name.is_empty());
+    assert!(alice.name_payment(&mut slate, b"").is_err());
+    bob.receive_slate(&mut slate, NOW).unwrap();
+    assert!(alice.name_payment(&mut slate, b"@bob").is_err());
+    assert!(alice.finalize(&slate, NOW).is_ok());
 }

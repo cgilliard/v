@@ -1168,6 +1168,33 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         };
         let dash = |n: Option<u64>| n.map_or("-".to_string(), commas);
         let amount = |n: u64| if n == 0 { "-".to_string() } else { coins(n as u128) };
+        // Whom a row is of, after it: the name of a step of a name; of
+        // a payment made, the address it paid (cut short in the list)
+        // and before it the name it was made to, where the wallet that
+        // was paid signed for one; of a payment received, the name it
+        // was paid as. The address is what a payment is to: the name
+        // is how it was found, and is there or not.
+        let whom = |row: &Row, short_address: bool| -> String {
+            let name = String::from_utf8_lossy(&row.name);
+            match row.kind {
+                Kind::Sent => {
+                    let address = wallet.paid_to(&row.txid).map(|to| crate::address::encode(&to));
+                    let address = address.map(|a| match short_address {
+                        true => format!("{}…{}", &a[..8], &a[a.len() - 6..]),
+                        false => a,
+                    });
+                    match (row.name.is_empty(), address) {
+                        (true, None) => String::new(),
+                        (true, Some(address)) => format!("  to {address}"),
+                        (false, None) => format!("  to {name}"),
+                        (false, Some(address)) => format!("  to {name} ({address})"),
+                    }
+                }
+                Kind::Received if !row.name.is_empty() => format!("  as {name}"),
+                _ if row.name.is_empty() => String::new(),
+                _ => format!("  @{name}"),
+            }
+        };
         let rows: Vec<&Row> = match which.copied() {
             None => wallet.list().iter().collect(),
             Some("pending") => wallet
@@ -1181,9 +1208,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 // Everything of one row.
                 let id = row.transaction().unwrap_or(row.id);
                 let mut out = format!("{}  {}  {}", row.number, kind(row), stage(row));
-                if !row.name.is_empty() {
-                    out.push_str(&format!("  @{}", String::from_utf8_lossy(&row.name)));
-                }
+                out.push_str(&whom(row, false));
                 out.push_str(&format!("\namount: {}\nfee: {}", amount(row.amount), amount(row.fee)));
                 out.push_str(&format!("\nblock: {}", dash(block(row))));
                 let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
@@ -1230,8 +1255,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             "#", "kind", "state", "amount", "fee", "block", "id"
         )];
         for (row, stage) in rows.iter().zip(&stages) {
-            let name =
-                if row.name.is_empty() { String::new() } else { format!("  @{}", String::from_utf8_lossy(&row.name)) };
+            let name = whom(row, true);
             lines.push(format!(
                 "  {:>4}  {:<14}  {stage:<wide$}  {:>24}  {:>14}  {:>9}  {}{name}",
                 row.number,
@@ -1510,12 +1534,23 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         // (Of a payment, both wallets say so, each by its own key; of
         // a burn, nobody can spend it: that is what holding means.)
         Ok(match &proof.claim {
-            Claim::Payment { note, receipt, payer, .. } => {
+            Claim::Payment { note, name, bundle, receipt, payer, .. } => {
                 let note = if note.is_empty() { String::new() } else { format!("Note: \"{}\"\n", shown(note)) };
+                // The name it was made to, where the paid wallet signed
+                // for one and it is that wallet's still, by the chain
+                // as it is here now (and, of a name under a name, by
+                // its certificate, if that has not run out). A name
+                // that does not hold is not shown: the address is what
+                // was paid, and is shown always.
+                let to = receipt.recipient();
+                let address = crate::address::encode(&to);
+                let to = match self.holds(name, bundle, &to) {
+                    true => format!("{} ({address})", String::from_utf8_lossy(name)),
+                    false => address,
+                };
                 format!(
-                    "the proof holds:\nFrom: {}\nTo: {}\nAmount: {}\n{note}{block}",
+                    "the proof holds:\nFrom: {}\nTo: {to}\nAmount: {}\n{note}{block}",
                     crate::address::encode(&payer.recipient()),
-                    crate::address::encode(&receipt.recipient()),
                     coins(proof.amount as u128),
                 )
             }
@@ -1526,6 +1561,26 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 burn.purpose
             ),
         })
+    }
+
+    /// Whether `name`, as a payment was made to it (`@name`, or
+    /// `label@name` with its certificate `bundle`), is the wallet of
+    /// address `whose` by the chain as it is here now: the name's
+    /// record says that address; or the certificate, signed by the
+    /// key the name's record says and not run out, says the name
+    /// under it is that wallet.
+    fn holds(&self, name: &[u8], bundle: &[u8], whose: &crate::hash::Digest) -> bool {
+        let says = |name: &[u8]| -> Option<crate::hash::Digest> {
+            let state = self.hold.chain().whole().ok()?;
+            let snap = state.snapshot().ok()?;
+            Some(Registry::record(&snap, name).ok()??.value)
+        };
+        match name.strip_prefix(b"@") {
+            Some(name) => says(name) == Some(*whose),
+            None => crate::subnames::read(bundle, (self.unix)()).is_some_and(|checked| {
+                checked.full().as_bytes() == name && checked.holder == *whose && says(&checked.name) == Some(checked.by)
+            }),
+        }
     }
 
     /// Burns `amount` for `purpose`, to the credit of `to` (an
@@ -1624,9 +1679,15 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             let state = self.hold.chain().whole().map_err(|e| e.to_string())?;
             let snap = state.snapshot().map_err(|e| e.to_string())?;
             let (amount, left) = Self::amount_of(&wallet, &snap, amount, fee)?;
-            let slate = wallet
+            let mut slate = wallet
                 .send_noted(amount, fee, note.as_bytes(), &snap, (self.unix)())
                 .map_err(|e| Self::short_of(&wallet, &snap, e))?;
+            // (Made to a name: said in the slate, for the wallet that
+            // is paid to sign for if the name is its own, and kept
+            // with the payment, which is known by it afterwards.)
+            if to.contains('@') {
+                wallet.name_payment(&mut slate, to.as_bytes()).map_err(|e| e.to_string())?;
+            }
             (slate, left)
         };
         let done = format!(
@@ -1733,8 +1794,16 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         // (Who pays is not known here, and need not be: the answer
         // goes back the way the slate came.)
         let said = if slate.note.is_empty() { String::new() } else { format!(", note: \"{}\"", shown(&slate.note)) };
-        let done =
-            format!("Payment {} answered: {} to this wallet{said}", &slate.id_hex()[..8], coins(slate.amount as u128));
+        // (Paid as a name of this wallet's, if it was made to one.)
+        let paid_as = match slate.name.is_empty() {
+            true => String::new(),
+            false => format!(" as {}", String::from_utf8_lossy(&slate.name)),
+        };
+        let done = format!(
+            "Payment {} answered: {} to this wallet{paid_as}{said}",
+            &slate.id_hex()[..8],
+            coins(slate.amount as u128)
+        );
         (self.log)(&done);
         if !self.hold.answer(message, crate::msg::KIND_SLATE, slate.id, slate.to_text().into_bytes()) {
             return Err(format!("Payment {} cannot be answered: it came by no node", &slate.id_hex()[..8]));
@@ -3065,6 +3134,69 @@ mod tests {
         (to, body)
     }
 
+    /// A payment made to a name is known by the name afterwards: in
+    /// both wallets' lists, with the address beside it in the one that
+    /// paid; and in its proof, for as long as the name is that
+    /// wallet's by the chain. The address is shown always, the name
+    /// only while it holds.
+    #[test]
+    fn a_payment_to_a_name_says_the_name() {
+        use crate::msg::KIND_SLATE;
+        let (desk, payer, paid) = funded("named");
+        let all = [&payer, &paid];
+        // The wallet to be paid registers a name that says its address.
+        assert!(said(&payer, "name-commit shop").starts_with("Name shop: committed to"));
+        let revealed = (0..40).any(|_| {
+            desk.mine(&payer, &all);
+            matches!(payer.run("name-reveal shop"), Reply::Said(_))
+        });
+        assert!(revealed);
+        desk.mine(&payer, &all);
+        // (Here the one that pays is `paid`, and `payer` holds the name.)
+        let (shop, buyer) = (&payer, &paid);
+        desk.mine(buyer, &all);
+        desk.mine(buyer, &all);
+        let address = said(shop, "address");
+        let begun = said(buyer, "send 5 @shop");
+        assert!(begun.contains(&format!("begun: 5 and a fee of 0.0000175, to {address}")), "{begun}");
+        let (_, slate) = last_post(&desk, KIND_SLATE);
+        let answered = shop.take(&message(KIND_SLATE, slate, None)).unwrap();
+        assert!(answered.ends_with("answered: 5 to this wallet as @shop"), "{answered}");
+        let (_, answer) = last_post(&desk, KIND_SLATE);
+        let signed = buyer.take(&message(KIND_SLATE, answer, Some(id_of(shop)))).unwrap();
+        assert!(signed.contains("signed and pooled"), "{signed}");
+        // Each list says it: to the name, with the address it paid;
+        // and as the name.
+        let last = |prompt: &TestConsole| said(prompt, "txs").lines().last().unwrap().to_string();
+        let cut = format!("{}…{}", &address[..8], &address[address.len() - 6..]);
+        assert!(last(buyer).ends_with(&format!("  to @shop ({cut})")), "{}", last(buyer));
+        assert!(last(shop).ends_with("  as @shop"), "{}", last(shop));
+        let n = last(buyer).split_whitespace().next().unwrap().to_string();
+        assert!(said(buyer, &format!("txs {n}")).lines().next().unwrap().ends_with(&format!("  to @shop ({address})")));
+        // Proven: to the name, and the address with it.
+        desk.mine(shop, &all);
+        let file = desk.file("named.proof");
+        assert!(said(buyer, &format!("payment-proof {n} {file}")).starts_with("the proof of "));
+        let holds = said(shop, &format!("verify-proof {file}"));
+        assert!(holds.contains(&format!("\nTo: @shop ({address})\nAmount: 5\n")), "{holds}");
+        // The name says another address from here on: the proof holds
+        // as it did, and shows the address alone.
+        let elsewhere = crate::address::encode(&[7; 32]);
+        assert!(said(shop, &format!("name-update shop {elsewhere}")).starts_with("Name shop: "));
+        desk.mine(shop, &all);
+        let holds = said(buyer, &format!("verify-proof {file}"));
+        assert!(holds.contains(&format!("\nTo: {address}\nAmount: 5\n")), "{holds}");
+        // And a payment to an address is known by its address.
+        let begun = said(buyer, &format!("send 1 {address}"));
+        assert!(begun.contains("begun: 1 and a fee of"), "{begun}");
+        let (_, slate) = last_post(&desk, KIND_SLATE);
+        let answered = shop.take(&message(KIND_SLATE, slate, None)).unwrap();
+        assert!(answered.ends_with("answered: 1 to this wallet"), "{answered}");
+        let (_, answer) = last_post(&desk, KIND_SLATE);
+        buyer.take(&message(KIND_SLATE, answer, Some(id_of(shop)))).unwrap();
+        assert!(last(buyer).ends_with(&format!("  to {cut}")), "{}", last(buyer));
+    }
+
     /// A payment sent to an address goes to its wallet as a message,
     /// is answered by a message, and is signed when the answer comes
     /// from the wallet it was sent to: and from no other, nor of what
@@ -3148,7 +3280,9 @@ mod tests {
         assert_eq!(row(&listed, 3)[..4], ["3", "sent", "pooled", "5"], "{listed}");
         let one = said(&payer, "txs 3");
         assert!(
-            one.starts_with("3  sent  pooled\namount: 5\n") && one.contains("\nspends: ") && one.contains("\nmakes: ")
+            one.starts_with(&format!("3  sent  pooled  to {to}\namount: 5\n"))
+                && one.contains("\nspends: ")
+                && one.contains("\nmakes: ")
         );
         assert!(one.contains("(this wallet's)") && one.contains("\nproof: not yet"), "{one}");
         assert!(matches!(payer.run("txs zz"), Reply::Wrong(_)));

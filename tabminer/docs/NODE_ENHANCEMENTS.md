@@ -1092,6 +1092,30 @@ these had a test of its own.
 
 ### 30. A payment to a name does not say the name afterwards
 
+- **Done, all three:**
+  1. The wallet that pays keeps the name the payment was made to,
+     with the payment: its row in `txs` ends `to @name (tab1znry…mraz)`
+     (the address cut short in the list, whole in `txs ROW`); a
+     payment to an address ends `to tab1znry…mraz`.
+  2. The slate carries the name (`@name`, or `label@name`, as it was
+     written). The wallet that is paid leaves it there if the name is
+     its own (a name it holds that says its own address; a name under
+     a name it was given, whose certificate has not run out) and its
+     row says `as @name`; if the name is not its own it takes it out,
+     and the payment is made all the same.
+  3. The name is part of what the paid wallet signs in its receipt,
+     and of what the paying wallet signs. The proof carries it, and
+     the certificate of a name under a name. `verify-proof` says `To:
+     @name (tab1…)` while the name is that wallet's by the chain as
+     it is where the proof is read (and the certificate has not run
+     out); when it is not, `To: tab1…`, with nothing said of a name.
+  - A payment to an address is signed and proven as it always was, to
+    the byte: proofs and wallets from before are read as they were.
+  - A payment is not signed that comes back as another name than it
+    was made to.
+- **Not done:** the name of who pays (`from @bob`): a wallet does
+  not say its own name yet (entry 31). Rows from before have no name.
+
 - **Seen:** `send 100 alice@me` is typed. From then on nothing says
   `alice@me`: the row in `txs` is
 
@@ -1142,6 +1166,14 @@ these had a test of its own.
   - Rows from before this have no name to show.
 
 ### 31. From an address to its name
+
+- **Done, of this:** the one who is paid says the name, and whoever
+  hears it checks it (entry 30): no list from addresses to names was
+  made, and none is needed for what is shown now. The rule that the
+  address is always shown, and a name only while it holds, is what
+  `txs` and `verify-proof` go by.
+- **Left:** the one who pays saying its own name; a name for an
+  address this wallet has had no dealing with.
 
 - **Asked:** `name NAME` says a name's address. The other way, an
   address's name, so that wherever an address is shown its name can

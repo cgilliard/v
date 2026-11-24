@@ -296,6 +296,16 @@ pub struct Slate {
     /// the wallet that is paid gave out, say. Up to
     /// [`crate::proofs::MAX_NOTE`] bytes; nothing, if nothing is said.
     pub note: Vec<u8>,
+    /// The name the payment is made to, if it is made to one: as it
+    /// was written (`@name`, or `label@name`). Whoever pays says it;
+    /// the wallet that is paid leaves it if the name is its own, and
+    /// signs for it with the rest; and takes it out if it is not. A
+    /// payment is to an address: the name is how that address was
+    /// found, kept so that the payment can be known by it.
+    pub name: Vec<u8>,
+    /// Of a name under a name: its certificate, put there by the
+    /// wallet that is paid ([`crate::subnames`]).
+    pub bundle: Vec<u8>,
     /// The receipt of the wallet that is paid: there once the slate is
     /// answered, and not before.
     pub receipt: Option<crate::proofs::Receipt>,
@@ -318,6 +328,10 @@ impl Slate {
         w.digest(&self.sender);
         w.0.push(self.note.len() as u8);
         w.0.extend_from_slice(&self.note);
+        w.0.push(self.name.len() as u8);
+        w.0.extend_from_slice(&self.name);
+        w.0.extend_from_slice(&(self.bundle.len() as u16).to_le_bytes());
+        w.0.extend_from_slice(&self.bundle);
         w.u32(self.inputs.len() as u32);
         for (pk, amount) in &self.inputs {
             w.0.extend_from_slice(&pk.to_bytes());
@@ -347,6 +361,10 @@ impl Slate {
         let sender = r.digest()?;
         let noted = r.take(1)?[0] as usize;
         let note = r.take(noted)?.to_vec();
+        let named = Some(r.take(1)?[0] as usize).filter(|n| *n <= crate::proofs::MAX_PAID_AS)?;
+        let name = r.take(named)?.to_vec();
+        let held = u16::from_le_bytes(r.take(2)?.try_into().ok()?) as usize;
+        let bundle = r.take(Some(held).filter(|n| *n <= crate::subnames::MAX_BUNDLE)?)?.to_vec();
         let n = r.len(PublicKey::SIZE + 8)?;
         let mut inputs = Vec::with_capacity(n);
         for _ in 0..n {
@@ -366,7 +384,8 @@ impl Slate {
             2 => Some(crate::proofs::Receipt::from_bytes(r.take(crate::proofs::Receipt::SIZE)?)?),
             _ => None,
         };
-        r.is_empty().then_some(Slate { id, stage, amount, fee, sender, note, receipt, inputs, outputs, change })
+        let slate = Slate { id, stage, amount, fee, sender, note, name, bundle, receipt, inputs, outputs, change };
+        r.is_empty().then_some(slate)
     }
 
     /// The slate as text to paste or keep in a file: base64 between
@@ -471,6 +490,8 @@ struct Pending {
     secret: [u8; 32],
     /// What the slate said the payment is for.
     note: Vec<u8>,
+    /// The name the payment was made to, if it was made to one.
+    name: Vec<u8>,
 }
 
 /// A payment made, or coins burned: the transaction, and what proves
@@ -553,6 +574,8 @@ impl Pending {
         w.0.extend_from_slice(&self.secret);
         w.0.push(self.note.len() as u8);
         w.0.extend_from_slice(&self.note);
+        w.0.push(self.name.len() as u8);
+        w.0.extend_from_slice(&self.name);
         w.finish()
     }
 
@@ -569,12 +592,21 @@ impl Pending {
         // (One begun before slates said who pays: with no secret, and
         // not to be finalized as it is. Given up with `cancel`.)
         if r.is_empty() {
-            return Some(Pending { inputs, change, amount, fee, secret: [0; 32], note: Vec::new() });
+            let (note, name) = (Vec::new(), Vec::new());
+            return Some(Pending { inputs, change, amount, fee, secret: [0; 32], note, name });
         }
         let secret = r.take(32)?.try_into().ok()?;
         let noted = r.take(1)?[0] as usize;
         let note = r.take(noted)?.to_vec();
-        r.is_empty().then_some(Pending { inputs, change, amount, fee, secret, note })
+        // (One begun before payments were made to names: to none.)
+        let name = match r.is_empty() {
+            true => Vec::new(),
+            false => {
+                let named = r.take(1)?[0] as usize;
+                r.take(named)?.to_vec()
+            }
+        };
+        r.is_empty().then_some(Pending { inputs, change, amount, fee, secret, note, name })
     }
 }
 
@@ -974,6 +1006,10 @@ struct Tables {
     /// list's rows, and not kept (taken up when the list is next
     /// brought up to date, which is at once).
     located: Vec<(Id, u32)>,
+    /// The names of payments made to names, for the list's rows of
+    /// them (by the id of a row: a transaction's, or an output's): not
+    /// kept, and taken up when the list is next brought up to date.
+    named: Vec<(Id, Vec<u8>)>,
     /// Payments that were seen in a block of a branch since gone from,
     /// and not again on the one gone over to: for the wallet's next
     /// look at the chain ([`Wallet::reconcile`]), and not kept.
@@ -1890,14 +1926,49 @@ impl<B: Backend> Wallet<B> {
         }
         let (id, secret) = (random_bytes::<32>()?, random_bytes::<32>()?);
         let (commitments, note) = (picked.iter().map(|c| c.commitment).collect(), note.to_vec());
-        let pending = Pending { inputs: commitments, change, amount, fee, secret, note: note.clone() };
+        let pending =
+            Pending { inputs: commitments, change, amount, fee, secret, note: note.clone(), name: Vec::new() };
         t.slates.insert(id, pending);
         self.commit(t, &[T_OUTPUTS, T_SLATES])?;
         let inputs = picked.iter().map(|c| (self.key(&c.nonce).public_key(), c.amount)).collect();
         // (Whoever pays, in the slate: this wallet's address, hashed
         // with the secret. The wallet that is paid has neither of it.)
         let (sender, change) = (crate::proofs::sender_tag(&self.id(), &secret), u32::from(change.is_some()));
-        Ok(Slate { id, stage: 1, amount, fee, sender, note, receipt: None, inputs, outputs, change })
+        let (name, bundle) = (Vec::new(), Vec::new());
+        Ok(Slate { id, stage: 1, amount, fee, sender, note, name, bundle, receipt: None, inputs, outputs, change })
+    }
+
+    /// Says of a payment just begun that it is made to `name`
+    /// (`@name`, or `label@name`: as it was written): in its slate,
+    /// for the wallet that is paid to sign for if the name is its own;
+    /// and kept with the payment, which is known by it from here on.
+    pub fn name_payment(&mut self, slate: &mut Slate, name: &[u8]) -> Result<()> {
+        if name.is_empty() || name.len() > crate::proofs::MAX_PAID_AS || slate.stage != 1 {
+            return Err(WalletError::BadSlate("not a name a payment can be made to"));
+        }
+        let mut t = self.t.clone();
+        let pending = t.slates.get_mut(&slate.id).ok_or(WalletError::Unknown)?;
+        pending.name = name.to_vec();
+        self.commit(t, &[T_SLATES])?;
+        slate.name = name.to_vec();
+        Ok(())
+    }
+
+    /// Whether `name`, as a payment is made to it (`@name`, or
+    /// `label@name`), is this wallet's own at `now`: a name it holds
+    /// that says this wallet's address; or a name under a name it has
+    /// been given, whose certificate has not run out, which is then
+    /// what shows it.
+    pub fn own_name(&self, name: &[u8], now: u64) -> Option<Vec<u8>> {
+        if let Some(name) = name.strip_prefix(b"@") {
+            let held = self.t.names.get(name)?;
+            let own = held.stage == names::NameStage::Owned && !held.transferring && held.value == self.id();
+            return own.then(Vec::new);
+        }
+        let (label, of) = crate::subnames::split(std::str::from_utf8(name).ok()?)?;
+        let held = self.t.names_held.get(&digest_to_bytes(&crate::subnames::point(label.as_bytes(), of.as_bytes())))?;
+        let expires = u64::from_le_bytes(held[8..16].try_into().ok()?);
+        (expires > now).then(|| held[16..].to_vec())
     }
 
     /// The recipient's step: adds an output for the slate's amount,
@@ -1912,6 +1983,15 @@ impl<B: Backend> Wallet<B> {
         if slate.amount < Policy::MAINNET.dust {
             return Err(WalletError::BadSlate("amount is below the dust limit"));
         }
+        // The name the payment is made to, if this wallet's own: left
+        // in the slate and signed for, with what shows it (of a name
+        // under a name, its certificate). Any other is taken out: the
+        // payment is to this wallet's address all the same, which is
+        // all that whoever pays needs it to be.
+        (slate.name, slate.bundle) = match self.own_name(&slate.name, now) {
+            Some(bundle) => (std::mem::take(&mut slate.name), bundle),
+            None => (Vec::new(), Vec::new()),
+        };
         let mut t = self.t.clone();
         let out = self.receive_in(&mut t, slate.amount, now)?;
         t.answered.insert(digest_to_bytes(&out.commitment));
@@ -1919,11 +1999,16 @@ impl<B: Backend> Wallet<B> {
         if !slate.note.is_empty() {
             t.notes.insert(digest_to_bytes(&out.commitment), slate.note.clone());
         }
+        // (And the name it was paid as, for its row in the list.)
+        if !slate.name.is_empty() {
+            t.named.push((digest_to_bytes(&out.commitment), slate.name.clone()));
+        }
         self.commit(t, &[T_OUTPUTS, T_ANSWERED, T_NOTES])?;
         // The receipt: this wallet's word, by the key its address is
         // the hash of, that the output is its own, for this slate.
         let key = self.identity_key();
-        slate.receipt = Some(crate::proofs::Receipt::sign(&key, &out, &slate.id, &slate.sender, &slate.note));
+        let (to, note, name) = (&slate.sender, &slate.note, &slate.name);
+        slate.receipt = Some(crate::proofs::Receipt::sign_as(&key, &out, &slate.id, to, note, name));
         slate.outputs.push(out);
         slate.stage = 2;
         Ok(())
@@ -1954,13 +2039,20 @@ impl<B: Backend> Wallet<B> {
         let tag = crate::proofs::sender_tag(&self.id(), &pending.secret);
         let claim = match (burn, &slate.receipt) {
             (Some(burn), _) => crate::proofs::Claim::Burn(burn),
-            (None, Some(receipt)) if receipt.verify(&made, &slate.id, &tag, &pending.note) => {
+            // (The name it comes back with is the one it was made to,
+            // or none: the wallet that is paid may decline a name, and
+            // may not answer as another.)
+            (None, Some(_)) if !slate.name.is_empty() && slate.name != pending.name => {
+                return Err(WalletError::BadSlate("answered as another name than it was made to"));
+            }
+            (None, Some(receipt)) if receipt.verify_as(&made, &slate.id, &tag, &pending.note, &slate.name) => {
                 let (secret, note, receipt) = (pending.secret, pending.note.clone(), receipt.clone());
+                let (name, bundle) = (slate.name.clone(), slate.bundle.clone());
                 // This wallet's own word that the payment is its own:
                 // kept with the receipt, for the proof.
                 let key = self.identity_key();
-                let payer = crate::proofs::Receipt::sign_as_payer(&key, &made, &slate.id, &tag, &note);
-                crate::proofs::Claim::Payment { secret, slate: slate.id, note, receipt, payer }
+                let payer = crate::proofs::Receipt::sign_as_payer_to(&key, &made, &slate.id, &tag, &note, &name);
+                crate::proofs::Claim::Payment { secret, slate: slate.id, note, name, bundle, receipt, payer }
             }
             (None, _) => return Err(WalletError::BadSlate("no receipt for this payment")),
         };
@@ -2030,6 +2122,10 @@ impl<B: Backend> Wallet<B> {
         let payment = Payment { txid: sent.txid, fee: slate.fee, created: now, proven: false, landed: None, proof };
         t.payments.insert(digest_to_bytes(&sent.txid), payment);
         t.signed(&slate.id, &digest_to_bytes(&sent.txid), is_burn);
+        // (Known by the name it was made to, where the wallet that was
+        // paid signed for it; and by nothing but its address where it
+        // did not.)
+        t.named.push((digest_to_bytes(&sent.txid), slate.name.clone()));
         t.sent.insert(digest_to_bytes(&sent.txid), sent);
         self.commit(t, &[T_OUTPUTS, T_SLATES, T_SENT, T_PAYMENTS])?;
         Ok(signed)
@@ -2596,6 +2692,16 @@ impl<B: Backend> Wallet<B> {
         let mut t = self.t.clone();
         t.located.extend(heights.iter().map(|(c, height)| (digest_to_bytes(c), *height)));
         self.commit(t, &[])
+    }
+
+    /// The address of the wallet that the payment of transaction
+    /// `txid` paid: by the receipt it signed, while the payment's
+    /// record is kept.
+    pub fn paid_to(&self, txid: &Id) -> Option<crate::hash::Digest> {
+        match &self.t.payments.get(txid)?.proof.claim {
+            crate::proofs::Claim::Payment { receipt, .. } => Some(receipt.recipient()),
+            crate::proofs::Claim::Burn(_) => None,
+        }
     }
 
     /// The row meant by `what`: its number; or the first digits, in
