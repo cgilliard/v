@@ -806,6 +806,34 @@ these had a test of its own.
 
 ### 25. The prompt recalls what was typed, and completes what is begun
 
+- **Done** (`src/terminal.rs`):
+  - The up and down arrows (and ctrl-p, ctrl-n) go through what was
+    typed before, back to the line that was being typed; the same
+    line twice running is remembered once. Kept for the run only,
+    not from one run to the next.
+  - Left, right, home, end (ctrl-a, ctrl-e), backspace and ctrl-h,
+    delete, ctrl-d on a line that is not empty, ctrl-k, ctrl-u,
+    ctrl-w, ctrl-l. A line longer than the terminal is wide goes
+    over as many rows as it needs.
+  - Tab as in bash: one thing that fits is filled in, with a space;
+    several, as far as they agree; a second tab lists them. It
+    finishes commands, the words a command knows (`txs pending`,
+    `outputs --all`, `send all`, the words of `subname`), and files,
+    for a command that takes one or a word written as a path.
+  - What the node says of the wallet while a line is being typed is
+    written above the line, which is drawn again under it.
+  - A password asked for at the prompt is not shown as it is typed.
+  - Ctrl-c ends the node as before; the terminal is put back as it
+    was however the node ends.
+- **Where:** Linux and macOS, when the node is run at a terminal.
+  Tried on Linux, through a terminal the tests cannot have, by hand;
+  the macOS settings are written from that system's layout and not
+  tried. Windows is left as it was: its console recalls and edits
+  lines itself, and has no tab here. Where input is not a terminal
+  (the tests, a script), lines are read whole as before.
+- **Not done:** the wallet's own names and addresses at a tab;
+  what was typed kept from one run to the next.
+
 - **Asked for:** the up arrow brings back the commands typed before
   (and down goes forward again), and tab completes a command begun.
 - **To settle:**

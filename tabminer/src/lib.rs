@@ -64,6 +64,7 @@ pub mod signed;
 pub mod store;
 pub mod structure;
 pub mod subnames;
+pub mod terminal;
 #[cfg(test)]
 #[path = "tests/util.rs"]
 pub(crate) mod test_util;

@@ -1164,7 +1164,9 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
             let main = Arc::clone(&main);
             move |line: &str| {
                 main.log(line);
-                if at_terminal {
+                // (Above the line being typed, if one is, which is
+                // then drawn again under it.)
+                if at_terminal && !tabminer::terminal::say(line) {
                     use std::io::Write;
                     let _ = write!(std::io::stderr(), "\r{line}\n> ");
                 }
@@ -1343,47 +1345,29 @@ fn open_wallet(
 /// each; until told to stop, or there is no more to read, when the node
 /// ends.
 fn prompt(console: &Console<FileBackend, FileBackend>, main: &Logger) {
-    let mut line = String::new();
-    loop {
-        print!("> ");
-        let _ = std::io::stdout().flush();
-        line.clear();
-        match std::io::stdin().lock().read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
+    // (Edited as it is typed, where the terminal lets it be: what was
+    // typed before is brought back with the arrows, and a word begun
+    // is finished with tab.)
+    let mut terminal = tabminer::terminal::Prompt::new(Box::new(tabminer::console::complete));
+    while let Ok(Some(line)) = terminal.read("> ") {
         match console.run(&line) {
             Reply::Said(text) => println!("{text}"),
             Reply::Wrong(text) => println!("error: {text}"),
             Reply::Nothing => {}
             // The wallet's password, asked for and typed here: it is
-            // no part of a command, and is kept by nothing.
+            // no part of a command, is not shown as it is typed, and
+            // is kept by nothing.
             Reply::Password => {
-                print!("Wallet password: ");
-                let _ = std::io::stdout().flush();
-                line.clear();
-                match std::io::stdin().lock().read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                match console.seed(line.trim_end_matches(['\n', '\r'])) {
+                let Ok(Some(password)) = terminal.read_secret("Wallet password: ") else { break };
+                match console.seed(&password) {
                     Ok(text) => println!("{text}"),
                     Err(text) => println!("error: {text}"),
                 }
-                line.clear();
             }
             // The wallet's password, changed: the one it has, and the
             // new one twice.
             Reply::NewPassword => {
-                let ask = |asking: &str| -> Option<String> {
-                    print!("{asking}");
-                    let _ = std::io::stdout().flush();
-                    let mut typed = String::new();
-                    match std::io::stdin().lock().read_line(&mut typed) {
-                        Ok(0) | Err(_) => None,
-                        Ok(_) => Some(typed.trim_end_matches(['\n', '\r']).to_string()),
-                    }
-                };
+                let mut ask = |asking: &str| terminal.read_secret(asking).ok().flatten();
                 let old = match console.locked() {
                     true => ask("Wallet password: "),
                     false => Some(String::new()),

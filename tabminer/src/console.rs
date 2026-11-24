@@ -151,6 +151,116 @@ pub const HELP: &str = "commands:
 
 /// What is said after a payment sent has been taken back, and after one
 /// has been sped up.
+/// The commands there are, by name: for what is said of one given
+/// what it does not take, and for finishing one begun
+/// ([`complete`]).
+pub const COMMANDS: &[&str] = &[
+    "address",
+    "balance",
+    "bump",
+    "burn",
+    "burn-proof",
+    "cancel",
+    "consensus",
+    "exit",
+    "fees",
+    "finalize",
+    "help",
+    "leaves",
+    "mempool",
+    "mining",
+    "name",
+    "name-commit",
+    "name-offer",
+    "name-reveal",
+    "name-transfer",
+    "name-update",
+    "names",
+    "outputs",
+    "password",
+    "payment-proof",
+    "payments",
+    "peers",
+    "prune",
+    "quit",
+    "receive",
+    "relays",
+    "resend",
+    "scan",
+    "seed",
+    "send",
+    "send-file",
+    "set-leaf",
+    "set-leaf-value",
+    "status",
+    "subname",
+    "subnames",
+    "supply",
+    "txs",
+    "verify-proof",
+];
+
+/// The commands whose words may be a file's name.
+const OF_FILES: &[&str] = &[
+    "burn-proof",
+    "finalize",
+    "name-offer",
+    "name-transfer",
+    "payment-proof",
+    "receive",
+    "send-file",
+    "set-leaf",
+    "subname",
+    "verify-proof",
+];
+
+/// What the word being typed could be, for whoever finishes it at a
+/// tab ([`crate::terminal`]): given the line up to the cursor, where
+/// its last word begins (in characters) and what that word could be.
+/// The first word is a command; a later one is a word the command
+/// knows (`txs pending`), or, of a command that takes a file or where
+/// the word is written as a path, a file there is.
+pub fn complete(before: &str) -> (usize, Vec<String>) {
+    let begins = before.rfind(' ').map_or(0, |at| at + 1);
+    let (from, word) = (before[..begins].chars().count(), &before[begins..]);
+    let mut words = before[..begins].split_whitespace();
+    let Some(command) = words.next() else {
+        let fit = COMMANDS.iter().filter(|c| c.starts_with(word)).map(|c| c.to_string()).collect();
+        return (from, fit);
+    };
+    let known: &[&str] = match (command, words.count()) {
+        ("txs", 0) => &["pending", "mined", "--all"],
+        ("txs", 1) | ("outputs", 0) => &["--all"],
+        ("send" | "send-file", 0) => &["all"],
+        ("subname", 0) => &["set", "delegate", "signer", "del", "drop"],
+        _ => &[],
+    };
+    let mut fit: Vec<String> = known.iter().filter(|k| k.starts_with(word)).map(|k| k.to_string()).collect();
+    let path = word.contains('/') || word.starts_with('.') || word.starts_with('~');
+    if path || (OF_FILES.contains(&command) && fit.is_empty()) {
+        // The files of the directory the word is in, that begin as it
+        // does: each as the word would be written, a directory with
+        // its stroke. (Those whose names begin with a dot only if the
+        // word does.)
+        let (dir, begun) = word.rfind('/').map_or(("", word), |at| word.split_at(at + 1));
+        let home = std::env::var("HOME").unwrap_or_default();
+        let read = match dir {
+            "" => ".".to_string(),
+            dir if dir.starts_with("~/") && !home.is_empty() => format!("{home}/{}", &dir[2..]),
+            dir => dir.to_string(),
+        };
+        for entry in std::fs::read_dir(read).into_iter().flatten().flatten() {
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            // (A name with a space in it cannot be said at the prompt.)
+            if name.starts_with(begun) && (begun.starts_with('.') || !name.starts_with('.')) && !name.contains(' ') {
+                let stroke = if entry.file_type().is_ok_and(|t| t.is_dir()) { "/" } else { "" };
+                fit.push(format!("{dir}{name}{stroke}"));
+            }
+        }
+    }
+    (from, fit)
+}
+
 /// Rows `txs` lists, the last of them, unless all are asked for.
 const TXS_SHOWN: usize = 30;
 
@@ -430,14 +540,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             ("name-transfer", [file]) => self.name_transfer(file, None),
             ("name-transfer", [file, fee]) => self.name_transfer(file, Some(fee)),
             ("scan", []) => self.scan(),
-            (
-                "send" | "status" | "peers" | "mempool" | "fees" | "leaves" | "set-leaf" | "set-leaf-value"
-                | "consensus" | "balance" | "address" | "outputs" | "send-file" | "receive" | "finalize" | "cancel"
-                | "bump" | "resend" | "prune" | "seed" | "password" | "scan" | "help" | "quit" | "txs" | "supply"
-                | "relays" | "exit" | "names" | "name" | "name-commit" | "name-reveal" | "name-update" | "name-offer"
-                | "name-transfer" | "mining" | "payments" | "payment-proof" | "burn-proof" | "verify-proof" | "burn",
-                _,
-            ) => Err(format!("{command}: not what it takes (see help)")),
+            (known, _) if COMMANDS.contains(&known) => Err(format!("{command}: not what it takes (see help)")),
             _ => Err(format!("{command}: no such command (see help)")),
         };
         match said {
@@ -2617,6 +2720,49 @@ mod tests {
         assert!(said(paid, &format!("receive {slate}")).contains("answered"));
         let signed = said(payer, &format!("finalize {slate}.received"));
         signed.split("transaction ").nth(1).unwrap()[..8].to_string()
+    }
+
+    /// A word begun at the prompt is finished: a command; a word a
+    /// command knows; a file, for a command that takes one or a word
+    /// written as a path. And every command there is, is one that
+    /// could be meant.
+    #[test]
+    fn what_is_begun_at_the_prompt_could_be() {
+        let could = |before: &str| {
+            let (from, mut fit) = complete(before);
+            fit.sort();
+            (from, fit.join(" "))
+        };
+        assert_eq!(could("sta"), (0, "status".to_string()));
+        assert_eq!(could("send"), (0, "send send-file".to_string()));
+        assert_eq!(could("zz"), (0, String::new()));
+        assert_eq!(complete("").1.len(), COMMANDS.len());
+        assert_eq!(could("txs "), (4, "--all mined pending".to_string()));
+        assert_eq!(could("txs p"), (4, "pending".to_string()));
+        assert_eq!(could("txs mined -"), (10, "--all".to_string()));
+        assert_eq!(could("outputs "), (8, "--all".to_string()));
+        assert_eq!(could("send a"), (5, "all".to_string()));
+        assert_eq!(could("status x"), (7, String::new()));
+        // Files: of the directory the word is in.
+        let dir = std::env::temp_dir().join(format!("tabminer-complete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for name in ["pay.slate", "pay.slate.received", ".hidden", "a b"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let at = dir.display().to_string();
+        assert_eq!(could(&format!("receive {at}/p")), (8, format!("{at}/pay.slate {at}/pay.slate.received")));
+        assert_eq!(could(&format!("receive {at}/")), (8, format!("{at}/pay.slate {at}/pay.slate.received {at}/sub/")));
+        assert_eq!(could(&format!("status {at}/s")), (7, format!("{at}/sub/")));
+        assert_eq!(could(&format!("receive {at}/.")), (8, format!("{at}/.hidden")));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Every command is known to the prompt as one: given what it
+        // does not take, it says so, and not that there is none.
+        let (_desk, payer, _) = funded("commands");
+        for command in COMMANDS {
+            let said = payer.run(&format!("{command} a b c d e f g h"));
+            assert!(!matches!(&said, Reply::Wrong(text) if text.ends_with("no such command (see help)")), "{command}");
+        }
     }
 
     /// A payment sent is sped up and taken back while no block has it;
