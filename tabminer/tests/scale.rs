@@ -191,10 +191,8 @@ impl Node {
     /// megabytes: from the lines of its stat log.
     fn peak_heap(&self) -> u64 {
         let log = std::fs::read_to_string(self.dir.join("stat.log")).unwrap_or_default();
-        // (The column sixth from the last: after it come the peers, the
-        // height and the blocks.)
-        let peak = |l: &str| l.split_whitespace().rev().nth(5)?.replace(',', "").parse::<u64>().ok();
-        log.lines().filter_map(peak).max().unwrap_or(0)
+        let Some(names) = log.lines().find(|l| l.starts_with("Uptime:")) else { return 0 };
+        log.lines().filter_map(|l| column(names, l, "PeakHeapMB")).max().unwrap_or(0)
     }
 
     /// Says what the node used: memory, and disk.
@@ -207,6 +205,16 @@ impl Node {
         }
         report(test, &format!("{who}_disk_mb"), dir_size(&self.dir) / 1_000_000);
     }
+}
+
+/// What a line of the stats log says under the column `name`: the
+/// columns' names are the last word of the log's line of names
+/// (`header`), and a line's last words are their values.
+fn column(header: &str, line: &str, name: &str) -> Option<u64> {
+    let names: Vec<&str> = header.split_whitespace().last()?.split('_').filter(|n| !n.is_empty()).collect();
+    let at = names.iter().position(|n| *n == name)?;
+    let values: Vec<&str> = line.split_whitespace().collect();
+    values.get(values.len().checked_sub(names.len())? + at)?.replace(',', "").parse().ok()
 }
 
 /// The seconds a line says after `label` (`applied in 0.427s`).

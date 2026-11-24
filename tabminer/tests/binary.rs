@@ -169,6 +169,16 @@ fn a_node_starts_says_it_is_ready_and_ends_when_told() {
     let _ = std::fs::remove_dir_all(&other);
 }
 
+/// What a line of the stats log says under the column `name`: the
+/// columns' names are the last word of the log's line of names
+/// (`header`), and a line's last words are their values.
+fn column(header: &str, line: &str, name: &str) -> Option<u64> {
+    let names: Vec<&str> = header.split_whitespace().last()?.split('_').filter(|n| !n.is_empty()).collect();
+    let at = names.iter().position(|n| *n == name)?;
+    let values: Vec<&str> = line.split_whitespace().collect();
+    values.get(values.len().checked_sub(names.len())? + at)?.replace(',', "").parse().ok()
+}
+
 /// Two nodes of the dev network, each making blocks and each told of
 /// the other: both chains grow, each takes the other's blocks, and
 /// they are of one mind. Every block carries the chain's proof, which
@@ -203,9 +213,9 @@ fn two_nodes_make_blocks_and_take_each_others() {
     let last = |i: usize| -> Option<(u64, u64, u64)> {
         let stats = std::fs::read_to_string(dirs[i].join("stat.log")).ok()?;
         let whole = stats.lines().rev().find(|l| l.starts_with('['))?;
-        let n: Vec<u64> = whole[26..].split_whitespace().map(|n| n.replace(',', "").parse().unwrap_or(0)).collect();
-        // (The last columns: Height, Blocks, Refetched, Mined.)
-        Some((n[n.len() - 4], n[n.len() - 3], n[n.len() - 1]))
+        let names = stats.lines().find(|l| l.starts_with("Uptime:"))?;
+        let of = |name: &str| column(names, whole, name);
+        Some((of("Height")?, of("Blocks")?, of("Mined")?))
     };
     // Until each has made blocks, and holds more than it made.
     let began = Instant::now();
@@ -233,10 +243,15 @@ fn two_nodes_make_blocks_and_take_each_others() {
         // (Not of the first block, which one of them may have had from the
         // other before its own was proven.)
         let told = ["] Proving block ", "] Mining block ", ": proved in ", "] Won block ", " hashes in "];
-        let told = told.into_iter().chain(["] Received block ", " bytes from 127.0.0.1:"]);
+        let told = told.into_iter().chain(["] Received block "]);
         for said in told.chain(["] Peer 127.0.0.1:", " connected (height "]) {
             assert!(main.contains(said), "{said}: {main}");
         }
+        // (The other's blocks joined its chain one at a time, or, where
+        // both had made a block on the same one, by going over to the
+        // other's branch.)
+        let joined = [" bytes from 127.0.0.1:", "] Reorganized to block "];
+        assert!(joined.iter().any(|said| main.contains(said)), "{main}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
