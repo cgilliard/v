@@ -1043,6 +1043,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             Stage::Replaced => format!("replaced by {}", row.by),
             Stage::Orphaned => "orphaned".to_string(),
             Stage::Remake => "to be made again".to_string(),
+            Stage::Failed => "failed".to_string(),
         };
         // The block: of an output, the one the chain says made it; of a
         // transaction, the height at which it was seen to be in.
@@ -2034,7 +2035,9 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 Err("a block has it: a commit cannot be cancelled. Left unrevealed, it is swept later".into())
             }
             (_, Stage::Confirmed) => Err(landed.into()),
-            (_, Stage::Cancelled | Stage::Replaced | Stage::Orphaned) => Err(format!("row {n} is done with already")),
+            (_, Stage::Cancelled | Stage::Replaced | Stage::Orphaned | Stage::Failed) => {
+                Err(format!("row {n} is done with already"))
+            }
             // A reveal that has been sent has said its name.
             (Kind::NameReveal, _) if !sure => Err(format!(
                 "the reveal has been sent, and has said the name: taking it back does not unsay it, \

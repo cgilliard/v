@@ -1047,6 +1047,15 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                         commas(did.names as u64)
                     ));
                 }
+                // A reveal given up because its commit is no longer in
+                // the chain is said, once.
+                for name in wallet.lock().unwrap_or_else(|e| e.into_inner()).take_failed_reveals() {
+                    main.log(&format!(
+                        "Error: the reveal of {name} failed: its commit is no longer where it was in the chain. \
+                         The name is committed to and not revealed again (see names); it has been said, \
+                         and another may commit to it first"
+                    ));
+                }
                 // What a reorganization took from the wallet, and gave
                 // back, is said.
                 if let Ok(did) = &followed {
@@ -1056,6 +1065,11 @@ fn run(c: &Configuration, main_log: &mut Option<Arc<Logger>>) -> Result<std::con
                         (c.lost, "outputs are in no block any more: orphaned, unless a block makes them again"),
                         (c.returned, "outputs that were orphaned are in the chain again"),
                         (c.forgotten, "outputs orphaned for too long are forgotten"),
+                        (
+                            c.stranded,
+                            "payments sent spent what is in no block any more: no block will have them; \
+                             to be made again (see txs)",
+                        ),
                     ] {
                         if n > 0 {
                             main.log(&format!("The wallet: {n} {what}"));

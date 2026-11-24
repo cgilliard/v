@@ -755,6 +755,9 @@ pub struct Reconciled {
     pub returned: usize,
     /// Outputs lost for so long that they are forgotten.
     pub forgotten: usize,
+    /// Payments sent that no block has, whose inputs are in no block
+    /// any more: they spend nothing, and are to be made again.
+    pub stranded: usize,
 }
 
 /// A signed transaction and, for every input whose last signature it was,
@@ -971,6 +974,10 @@ struct Tables {
     /// list's rows, and not kept (taken up when the list is next
     /// brought up to date, which is at once).
     located: Vec<(Id, u32)>,
+    /// Payments that were seen in a block of a branch since gone from,
+    /// and not again on the one gone over to: for the wallet's next
+    /// look at the chain ([`Wallet::reconcile`]), and not kept.
+    unlanded: Vec<Id>,
     /// How many of the list's first rows are at rest: done with, and
     /// not looked at again when the list is brought up to date. Not
     /// kept: found again as the list is gone through.
@@ -1151,6 +1158,10 @@ pub struct Wallet<B: Backend> {
     min_confirmations: u32,
     /// The logs of the outputs and of the list, as they are on disk.
     logs: [journal::Log; 2],
+    /// The names whose reveals the wallet gave up since this was last
+    /// asked for, their commits being no longer in the chain: to be
+    /// said to whoever keeps the wallet ([`Wallet::take_failed_reveals`]).
+    reveals_failed: Vec<String>,
 }
 
 impl<B: Backend> Wallet<B> {
@@ -1177,7 +1188,8 @@ impl<B: Backend> Wallet<B> {
         };
         let logs = Self::logs(&records)?;
         let min_confirmations = MIN_CONFIRMATIONS;
-        Ok((Wallet { records, master: master_of(&secret.seed), t, min_confirmations, logs }, created))
+        let reveals_failed = Vec::new();
+        Ok((Wallet { records, master: master_of(&secret.seed), t, min_confirmations, logs, reveals_failed }, created))
     }
 
     /// [`Wallet::open_with`], with no password asked for or given.
@@ -1206,7 +1218,8 @@ impl<B: Backend> Wallet<B> {
         t.address = (u64::from_le_bytes(drawn) >> 4).max(1);
         records.write(&[(T_META, &t.encode(T_META)), (T_ADDRESS, &t.encode(T_ADDRESS))])?;
         let logs = Self::logs(&records)?;
-        Ok(Wallet { records, master: master_of(&secret.seed), t, min_confirmations: MIN_CONFIRMATIONS, logs })
+        let (min_confirmations, reveals_failed) = (MIN_CONFIRMATIONS, Vec::new());
+        Ok(Wallet { records, master: master_of(&secret.seed), t, min_confirmations, logs, reveals_failed })
     }
 
     /// Puts `t` in place of what the wallet keeps: the tables `dirty` on
@@ -1476,7 +1489,15 @@ impl<B: Backend> Wallet<B> {
         end: u64,
     ) -> Result<usize> {
         let mut t = self.t.clone();
-        let (mut found, mut paid) = (0, 0);
+        let (mut found, mut paid, mut signed) = (0, 0, 0);
+        // (A payment seen in a block of this height or above was seen
+        // on a branch gone from, if it is not seen again from here.)
+        let gone: Vec<Id> = t.landed.iter().filter(|(_, at)| **at >= height).map(|(txid, _)| *txid).collect();
+        for txid in gone {
+            t.landed.remove(&txid);
+            t.unlanded.push(txid);
+            signed += 1;
+        }
         for (i, c) in outputs.iter().enumerate() {
             let id = digest_to_bytes(c);
             if let Some(o) = t.outputs.get_mut(&id) {
@@ -1484,6 +1505,19 @@ impl<B: Backend> Wallet<B> {
                 t.answered.remove(&id);
                 t.located.push((id, height));
                 found += 1;
+            }
+            // A transaction this wallet signed that makes this output
+            // is in this block: every transaction makes one at the
+            // least, so this is how it is known to be in a block at
+            // all. (That what it spent is no longer unspent does not
+            // say so: it may have been undone.)
+            let makes = |sent: &&Sent| sent.tx.outputs.iter().any(|o| o.commitment == *c);
+            let landed: Vec<Id> = t.sent.iter().filter(|(_, sent)| makes(sent)).map(|(txid, _)| *txid).collect();
+            for txid in landed {
+                t.landed.insert(txid, height);
+                t.lost.remove(&txid);
+                t.unlanded.retain(|was| *was != txid);
+                signed += 1;
             }
             // An output this wallet paid for, or burned: where it is,
             // for its proof. (Of a block other than it was in before,
@@ -1512,6 +1546,9 @@ impl<B: Backend> Wallet<B> {
         }
         if paid > 0 {
             dirty.push(T_PAYMENTS);
+        }
+        if signed > 0 {
+            dirty.extend([T_LANDED, T_LOST]);
         }
         self.commit(t, &dirty)?;
         Ok(found)
@@ -2529,6 +2566,13 @@ impl<B: Backend> Wallet<B> {
         self.t.list.get((number as usize).checked_sub(1)?)
     }
 
+    /// The names whose reveals the wallet has given up since this was
+    /// last asked, because their commits were no longer where the
+    /// reveals said: each is committed to and not revealed again.
+    pub fn take_failed_reveals(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.reveals_failed)
+    }
+
     /// The outputs that have a row in the list, lie in the chain, and
     /// whose row does not say which block made them, with where each
     /// lies: those found by looking through the unspent outputs, not
@@ -2669,7 +2713,10 @@ impl<B: Backend> Wallet<B> {
     ) -> Result<Reconciled> {
         let mut t = self.t.clone();
         let mut did = Reconciled::default();
-        let mut changed = false;
+        let (mut changed, mut outputs_changed) = (false, false);
+        // (Those that a branch gone from had, and this one has not.)
+        let unlanded = std::mem::take(&mut t.unlanded);
+        outputs_changed |= !unlanded.is_empty();
         for (id, sent) in &self.t.sent {
             let mut held = false;
             for c in &sent.inputs {
@@ -2678,7 +2725,33 @@ impl<B: Backend> Wallet<B> {
                 }
             }
             match (held, t.landed.get(id).copied()) {
-                (false, None) => drop(t.landed.insert(*id, height)),
+                // What it spent is no longer unspent, and no block was
+                // seen to make what it makes. Where the blocks were not
+                // gone through one by one, that is how a payment in a
+                // block looks, and it is taken for one. Where they
+                // were, what it spent has been undone: no block has
+                // it, and none will while that is so. Kept as it is for
+                // as long as the chain may go back, then let go of.
+                (false, None) if undone_from == Some(0) => drop(t.landed.insert(*id, height)),
+                (false, None) => match t.lost.get(id).copied() {
+                    None => {
+                        t.lost.insert(*id, height);
+                        did.stranded += 1;
+                    }
+                    Some(at) if height >= at.saturating_add(depth) => {
+                        t.lost.remove(id);
+                        let txid = sent.txid;
+                        Self::unsend_in(&mut t, &txid);
+                        outputs_changed = true;
+                    }
+                    Some(_) => continue,
+                },
+                // (What it spent is there again: to be mined, or made
+                // again if it lies elsewhere.)
+                (true, None) if t.lost.remove(id).is_some() => {}
+                // (In a block that was undone, and what it spent is
+                // unspent again: to be mined again.)
+                (true, None) if unlanded.contains(id) => did.undone += 1,
                 (false, Some(at)) if height >= at.saturating_add(depth) => {
                     t.sent.remove(id);
                     t.landed.remove(id);
@@ -2722,8 +2795,8 @@ impl<B: Backend> Wallet<B> {
             }
             changed = true;
         }
-        if changed {
-            self.commit(t, &[T_OUTPUTS, T_SENT, T_ANSWERED, T_LANDED, T_LOST])?;
+        if changed || outputs_changed {
+            self.commit(t, &[T_OUTPUTS, T_SENT, T_ANSWERED, T_LANDED, T_LOST, T_PAYMENTS])?;
         }
         Ok(did)
     }

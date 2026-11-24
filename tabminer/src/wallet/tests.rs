@@ -219,10 +219,11 @@ fn a_payment_is_agreed_by_slate() {
         Balance { confirmed: (70 * COIN - fee) as u128, spendable: (70 * COIN - fee) as u128, ..Default::default() }
     );
     assert_eq!(b, Balance { confirmed: 30 * COIN as u128, spendable: 30 * COIN as u128, ..Default::default() });
-    // (Once its block is deep enough to rely on.)
-    assert_eq!((alice.reconcile(&chain, 10, 5, Some(0)).unwrap(), alice.sent().len()), (Reconciled::default(), 1));
+    // (Once its block, the first of these tests' chain, is deep
+    // enough to rely on.)
+    assert_eq!((alice.reconcile(&chain, 5, 5, Some(0)).unwrap(), alice.sent().len()), (Reconciled::default(), 1));
     assert!(alice.unconfirmed(&chain).unwrap().is_empty());
-    assert_eq!(alice.reconcile(&chain, 15, 5, Some(0)).unwrap(), Reconciled { settled: 1, ..Default::default() });
+    assert_eq!(alice.reconcile(&chain, 6, 5, Some(0)).unwrap(), Reconciled { settled: 1, ..Default::default() });
     assert!(alice.sent().is_empty());
     // And all of it is there when the files are opened again.
     assert_eq!(reopened(&alice, "").unwrap().balance(&chain).unwrap(), a);
@@ -385,7 +386,6 @@ fn a_payment_sent_is_cancelled_or_sped_up() {
     // In a block: the wallet has it all but the fee, once what was
     // never made is forgotten; and the recipient has nothing.
     chain.take(&back.tx, &mut [&mut alice, &mut bob]);
-    alice.reconcile(&chain, 1, 0, Some(0)).unwrap();
     assert_eq!(alice.reconcile(&chain, 1, 0, Some(0)).unwrap().settled, 1);
     assert!(alice.balance(&chain).unwrap().pending > 0);
     assert_eq!(alice.prune_pending(&chain, &[]).unwrap(), 2);
@@ -1038,4 +1038,135 @@ fn what_is_written_a_change_at_a_time_is_what_is_read() {
         }
     }
     assert!(wallet.list().len() > 40 && bob.list().len() > 20);
+}
+
+/// A reveal is sent, and before a block has it the chain goes over to
+/// a branch on which its commit is not where the reveal says: not
+/// there at all, or made again elsewhere. No block will take that
+/// reveal. The wallet gives it up of itself: the name is committed to
+/// and not revealed, as before; what the reveal was to spend is free;
+/// its row says it failed; and whoever keeps the wallet is told, once.
+/// With the commit in the chain again, the name is revealed from where
+/// it now is.
+#[test]
+fn a_reveal_whose_commit_is_undone_is_given_up() {
+    use super::list::{Kind, Stage};
+    use names::NameStage;
+    let mut chain = Outputs::default();
+    let mut names = Names::default();
+    let mut alice = new();
+    let funds: Vec<Output> = (0..4).map(|_| alice.receive(10 * COIN, NOW).unwrap()).collect();
+    chain.make(&funds, &mut [&mut alice]);
+    let all = alice.balance(&chain).unwrap().confirmed;
+    // Committed to, in a block; revealed, in none.
+    let op = alice.name_commit(b"alice", d(1), NOW).unwrap();
+    let commit = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    names.take(&commit.tx, 10);
+    chain.take(&commit.tx, &mut [&mut alice]);
+    let op = alice.name_reveal(b"alice", 0, 3, &names, 13, NOW).unwrap();
+    let reveal = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    assert_eq!(alice.sync_names(&names).unwrap(), 0);
+    assert_eq!(alice.owned_name(b"alice").unwrap().stage, NameStage::Revealed);
+    let row = |w: &Wallet<MemBackend>, kind: Kind| w.list().iter().rev().find(|r| r.kind == kind).unwrap().stage;
+    assert_eq!(row(&alice, Kind::NameReveal), Stage::Pooled);
+    let locked = alice.balance(&chain).unwrap().locked;
+    assert!(locked > 0);
+
+    // The commit is made elsewhere on the branch gone over to.
+    let was = names.commits[0].2;
+    names.commits[0].2 = was + 7;
+    assert_eq!(alice.sync_names(&names).unwrap(), 1);
+    assert!(alice.owned_name(b"alice").is_none() && alice.pending_commits().len() == 1);
+    assert_eq!(row(&alice, Kind::NameReveal), Stage::Failed);
+    assert_eq!(alice.take_failed_reveals(), ["alice"]);
+    assert!(alice.take_failed_reveals().is_empty());
+    assert!(alice.sent().iter().all(|s| s.txid != reveal.tx.txid()));
+    assert_eq!(alice.balance(&chain).unwrap().locked, 0);
+    // Nothing more comes of looking again.
+    assert_eq!(alice.sync_names(&names).unwrap(), 0);
+    // Revealed again, from where the commit now is; and mined.
+    let op = alice.name_reveal(b"alice", 0, 3, &names, 20, NOW).unwrap();
+    assert!(matches!(&op, crate::name::NameOp::Reveal { commit, .. } if *commit == was + 7));
+    let again = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    assert_eq!(row(&alice, Kind::NameReveal), Stage::Pooled);
+
+    // The commit is on no branch at all now: given up again, and the
+    // commit stays the wallet's to reveal should it come back.
+    let undone = names.commits.remove(0);
+    assert_eq!(alice.sync_names(&names).unwrap(), 1);
+    assert_eq!((row(&alice, Kind::NameReveal), alice.take_failed_reveals().len()), (Stage::Failed, 1));
+    assert!(
+        matches!(alice.name_reveal(b"alice", 0, 3, &names, 30, NOW), Err(WalletError::Name(m)) if m.contains("not on chain"))
+    );
+    assert!(alice.sent().iter().all(|s| s.txid != again.tx.txid()));
+    names.commits.push(undone);
+    let op = alice.name_reveal(b"alice", 0, 3, &names, 30, NOW).unwrap();
+    let last = alice.carry(vec![op], None, &chain, NOW).unwrap();
+    names.take(&last.tx, 30);
+    chain.take(&last.tx, &mut [&mut alice]);
+    assert_eq!(alice.sync_names(&names).unwrap(), 1);
+    assert_eq!(alice.owned_name(b"alice").unwrap().stage, NameStage::Owned);
+    assert_eq!(row(&alice, Kind::NameReveal), Stage::Confirmed);
+    // A reveal that a block has is never given up, wherever its commit
+    // is said to be afterwards (it is spent).
+    assert_eq!(alice.sync_names(&names).unwrap(), 0);
+    // And nothing was lost by any of it but the fees of what was mined.
+    let fees = (commit.tx.balance() + last.tx.balance()) as u128;
+    assert_eq!(alice.balance(&chain).unwrap().confirmed + fees, all);
+}
+
+/// A payment is signed and, before a block has it, the chain goes over
+/// to a branch that never made what it spends. That its input is no
+/// longer unspent does not make it a payment a block has: no block was
+/// seen to make what it makes. The list says it is to be made again;
+/// if what it spent comes back it is a payment to be mined again; and
+/// if not, the wallet lets go of it when the chain is past going back.
+#[test]
+fn a_payment_whose_input_is_undone_is_not_taken_for_mined() {
+    use super::list::{Kind, Stage};
+    let mut chain = Outputs::default();
+    let mut alice = funded(&mut chain, 100 * COIN);
+    let mut bob = new();
+    let mut slate = alice.send(30 * COIN, None, &chain, NOW).unwrap();
+    bob.receive_slate(&mut slate, NOW).unwrap();
+    let signed = alice.finalize(&slate, NOW).unwrap();
+    let stage = |w: &Wallet<MemBackend>| w.list().iter().find(|r| r.kind == Kind::Sent).unwrap().stage;
+    assert_eq!(stage(&alice), Stage::Pooled);
+
+    // The block that made her output is undone; the blocks of the
+    // other branch are gone through, and make nothing of hers.
+    chain.0[0].3 = false;
+    alice.locate(0, &[], 1, &[9; 32], 0).unwrap();
+    let did = alice.reconcile(&chain, 5, 10, None).unwrap();
+    assert_eq!(did, Reconciled { stranded: 1, ..Default::default() });
+    assert_eq!(stage(&alice), Stage::Remake);
+    assert_eq!(alice.reconcile(&chain, 6, 10, None).unwrap(), Reconciled::default());
+    assert_eq!(alice.sent().len(), 1);
+    // It comes back: a payment like any other that no block has.
+    chain.0[0].3 = true;
+    alice.reconcile(&chain, 7, 10, None).unwrap();
+    assert_eq!(stage(&alice), Stage::Pooled);
+    // Undone again, and for good: let go of when the chain is past
+    // going back, with what it was to spend and what it was to make.
+    chain.0[0].3 = false;
+    assert_eq!(alice.reconcile(&chain, 8, 10, None).unwrap().stranded, 1);
+    assert_eq!(alice.reconcile(&chain, 17, 10, None).unwrap(), Reconciled::default());
+    assert_eq!((alice.sent().len(), stage(&alice)), (1, Stage::Remake));
+    alice.reconcile(&chain, 18, 10, None).unwrap();
+    assert!(alice.sent().is_empty() && alice.payments().is_empty());
+    assert_eq!(stage(&alice), Stage::Cancelled);
+    // What it holds is what the chain holds: nothing.
+    alice.prune_pending(&chain, &[]).unwrap();
+    assert_eq!(alice.balance(&chain).unwrap(), Balance::default());
+    // And mined, it is known by what it makes: on another chain, where
+    // the block that has it is seen.
+    let mut chain = Outputs::default();
+    let mut carol = funded(&mut chain, 100 * COIN);
+    let mut slate = carol.send(30 * COIN, None, &chain, NOW).unwrap();
+    bob.receive_slate(&mut slate, NOW).unwrap();
+    let signed_too = carol.finalize(&slate, NOW).unwrap();
+    chain.take(&signed_too.tx, &mut [&mut carol]);
+    assert_eq!(carol.reconcile(&chain, 2, 10, None).unwrap(), Reconciled::default());
+    assert_eq!(stage(&carol), Stage::Confirmed);
+    let _ = signed;
 }

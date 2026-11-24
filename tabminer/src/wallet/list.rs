@@ -58,8 +58,12 @@ pub enum Stage {
     Replaced,
     /// In a block that was undone.
     Orphaned,
-    /// Signed for outputs that lie elsewhere now: to be made again.
+    /// Signed for outputs that lie elsewhere now, or are in no block
+    /// any more: to be made again.
     Remake,
+    /// Given up by the wallet itself: no block could have had it (a
+    /// reveal whose commit is no longer in the chain).
+    Failed,
 }
 
 const KINDS: [Kind; 10] = [
@@ -74,8 +78,16 @@ const KINDS: [Kind; 10] = [
     Kind::Cancel,
     Kind::Bump,
 ];
-const STAGES: [Stage; 7] =
-    [Stage::Begun, Stage::Pooled, Stage::Confirmed, Stage::Cancelled, Stage::Replaced, Stage::Orphaned, Stage::Remake];
+const STAGES: [Stage; 8] = [
+    Stage::Begun,
+    Stage::Pooled,
+    Stage::Confirmed,
+    Stage::Cancelled,
+    Stage::Replaced,
+    Stage::Orphaned,
+    Stage::Remake,
+    Stage::Failed,
+];
 
 /// A row of the list.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -241,6 +253,14 @@ impl Tables {
         }
     }
 
+    /// The transaction `txid` is given up by the wallet itself, since
+    /// no block could have it: its row says so from here on.
+    pub(super) fn failed(&mut self, txid: &Id) {
+        if let Some(at) = self.row_of(txid) {
+            self.list[at].stage = Stage::Failed;
+        }
+    }
+
     /// The transaction `new` was signed in the place of `old`, to take
     /// it back or to speed it up: a row of its own, and the old one's
     /// says which took its place.
@@ -331,13 +351,15 @@ pub(super) fn relist(t: &mut Tables) -> bool {
                     Some(at) => (Stage::Confirmed, if row.height > 0 { row.height } else { *at }),
                     None => {
                         // Signed for where its outputs lay: if one lies
-                        // elsewhere now, it spends nothing.
+                        // elsewhere now, it spends nothing; nor if what
+                        // it was to spend is in no block any more.
                         let at = sent.tx.spent_positions();
                         let moved = sent.inputs.iter().zip(&at).any(|(c, signed)| {
                             let now = t.outputs.get(&digest_to_bytes(c)).and_then(|o| o.position);
                             now.is_some_and(|now| now != *signed)
                         });
-                        (if moved { Stage::Remake } else { Stage::Pooled }, 0)
+                        let stranded = t.lost.contains_key(&row.txid);
+                        (if moved || stranded { Stage::Remake } else { Stage::Pooled }, 0)
                     }
                 },
                 // (No record of it any more: given up before it was

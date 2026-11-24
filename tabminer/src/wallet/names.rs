@@ -502,6 +502,7 @@ impl<B: Backend> Wallet<B> {
             return Ok(0);
         }
         let (mut changed, mut gave_up) = (0, false);
+        let mut failed: Vec<String> = Vec::new();
         let mut t = self.t.clone();
         // A pending commit whose reveal landed after all.
         for c in self.pending_commits() {
@@ -522,6 +523,41 @@ impl<B: Backend> Wallet<B> {
                 };
                 t.names.insert(name.clone(), entry);
                 t.commits.remove(&digest_to_bytes(&c.commit));
+                changed += 1;
+            }
+        }
+        // A reveal sent that no block has, whose commit is no longer
+        // where the reveal says it is (a branch that had the commit was
+        // gone from, and the one gone over to has it elsewhere, or not
+        // at all): no block will take it. It is given up, what it was
+        // to spend is free, and the name is committed to and not
+        // revealed, as before it was sent; to be revealed again when
+        // its commit is in the chain and deep enough. (The name has
+        // been said by then, which cannot be taken back: whoever saw
+        // it may commit to it first.)
+        for entry in self.t.names.values().filter(|n| n.stage == NameStage::Revealed && !n.transferring) {
+            let Some(commit) = self.commit_of(&entry.name, &entry.nonce) else { continue };
+            let reveals = |op: &NameOp| match op {
+                NameOp::Reveal { record, commit, .. } if record.name.as_bytes() == &entry.name[..] => Some(*commit),
+                _ => None,
+            };
+            let sent: Vec<(Commitment, u64, NameOp)> = t
+                .sent
+                .values()
+                .filter(|sent| !t.landed.contains_key(&digest_to_bytes(&sent.txid)))
+                .filter_map(|sent| {
+                    let op = sent.tx.ops.iter().find(|op| reveals(op).is_some())?;
+                    Some((sent.txid, reveals(op)?, op.clone()))
+                })
+                .collect();
+            for (txid, said_at, op) in sent {
+                if registry.commit(&commit)?.is_some_and(|(at, _)| at == said_at) {
+                    continue;
+                }
+                t.failed(&digest_to_bytes(&txid));
+                self.undo_name_op_in(&mut t, &op);
+                gave_up |= Self::unsend_in(&mut t, &txid);
+                failed.push(String::from_utf8_lossy(&entry.name).into_owned());
                 changed += 1;
             }
         }
@@ -576,6 +612,7 @@ impl<B: Backend> Wallet<B> {
             let all = &[T_COMMITS, T_NAMES, T_OUTPUTS, T_SENT, super::T_PAYMENTS];
             let tables: &[usize] = if gave_up { all } else { &[T_COMMITS, T_NAMES] };
             self.commit(t, tables)?;
+            self.reveals_failed.extend(failed);
         }
         Ok(changed)
     }

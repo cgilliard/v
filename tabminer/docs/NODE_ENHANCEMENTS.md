@@ -940,6 +940,33 @@ these had a test of its own.
 
 ### 28. A reveal whose commit is not in the chain
 
+- **Done:**
+  - At every block the wallet holds each reveal that no block has
+    against the chain. If its commit is not where the reveal says
+    (gone, or made again elsewhere), the reveal is given up: the name
+    is `committed` again, what the reveal was to spend is free, its
+    row in `txs` says `failed`, and the log says so once, with the
+    warning that the name has been said. With the commit in the chain
+    again the name is revealed from where it now is. A commit that is
+    in no block is not pooled again by this: its own transaction is
+    a payment like any other, and stands or is stranded as below.
+    (`wallet::tests::a_reveal_whose_commit_is_undone_is_given_up`.)
+  - A payment the wallet signed is known to be in a block by a block
+    making what it makes, and by that alone where blocks are gone
+    through one by one. Before, that what it spent was no longer
+    unspent was taken to mean so: a payment whose inputs a branch
+    change undid was said to be `confirmed`, and let go of as
+    settled. Now it is `to be made again`; it is a payment in no
+    block again if what it spent comes back; and when the chain is
+    past going back the wallet lets go of it, with what it was to
+    spend. The log says how many, when it happens.
+    (`wallet::tests::a_payment_whose_input_is_undone_is_not_taken_for_mined`.)
+  - A payment that a branch gone from had in a block, and the branch
+    gone over to has not, is no longer taken to be in that block.
+- **Not tried:** the same with real nodes (the test of a payment
+  through a branch change has the second case, and passes as it
+  did); a reveal and its commit both in blocks that are undone.
+
 - **Asked for:** that a name cannot be revealed without its commit in
   the chain; and that where it happens all the same (a
   reorganization undoes the commit after the reveal was sent), the
