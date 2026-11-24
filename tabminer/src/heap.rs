@@ -5,8 +5,8 @@
 //! bytes held now and the most ever held, of the whole program and of
 //! each [`Part`] of it. A program that makes it its allocator
 //! (`#[global_allocator]`, as the node does) can say them at any
-//! moment, on any system. Where it is not the allocator (the library's
-//! own tests) every number is zero.
+//! moment, on any system. Where it is not the allocator (a program
+//! that uses the library otherwise) every number is zero.
 //!
 //! A thread says which part it is working for ([`enter`]); what it
 //! allocates meanwhile is that part's, and stays that part's whichever
@@ -41,11 +41,18 @@ pub enum Part {
     Table = 4,
     /// What proving a block holds while it is proven.
     Proving = 5,
+    /// Nothing of a node's: for the test of the counting itself.
+    #[cfg(test)]
+    Test = 6,
 }
 
 impl Part {
     /// Every part.
+    #[cfg(not(test))]
     pub const ALL: [Part; 6] = [Part::Node, Part::Pool, Part::Wallet, Part::Setup, Part::Table, Part::Proving];
+    #[cfg(test)]
+    pub const ALL: [Part; 7] =
+        [Part::Node, Part::Pool, Part::Wallet, Part::Setup, Part::Table, Part::Proving, Part::Test];
 
     /// As it is said to whoever runs the node.
     pub fn name(self) -> &'static str {
@@ -56,6 +63,8 @@ impl Part {
             Part::Setup => "the proofs' setup",
             Part::Table => "the table of the proof of work",
             Part::Proving => "proving",
+            #[cfg(test)]
+            Part::Test => "a test",
         }
     }
 
@@ -244,7 +253,8 @@ pub fn reset_most(part: Part) {
 mod tests {
     use super::*;
 
-    /// The allocator alone, not as the program's: what it hands out
+    /// The allocator asked itself, for a part no other test holds
+    /// anything for: what it hands out
     /// is aligned as asked and keeps what is written through growing
     /// and shrinking, and each part is counted what it holds, whoever
     /// gives it back.
@@ -254,12 +264,12 @@ mod tests {
         let before: Vec<usize> = Part::ALL.iter().map(|p| held(*p)).collect();
         for align in [1usize, 2, 8, 16, 64, 4096] {
             let layout = Layout::from_size_align(100, align).unwrap();
-            let in_pool = enter(Part::Pool);
+            let in_pool = enter(Part::Test);
             // SAFETY: a layout of a size that is not zero.
             let p = unsafe { a.alloc(layout) };
             drop(in_pool);
             assert!(!p.is_null() && p as usize % align == 0);
-            assert_eq!(held(Part::Pool) - before[Part::Pool as usize], 100);
+            assert_eq!(held(Part::Test) - before[Part::Test as usize], 100);
             // SAFETY: a hundred bytes of ours.
             unsafe { core::slice::from_raw_parts_mut(p, 100).iter_mut().enumerate().for_each(|(i, b)| *b = i as u8) };
             // Grown by a thread working for another part: the pool's still.
@@ -267,8 +277,7 @@ mod tests {
             // SAFETY: `p` is of `layout`, and the new size is not zero.
             let q = unsafe { a.realloc(p, layout, 5000) };
             assert!(!q.is_null() && q as usize % align == 0);
-            assert_eq!(held(Part::Pool) - before[Part::Pool as usize], 5000);
-            assert_eq!(held(Part::Wallet), before[Part::Wallet as usize]);
+            assert_eq!(held(Part::Test) - before[Part::Test as usize], 5000);
             // SAFETY: the first hundred bytes are as they were.
             assert!(unsafe { core::slice::from_raw_parts(q, 100) }.iter().enumerate().all(|(i, b)| *b == i as u8));
             let grown = Layout::from_size_align(5000, align).unwrap();
@@ -278,7 +287,7 @@ mod tests {
             // SAFETY: `r` is of ten bytes at this alignment.
             unsafe { a.dealloc(r, Layout::from_size_align(10, align).unwrap()) };
             drop(in_wallet);
-            assert_eq!(held(Part::Pool), before[Part::Pool as usize]);
+            assert_eq!(held(Part::Test), before[Part::Test as usize]);
             // SAFETY: zeroed, and given back.
             unsafe {
                 let z = a.alloc_zeroed(layout);
@@ -286,10 +295,10 @@ mod tests {
                 a.dealloc(z, layout);
             }
         }
-        assert!(most(Part::Pool) >= 5000);
+        assert!(most(Part::Test) >= 5000);
         assert_eq!(part(), Part::Node);
         // A thread begun for a part's work is that part's.
-        let _in = enter(Part::Proving);
-        assert_eq!(std::thread::scope(|s| s.spawn(within(part)).join().unwrap()), Part::Proving);
+        let _in = enter(Part::Test);
+        assert_eq!(std::thread::scope(|s| s.spawn(within(part)).join().unwrap()), Part::Test);
     }
 }

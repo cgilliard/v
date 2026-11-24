@@ -75,3 +75,9 @@ pub mod wallet;
 pub mod work;
 pub mod wots;
 pub mod xmss;
+
+/// The library's own tests count the memory they hold, as the node
+/// does: for the tests that say how much a piece of work takes.
+#[cfg(test)]
+#[global_allocator]
+static HEAP: heap::Counting = heap::Counting;

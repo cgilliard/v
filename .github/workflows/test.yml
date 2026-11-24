@@ -186,6 +186,7 @@ jobs:
       matrix:
         test:
           # slow-tests:begin
+          - prover::tests::main_network_block_memory
           - prover::tests::main_network_block_timing
           - prover::tests::write_the_dev_networks_setup
           - wallet::tests::a_miners_wallet_at_the_size_it_grows_to

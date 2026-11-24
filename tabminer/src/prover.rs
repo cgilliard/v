@@ -1427,6 +1427,11 @@ pub(crate) mod tests {
     /// The header of a block of `body` on the chain's last, its work
     /// found.
     fn header_for(chain: &Chain<MemBackend, ChainVerifier>, body: &Body) -> Header {
+        header_from(chain, body, &*table())
+    }
+
+    /// As [`header_for`], its work of the table `source`.
+    fn header_from(chain: &Chain<MemBackend, ChainVerifier>, body: &Body, source: &impl ItemSource) -> Header {
         let parent = chain.tip().unwrap();
         let bytes = body.to_bytes();
         let (state_root, stated) = chain.header_after(&BodyRef::from_bytes(&bytes).unwrap()).unwrap();
@@ -1443,7 +1448,7 @@ pub(crate) mod tests {
         };
         let target = chain.expected_target(&parent).unwrap();
         loop {
-            header.mix = hashimoto(&*table(), &header.pow_hash(), &header.nonce).mix;
+            header.mix = hashimoto(source, &header.pow_hash(), &header.nonce).mix;
             if header.quick_pow_check(&target) {
                 return header;
             }
@@ -1462,6 +1467,18 @@ pub(crate) mod tests {
     fn prove_with(
         setup: &Setup,
         chain: &Chain<MemBackend, ChainVerifier>,
+        reward: &crate::output::Output,
+        txs: &[Transaction],
+        proven: Option<&SignedProof>,
+    ) -> Option<Vec<u8>> {
+        prove_from(setup, chain, &*table(), reward, txs, proven)
+    }
+
+    /// As [`prove_with`], the work of the table `source`.
+    fn prove_from(
+        setup: &Setup,
+        chain: &Chain<MemBackend, ChainVerifier>,
+        source: &impl ItemSource,
         reward: &crate::output::Output,
         txs: &[Transaction],
         proven: Option<&SignedProof>,
@@ -1497,7 +1514,7 @@ pub(crate) mod tests {
         };
         let witness = Witness::collect(&snap, txs, &[]).unwrap();
         let contents = Contents { txs, sweeps: &[], reward };
-        setup.block(&*table(), &parent, &before, &start, witness, &contents, proven)
+        setup.block(source, &parent, &before, &start, witness, &contents, proven)
     }
 
     /// Blocks that pay their reward, each carrying the chain's proof,
@@ -1750,6 +1767,114 @@ pub(crate) mod tests {
             assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
             println!("block {height}: taken in {:.1?}", began.elapsed());
         }
+    }
+
+    /// What making a block holds, on the main network's proofs: a block
+    /// of a reward alone; a block of one payment, of one signature and
+    /// `INPUTS` outputs (256 unless given); and a block of one payment
+    /// that spends those, of `INPUTS` signatures, the most a block made
+    /// here checks, and `OUTPUTS` outputs (1 unless given). Said for
+    /// each: the most memory held while each part of its proof was
+    /// made, the most held at all, and what taking the block held.
+    #[test]
+    #[ignore = "memory; run with --release --nocapture, after the main network's setup is written"]
+    fn main_network_block_memory() {
+        use crate::heap::{self, Part};
+        use crate::output::{Key, Output};
+        use crate::transaction::UnsignedTransaction;
+        use std::time::Instant;
+        let number = |name: &str, or: usize| std::env::var(name).ok().and_then(|n| n.parse().ok()).unwrap_or(or);
+        let (inputs, outputs) = (number("INPUTS", 256), number("OUTPUTS", 1));
+        let megabytes = |bytes: usize| bytes / 1_000_000;
+        let bytes = std::fs::read("../resources/setup-mainnet.bin").unwrap();
+        let parts = Parts::from_bytes(&bytes).unwrap();
+        let text = crate::pow::SeedText::new(crate::pow::PowParams::MAINNET);
+        let params = ChainParams {
+            pow: crate::pow::PowParams::MAINNET,
+            emission: ChainParams::MAINNET.emission,
+            program: parts.own,
+            ..easy()
+        };
+        let params = ChainParams { genesis_mix: None, ..params };
+        let setup = Setup::from_parts(Level::MAINNET, Emission(params.emission), params.pow, &parts).unwrap();
+        println!("the setup holds {} MB", megabytes(heap::held(Part::Setup)));
+        let chain =
+            Chain::open(MemBackend::new(), 8, params, text, ChainVerifier::of(&Level::MAINNET, &parts)).unwrap();
+        let source = text.at(0);
+        // A block of `txs` and `reward` made, said, and taken.
+        let make = |name: &str, reward: &Output, txs: &[Transaction]| {
+            let _ = parts_timed();
+            heap::reset_peak();
+            let (began, before) = (Instant::now(), heap::now());
+            let signings: Vec<Signing> = txs.iter().flat_map(Transaction::signings).collect();
+            let proven = (!signings.is_empty()).then(|| setup.sign(&signings).unwrap());
+            let proof = prove_from(&setup, &chain, &source, reward, txs, proven.as_ref()).unwrap();
+            println!(
+                "{name}: proved in {:.1?}, a proof of {} bytes; {} MB held before, {} MB at the most",
+                began.elapsed(),
+                proof.len(),
+                megabytes(before),
+                megabytes(heap::peak())
+            );
+            for part in parts_timed() {
+                println!("  {}: {:.1?}, {} MB of proving's at the most", part.name, part.took, megabytes(part.most));
+            }
+            drop(proven);
+            let spent: Vec<u64> = txs.iter().flat_map(|tx| tx.inputs.iter().map(|i| i.position)).collect();
+            let made = [reward].into_iter().chain(txs.iter().flat_map(|tx| &tx.outputs)).map(Output::block_output);
+            let body = Body { inputs: spent, outputs: made.collect(), proof, ..Body::default() };
+            let block = Block { header: header_from(&chain, &body, &source), body }.to_bytes();
+            heap::reset_peak();
+            let (began, before) = (Instant::now(), heap::now());
+            assert_eq!(chain.apply_block(&BlockRef::from_bytes(&block).unwrap(), NOW), Ok(Applied::Extended));
+            println!(
+                "{name}: {} bytes, taken in {:.1?} with {} MB more held at the most",
+                block.len(),
+                began.elapsed(),
+                megabytes(heap::peak() - before)
+            );
+        };
+        // The first block pays a key; the second spends that into an
+        // output for each of `inputs` keys; the third spends them all.
+        let mut first = Key::generate(&[3; 32]);
+        let paid = Output::new(&first.public_key(), params.subsidy(1));
+        make("a block of a reward alone", &paid, &[]);
+        let mut keys: Vec<Key> = (0..inputs)
+            .map(|i| {
+                let mut seed = [5; 32];
+                seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                Key::generate(&seed)
+            })
+            .collect();
+        let (fee, each) = (1000, (paid.amount - 1000) / inputs as u64);
+        let shares: Vec<Output> = keys.iter().map(|key| Output::new(&key.public_key(), each)).collect();
+        let fee_first = paid.amount - each * inputs as u64;
+        let split = UnsignedTransaction::new(vec![(first.public_key(), paid.amount)], shares)
+            .at(&[0])
+            .sign_with(&mut first)
+            .unwrap();
+        let reward = Output::to_key_hash(&[4; 32], params.subsidy(2) + fee_first);
+        make(&format!("a block of one signature and {inputs} outputs"), &reward, &[split]);
+        // (The reward of the second block lies at 1, the shares after it.)
+        let positions: Vec<u64> = (0..inputs as u64).map(|i| 2 + i).collect();
+        let total = each * inputs as u64 - fee;
+        let made: Vec<Output> = (0..outputs)
+            .map(|o| {
+                let amount = total / outputs as u64 + if o == 0 { total % outputs as u64 } else { 0 };
+                Output::to_key_hash(&[6 + o as u8; 32], amount)
+            })
+            .collect();
+        let all = UnsignedTransaction::new(keys.iter().map(|key| (key.public_key(), each)).collect(), made)
+            .at(&positions)
+            .sign(|i, _, msg| keys[i].sign(msg))
+            .unwrap();
+        let reward = Output::to_key_hash(&[7; 32], params.subsidy(3) + fee);
+        make(&format!("a block of {inputs} signatures and {outputs} outputs"), &reward, &[all]);
+        // (What the system says the process held at the most, all told:
+        // more than was asked for, by what its allocator keeps.)
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let resident = status.lines().find(|l| l.starts_with("VmHWM")).and_then(|l| l.split_whitespace().nth(1));
+        println!("the process, by the system: {} kB at the most", resident.unwrap_or("?"));
     }
 
     /// The setup built in is the main network's: its step's program is
