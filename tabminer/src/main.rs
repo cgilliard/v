@@ -412,31 +412,6 @@ fn make_block(
                 timed.iter().map(|p| format!("{} {}", p.name, short_seconds(p.took.as_millis() as u64))).collect();
             let parts = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
             main.log(&format!("Mining block {height} on {parent}: proved in {took}{parts}"));
-            // (And what it held, part by part: the most proving held
-            // while each was made, and what is held whatever is made.)
-            let megabytes = |bytes: usize| format!("{} MB", commas(bytes as u64 / 1_000_000));
-            let most: Vec<String> = timed.iter().map(|p| format!("{} {}", p.name, megabytes(p.most))).collect();
-            if !most.is_empty() {
-                use tabminer::heap::{Part, held};
-                let beside = match timed.iter().any(|p| p.beside) {
-                    true => "; a block given up was still being proven beside it, and is counted in these",
-                    false => "",
-                };
-                main.log(&format!(
-                    "Mining block {height} on {parent}: the most memory proving held: {}{beside}; held besides: {} {}, {} {}, {} {}, {} {}, {} {}",
-                    most.join(", "),
-                    Part::Setup.name(),
-                    megabytes(held(Part::Setup)),
-                    Part::Table.name(),
-                    megabytes(held(Part::Table)),
-                    Part::Pool.name(),
-                    megabytes(held(Part::Pool)),
-                    Part::Wallet.name(),
-                    megabytes(held(Part::Wallet)),
-                    Part::Node.name(),
-                    megabytes(held(Part::Node)),
-                ));
-            }
         }
     };
     // What the block carries of the pool: none, if it cannot be
