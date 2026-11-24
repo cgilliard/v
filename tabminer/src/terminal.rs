@@ -510,6 +510,28 @@ impl Prompt {
     }
 }
 
+/// Asks on the terminal, before there is a prompt, for a line that is
+/// not to be seen as it is typed: a password, when the program
+/// starts. `asking` is said where errors are, so that what the
+/// program prints is not mixed with it. Where what is typed is not a
+/// terminal's (a file, another program) it is read as any line is.
+/// None when there is nothing more to read.
+pub fn ask_secret(asking: &str) -> io::Result<Option<String>> {
+    use std::io::IsTerminal;
+    eprint!("{asking}");
+    io::stderr().flush()?;
+    let hidden = sys::CAN && io::stdin().is_terminal();
+    let raw = if hidden { Some(sys::Raw::enter(true)?) } else { None };
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line)?;
+    drop(raw);
+    // (The end of the line was not shown either.)
+    if hidden {
+        eprintln!();
+    }
+    Ok((read > 0).then(|| line.trim_end_matches(['\n', '\r']).to_string()))
+}
+
 /// The terminal's settings, by the system's own calls.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod sys {

@@ -1326,6 +1326,10 @@ fn open_wallet(
         std::io::stdin().lock().read_line(&mut line)?;
         Ok(line.trim_end_matches(['\n', '\r']).to_string())
     };
+    // (A password is not shown as it is typed.)
+    let hidden = |asking: &str| -> Result<String, WalletError> {
+        Ok(tabminer::terminal::ask_secret(asking)?.unwrap_or_default())
+    };
     let mut ask = |ask: Ask| -> Result<String, WalletError> {
         // From the file, if one is given: its first line.
         if let Some(file) = &c.password_file {
@@ -1333,10 +1337,10 @@ fn open_wallet(
             return Ok(text.lines().next().unwrap_or("").to_string());
         }
         match (ask, c.prompt) {
-            (Ask::Unlock, true) => typed("Wallet password: "),
+            (Ask::Unlock, true) => hidden("Wallet password: "),
             (Ask::New, true) => loop {
-                let first = typed("A password for the new wallet (none, for no password): ")?;
-                if first.is_empty() || typed("The same again: ")? == first {
+                let first = hidden("A password for the new wallet (none, for no password): ")?;
+                if first.is_empty() || hidden("The same again: ")? == first {
                     break Ok(first);
                 }
                 eprintln!("They are not the same.");
