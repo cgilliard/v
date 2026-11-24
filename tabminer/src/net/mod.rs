@@ -30,4 +30,4 @@ pub mod socket;
 pub const MAX_DATAGRAM: usize = 1232;
 /// The version of all this. A node of another version is answered, so
 /// that it can see why, and otherwise left alone.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;

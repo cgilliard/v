@@ -211,6 +211,8 @@ fn claim(nonce: u64, genesis: Digest) -> Status {
         window: 0,
         tip: genesis,
         work: U256::ZERO,
+        // (A node of its own: no two of these claims are one node's.)
+        node: nonce.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1 << 63,
     }
 }
 
@@ -280,7 +282,7 @@ fn a_forged_ping_costs_its_victim_no_more_than_the_forger() {
             Message::Ping(_) => pings += 1,
             other => panic!("{other:?}"),
         }
-        assert_eq!(bytes.len(), 133, "as much as a ping, no more");
+        assert_eq!(bytes.len(), 141, "as much as a ping, no more");
     }
     assert_eq!((pongs, pings), (100, 8));
     // The same address again and again gets pongs, and no second ping
@@ -1718,6 +1720,80 @@ fn announcements_from_nowhere_cost_the_chain_nothing() {
     assert!((1..=16).contains(&c.checked), "{} checked", c.checked);
     assert_eq!(w.nodes[0].table(&at(1)).refusal(&at(1), false, now), Some(crate::net::peers::Refused::Banned));
     assert_eq!(w.best(0), tip);
+}
+
+/// A node catching up tells nobody of the blocks it takes: each of its
+/// peers that is as high has had them all along. (It once told every
+/// peer of every old block as it joined it to its chain.) A block that
+/// is news to a peer is told to it as before.
+#[test]
+fn a_node_catching_up_announces_nothing_old() {
+    let chains = vec![chain_of(easy()), chain_of(easy()), chain_of(easy())];
+    let made = grow(&chains[1], 20, 1);
+    give(&chains[2], &made);
+    let mut w = World::with(chains.clone(), &small_runs());
+    w.nodes[0].add_peer(at(1), false, 0);
+    w.nodes[0].add_peer(at(2), false, 0);
+    w.run(20 * SECOND);
+    assert_eq!(tip(&w, 0), tip(&w, 1));
+    assert_eq!(w.nodes[0].counts().announced, 0);
+    // One more, made by the second: told to both the others, and by
+    // whichever of those has it first to nobody that has it.
+    let more = grow(&chains[1], 1, 2);
+    let block = crate::block::BlockRef::from_bytes(&more[0]).unwrap();
+    let (header, len) = (*block.header(), (more[0].len() - crate::block::HEADER_SIZE) as u32);
+    w.inject(at(1), 0, &Message::Block { header, len });
+    w.inject(at(1), 2, &Message::Block { header, len });
+    w.run(20 * SECOND);
+    assert_eq!((tip(&w, 0), tip(&w, 2)), (tip(&w, 1), tip(&w, 1)));
+    assert!(w.nodes[0].counts().announced <= 1 && w.nodes[2].counts().announced <= 1);
+}
+
+/// A node is known by a number it says in every ping, whatever address
+/// it is heard from. One that is a live peer already, heard of at a
+/// second address (its router's, which another node told of), is not
+/// a second peer; and a node that hears its own number has reached
+/// itself. Neither address is asked again.
+#[test]
+fn a_node_heard_from_two_addresses_is_one_peer() {
+    use crate::net::peers::Refused;
+    let mut w = World::new(2, &Config::default());
+    w.nodes[0].add_peer(at(1), false, 0);
+    w.run(2 * SECOND);
+    assert_eq!((w.live(0), w.live(1)), (vec![at(1)], vec![at(0)]));
+    let genesis = w.nodes[0].chain().params().genesis().header.hash();
+    let numbers = [w.nodes[0].hold().node_number(), w.nodes[1].hold().node_number()];
+    assert_ne!(numbers[0], numbers[1]);
+    // The pong to this node's ping of an address nobody is at, as the
+    // node of that number would give it.
+    let pong_from = |w: &mut World, alias: SocketAddrV4, node: u64| {
+        w.strays.clear();
+        w.nodes[0].add_peer(alias, false, w.now);
+        w.woken();
+        w.run(2 * SECOND);
+        let ping = w.strays.iter().find_map(|(_, to, bytes)| match Message::decode(NET, bytes) {
+            Ok(Message::Ping(status)) if *to == alias => Some(status),
+            _ => None,
+        });
+        let nonce = ping.expect("the address is pinged").nonce;
+        w.inject(alias, 0, &Message::Pong(Status { node, ..claim(nonce, genesis) }));
+        w.run(SECOND);
+    };
+    // The peer it has, at another address: no second peer.
+    pong_from(&mut w, at(7), numbers[1]);
+    let now = w.now;
+    assert_eq!(w.live(0), [at(1)]);
+    assert_eq!(w.nodes[0].table(&at(7)).refusal(&at(7), false, now), Some(Refused::Itself));
+    // Itself, at an address it did not know for its own.
+    pong_from(&mut w, at(8), numbers[0]);
+    assert_eq!(w.live(0), [at(1)]);
+    assert_eq!(w.nodes[0].table(&at(8)).refusal(&at(8), false, now), Some(Refused::Itself));
+    // Another node at another address is another peer.
+    pong_from(&mut w, at(9), 12345);
+    assert_eq!(w.live(0), [at(1), at(9)]);
+    // And the first is the peer it was all along.
+    w.run(40 * SECOND);
+    assert!(w.live(0).contains(&at(1)) && w.live(1) == [at(0)]);
 }
 
 /// A peer that says its chain is higher than any could be by now is

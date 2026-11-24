@@ -792,6 +792,8 @@ mod tests {
             window: 90,
             tip: [0; 32],
             work: U256::from_u64(work),
+            // (Each its own node.)
+            node: nonce,
         }
     }
 

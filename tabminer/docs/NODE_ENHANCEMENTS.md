@@ -188,6 +188,16 @@ should weigh more in the fee (19).
 
 ### 11. One node is counted as two peers when it is reached at two addresses
 
+- **Done:** every node takes a number by chance when it starts and
+  says it in its pings and pongs. A node that is a live peer already,
+  heard of at a second address, is not a second peer: the first
+  address stands, and the second is not asked again. A node that
+  hears its own number has reached itself, and does not ask that
+  address again either. (`a_node_heard_from_two_addresses_is_one_peer`.)
+  What a node says of itself is eight bytes longer for it, and the
+  version nodes say is 2: nodes from before and after do not take
+  each other for peers. Every node goes over together.
+
 - **Seen:** `peers` on one of two nodes run on one machine, with three
   seeds elsewhere: five nodes in all, so four others, and five peers
   listed. It looked as if the node were its own peer.
@@ -209,6 +219,12 @@ should weigh more in the fee (19).
   however it did.
 
 ### 13. What a live network says to itself: the request logs, read
+
+- **Done ahead of the reading, from what the live test showed:** a
+  block is not announced to a peer whose chain is as high already, by
+  what it last said: a node catching up tells nobody of old blocks
+  (`a_node_catching_up_announces_nothing_old`). The rest of the
+  reading is still to do, on a live network.
 
 - **Asked for:** to run the things a node and a wallet do on the live
   network, one at a time, and read `request.log` on each node for
@@ -1330,9 +1346,12 @@ these had a test of its own.
     its 351 chunks here; the rest is asked of …`). A peer it happens
     to twice within the time a peer is passed over is passed over.
     Tried by `a_block_that_stops_coming_is_gone_on_with_by_another_peer`.
-  - Still to do of this entry: the counts in the statistics' lines;
-    whether the node's own fetches are logged; old blocks announced
-    by a node catching up.
+  - The statistics have a column `Refetched`: fetches that did not
+    end with the peer they began with (given up, too slow, gone on
+    with by another). Old blocks are no longer announced by a node
+    catching up (entry 13).
+  - Still to do of this entry: whether the node's own fetches are
+    logged, a line each.
 
 - **Seen:** a third node started on the live network (`target/main3`,
   no mining) took headers 1 to 74 in half a second and blocks 1 to 45

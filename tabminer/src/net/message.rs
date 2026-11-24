@@ -94,10 +94,16 @@ pub struct Status {
     pub tip: Digest,
     /// The work of its chain, in all.
     pub work: U256,
+    /// A number the node took by chance when it started: the same in
+    /// everything it says, from whatever address it is heard. A node
+    /// reached at two addresses (its own and its router's, say) is
+    /// known by it for one node, and a node that hears its own knows
+    /// it has reached itself.
+    pub node: u64,
 }
 
 impl Status {
-    pub const BYTES: usize = 8 + 4 + 8 + 32 + 4 + 4 + 4 + 32 + 32;
+    pub const BYTES: usize = 8 + 4 + 8 + 32 + 4 + 4 + 4 + 32 + 32 + 8;
 }
 
 /// Addresses of peers: [`MAX_ADDRS`] at most.
@@ -583,6 +589,7 @@ impl Out<'_> {
         self.put(&s.window.to_le_bytes());
         self.put(&digest_to_bytes(&s.tip));
         self.put(&s.work.to_le_bytes());
+        self.put(&s.node.to_le_bytes());
     }
 }
 
@@ -622,6 +629,7 @@ impl<'a> In<'a> {
             window: self.u32()?,
             tip: self.digest()?,
             work: U256::from_le_bytes(&self.array()?),
+            node: self.u64()?,
         })
     }
 }
@@ -650,6 +658,7 @@ mod tests {
             window: rng.next_u64() as u32,
             tip: digest(rng),
             work: U256(core::array::from_fn(|_| rng.next_u64())),
+            node: rng.next_u64(),
         }
     }
 
@@ -792,10 +801,11 @@ mod tests {
             window: 0,
             tip: d,
             work: U256::ZERO,
+            node: 0,
         };
         let ping = Message::Ping(s).encode(NET, &mut buf);
         assert_eq!((ping, Message::Pong(s).encode(NET, &mut buf)), (HEAD + Status::BYTES, HEAD + Status::BYTES));
-        assert_eq!(Status::BYTES, 128);
+        assert_eq!(Status::BYTES, 136);
     }
 
     #[test]

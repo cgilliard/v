@@ -810,6 +810,13 @@ pub(crate) struct Shared {
     /// worker that address belongs to honours. (What passes between
     /// wallets comes in at one worker and goes out by another.)
     token_secret: [u8; 32],
+    /// The number this node is known by, whatever address it is heard
+    /// from ([`Status::node`]): taken by chance at each start.
+    node: u64,
+    /// The nodes that are live peers, each by its number, and the
+    /// address it is a peer at: a node heard of at a second address is
+    /// not a second peer.
+    nodes: Mutex<Vec<(u64, SocketAddrV4)>>,
     /// The node's peers in all.
     totals: Arc<Totals>,
     /// How many of each worker's peers are live, as it last counted;
@@ -823,6 +830,10 @@ pub(crate) struct Shared {
     threaded: AtomicBool,
     /// Blocks that have joined the chain here.
     blocks: AtomicU64,
+    /// Fetches that did not end with the peer they began with: given
+    /// up (silent, refused, gone), too slow, or gone on with by
+    /// another for bringing nothing new.
+    refetched: AtomicU64,
     /// Blocks made here of which what came of them has been heard.
     settled: AtomicU64,
     /// Wakes a worker that is waiting, where each waits on a thread of
@@ -1471,6 +1482,36 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             window,
             tip: tip.hash(),
             work,
+            node: self.shared.node,
+        }
+    }
+
+    /// Whether the node of number `node`, heard from `from`, is one
+    /// this node has as a live peer at another address already: then
+    /// that address is the peer, and this one is not. (The first it
+    /// was live at: which is the one it was given, of a node told its
+    /// peers.) If not, `from` is where that node is a peer from here
+    /// on.
+    fn peer_elsewhere(&self, node: u64, from: SocketAddrV4) -> bool {
+        let mut nodes = self.shared.nodes.lock().unwrap_or_else(|e| e.into_inner());
+        let live = |addr: &SocketAddrV4| {
+            let known = |of: &Mutex<Vec<SocketAddrV4>>| of.lock().unwrap_or_else(|e| e.into_inner()).contains(addr);
+            self.was_live.binary_search(addr).is_ok() || self.shared.known.iter().any(known)
+        };
+        match nodes.iter_mut().find(|known| known.0 == node) {
+            Some((_, at)) if *at != from && live(at) => true,
+            Some((_, at)) => {
+                *at = from;
+                false
+            }
+            None => {
+                // (No more remembered than there can be peers of.)
+                if nodes.len() >= 4096 {
+                    nodes.remove(0);
+                }
+                nodes.push((node, from));
+                false
+            }
         }
     }
 
@@ -3019,6 +3060,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         }
         for peer in self.was_live.iter().filter(|a| mine.binary_search(a).is_err()) {
             self.shared.say(Event::PeerLost { peer: *peer });
+            // (Its node may be a peer at another address from now.)
+            self.shared.nodes.lock().unwrap_or_else(|e| e.into_inner()).retain(|known| known.1 != *peer);
         }
         self.was_live.clone_from(&mine);
         self.shared.live[self.me].store(mine.len(), Ordering::Relaxed);
@@ -3425,7 +3468,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             return self.send(from, &pong, out);
         }
         // Our own ping to this address, come back: the address is ours.
-        if self.peers.is_own_ping(&from, theirs.nonce) {
+        // (Or anything of this node's own, by whatever way it came.)
+        if self.peers.is_own_ping(&from, theirs.nonce) || theirs.node == self.shared.node {
             return self.peers.mark_self(from);
         }
         if self.peers.proven(&from) {
@@ -3460,6 +3504,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             self.counts.strangers += 1;
             self.peers.remove(&from);
             return;
+        }
+        // This node itself, reached at an address it did not know for
+        // its own; or a node that is a peer already, at another: no
+        // peer, and not asked again.
+        if theirs.node == self.shared.node || self.peer_elsewhere(theirs.node, from) {
+            return self.peers.mark_self(from);
         }
         // Live from now, if it was not: said at once, before anything
         // that is done because it is.
@@ -3921,7 +3971,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// how long its body is.
     fn announce(&mut self, now: Micros, header: Header, len: u32, except: Option<SocketAddrV4>, out: Out<'_>) {
         let mut all = Vec::new();
-        all.extend(self.peers.live(now).map(|p| p.addr).filter(|a| Some(*a) != except));
+        // (Not to a peer whose chain is as high already, by what it
+        // last said of it: a node catching up would tell every peer of
+        // every old block as it joined it to its chain, and each of
+        // them has had that block for as long as it has been one.)
+        let has = |p: &super::peers::Peer| p.status.is_some_and(|theirs| theirs.height >= header.height);
+        all.extend(self.peers.live(now).filter(|p| !has(p)).map(|p| p.addr).filter(|a| Some(*a) != except));
         for addr in all {
             self.counts.announced += 1;
             self.send(addr, &Message::Block { header, len }, out);
@@ -5145,6 +5200,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     self.fetches[i].fetch.resume(transfer, path, now);
                     self.fetches[i].from = to;
                     self.counts.fetches_moved += 1;
+                    self.shared.refetched.fetch_add(1, Ordering::Relaxed);
                     self.shared.say(Event::FetchMoved { height, from, to, quiet, here, of });
                     // Once is anyone's line; a peer it happens to
                     // again is passed over, as one too slow is.
@@ -5377,6 +5433,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// it then asked.
     fn fetch_failed(&mut self, l: &mut List, now: Micros, object: Object, from: SocketAddrV4, gone: bool) {
         self.counts.fetches_failed += 1;
+        self.shared.refetched.fetch_add(1, Ordering::Relaxed);
         self.shared.work(self.me);
         // Of the state being taken: asked of another, and this peer
         // not again while another can be.
@@ -5481,12 +5538,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             leaving: Mutex::default(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
             token_secret: derive(&secret, b'T', 0),
+            node: u64::from_le_bytes(derive(&secret, b'I', 0)[..8].try_into().expect("eight bytes")),
+            nodes: Mutex::default(),
             totals: Arc::new(Totals::new()),
             live: (0..n).map(|_| AtomicUsize::new(0)).collect(),
             known: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
             ready: AtomicUsize::new(0),
             threaded: AtomicBool::new(false),
             blocks: AtomicU64::new(0),
+            refetched: AtomicU64::new(0),
             settled: AtomicU64::new(0),
             waker: RwLock::new(None),
             turn: AtomicUsize::new(0),
@@ -5846,6 +5906,8 @@ pub struct Standing {
     pub blocks: u64,
     /// Objects the node is after that are being fetched.
     pub fetching: usize,
+    /// Fetches that did not end with the peer they began with.
+    pub refetched: u64,
 }
 
 impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
@@ -5970,6 +6032,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
         let now = Arc::new(relays_of(Some(file)));
         let before = std::mem::replace(&mut *self.shared.relays.lock().unwrap(), now);
         *self.shared.relays_before.lock().unwrap() = Some((before, at));
+    }
+
+    /// The number this node is known by ([`Status::node`]).
+    #[cfg(test)]
+    pub(crate) fn node_number(&self) -> u64 {
+        self.shared.node
     }
 
     /// Says what a name says, in the chain's place.
@@ -6178,6 +6246,7 @@ impl<B: Backend + 'static, V> Handle<B, V> {
             height: self.chain.tip().map_or(0, |tip| tip.height),
             blocks: self.shared.blocks.load(Ordering::Relaxed),
             fetching: self.list.read().unwrap_or_else(|e| e.into_inner()).fetching.len(),
+            refetched: self.shared.refetched.load(Ordering::Relaxed),
         }
     }
 }

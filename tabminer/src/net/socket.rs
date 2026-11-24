@@ -55,12 +55,13 @@ pub const STATS: &[(&str, Kind)] = &[
     ("Requests", Kind::Count),
     ("HeapMB", Kind::Level),
     ("PeakHeapMB", Kind::Level),
+    ("Refetched", Kind::Count),
 ];
 /// The node's stats. The log shows these of them, each in a column
 /// this wide; the rest are counted all the same.
 ///
 /// ```text
-/// Uptime: 0:00:00           Requests___Packets____AvgLatency(us)_Peers_PeersLive_Height_Blocks_Mined
+/// Uptime: 0:00:00           Requests___Packets____AvgLatency(us)_HeapMB_PeakHeapMB_Peers_PeersLive_Height_Blocks_Refetched_Mined
 /// ```
 pub fn stats() -> Stats {
     Stats::new(STATS).showing(&[
@@ -73,6 +74,7 @@ pub fn stats() -> Stats {
         (PEERS_LIVE, 10),
         (HEIGHT, 7),
         (BLOCKS, 7),
+        (REFETCHED, 10),
         (MINED, 6),
     ])
 }
@@ -86,6 +88,7 @@ pub fn set_levels<B: Backend + 'static, V>(stats: &Stats, hold: &Handle<B, V>) {
     stats.set(HEIGHT, now.height as u64);
     stats.set(BLOCKS, now.blocks);
     stats.set(FETCHING, now.fetching as u64);
+    stats.set(REFETCHED, now.refetched);
     // (In megabytes, of a million bytes: nothing, where the program
     // does not count what it holds.)
     stats.set(HEAP, crate::heap::now() as u64 / 1_000_000);
@@ -119,6 +122,10 @@ pub const REQUESTS: usize = 11;
 /// megabytes ([`crate::heap`]).
 pub const HEAP: usize = 12;
 pub const HEAP_PEAK: usize = 13;
+/// Fetches that did not end with the peer they began with: given up,
+/// too slow, or gone on with by another. Now and then is any network;
+/// many is a peer, or a line, that is not what it should be.
+pub const REFETCHED: usize = 14;
 
 /// What the main log says when datagrams are dropped.
 pub const DROPPING: &str = "dropped requests: a worker's queue is full";
