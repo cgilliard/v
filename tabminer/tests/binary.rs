@@ -204,7 +204,8 @@ fn two_nodes_make_blocks_and_take_each_others() {
         let stats = std::fs::read_to_string(dirs[i].join("stat.log")).ok()?;
         let whole = stats.lines().rev().find(|l| l.starts_with('['))?;
         let n: Vec<u64> = whole[26..].split_whitespace().map(|n| n.replace(',', "").parse().unwrap_or(0)).collect();
-        Some((n[n.len() - 3], n[n.len() - 2], n[n.len() - 1]))
+        // (The last columns: Height, Blocks, Refetched, Mined.)
+        Some((n[n.len() - 4], n[n.len() - 3], n[n.len() - 1]))
     };
     // Until each has made blocks, and holds more than it made.
     let began = Instant::now();

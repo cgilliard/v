@@ -683,7 +683,8 @@ fn throughput() {
     };
 
     // Taken: read, looked up, their signatures checked, and pooled.
-    let mut pool = Mempool::with_policy(DEFAULT_CAPACITY, policy);
+    // (A pool that holds all it knows of, as a node that makes blocks does.)
+    let mut pool = Mempool::with_policy(DEFAULT_CAPACITY, policy.holding_all());
     let t = Instant::now();
     for tx in &txs {
         pool.insert(tx, &state, 1, 0).unwrap();
