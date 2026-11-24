@@ -193,10 +193,11 @@ should weigh more in the fee (19).
     of work 1,074, proving 41)`, the parts of a megabyte or more.
   - The stats log: columns `PoolMB`, `SetupMB`, `TableMB` (held now)
     and `PeakProvingMB` (the most proving has held in a part of it).
-  - Part by part of a proof, by a test
-    (`prover::tests::main_network_block_memory`, a job of its own on
-    CI): not in the main log, where it was a line too many for
-    whoever runs a node.
+  - The main log, with `--debug-memory` only: with every block
+    proven, the most memory proving held while each part of the proof
+    was made, and what was held besides. (And by a test,
+    `prover::tests::main_network_block_memory`, a job of its own on
+    CI.)
 - **Measured with it** (a node that mines alone, six threads, the
   table of the proof of work of 1,074 MB):
 

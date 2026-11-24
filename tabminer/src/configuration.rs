@@ -346,6 +346,11 @@ is given (default 5)",
         "Debugging",
         &[
             Opt {
+                name: "debug-memory",
+                takes: Takes::Nothing,
+                help: "say in the main log, with every block proven here, the most\nmemory proving held while each part of the proof was made,\nand what the node holds besides",
+            },
+            Opt {
                 name: "debug-no-validate-proofs",
                 takes: Takes::Nothing,
                 help: "take blocks without checking their proofs, and make them\nwithout proving: only on a dev network, in a build that has\nthem, and in a data directory of its own, which is marked as\none whose blocks were never checked",
@@ -560,6 +565,9 @@ pub struct Configuration {
     pub prompt: bool,
     /// Whether the wallet is to be made again from its words.
     pub restore: bool,
+    /// Debugging: whether the memory proving held is said with every
+    /// block proven.
+    pub debug_memory: bool,
     /// Debugging: whether blocks' proofs go unchecked, and unmade.
     pub debug_unchecked: bool,
     /// Debugging: the outputs every block made here makes, and how
@@ -1032,6 +1040,7 @@ impl Configuration {
                 .map_or(crate::wallet::MIN_CONFIRMATIONS, |n| n.min(u32::MAX as usize) as u32),
             prompt: !given.flag("no-prompt"),
             restore: given.flag("restore"),
+            debug_memory: given.flag("debug-memory"),
             debug_unchecked,
             debug_fill,
             debug_outputs,
@@ -1076,6 +1085,9 @@ impl Configuration {
         lines.push(("Min Confirmations", commas(self.min_confirmations as u64)));
         if self.debug_unchecked {
             lines.push(("Debug", "blocks' proofs are not checked".to_string()));
+        }
+        if self.debug_memory {
+            lines.push(("Debug Memory", "said with every block proven".to_string()));
         }
         lines.extend([
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
