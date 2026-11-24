@@ -414,9 +414,9 @@ pub fn tidy<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVeri
     // (What the pool's transactions make may yet be made.)
     let (mut keep, mut commits) = (Vec::new(), Vec::new());
     hold.pool(&mut |pool| {
-        for e in pool.entries() {
-            keep.extend(e.tx().outputs().iter().map(|o| o.commitment));
-            commits.extend(e.tx().ops().filter_map(|op| match op {
+        for tx in pool.entries().filter_map(|e| e.tx()) {
+            keep.extend(tx.outputs().iter().map(|o| o.commitment));
+            commits.extend(tx.ops().filter_map(|op| match op {
                 NameOp::Commit { commit, .. } => Some(commit),
                 _ => None,
             }));
@@ -443,7 +443,9 @@ pub fn observe<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofV
     let mut seen = Vec::new();
     hold.pool(&mut |pool| {
         for e in pool.entries() {
-            seen.extend(e.tx().inputs().map(|i| (i.commitment(), i.signature.index)));
+            if let Some(tx) = e.tx() {
+                seen.extend(tx.inputs().map(|i| (i.commitment(), i.signature.index)));
+            }
         }
     });
     wallet.lock().unwrap_or_else(|e| e.into_inner()).observe_signatures(&seen).map_err(|e| e.to_string())
@@ -916,6 +918,14 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 commas(pool.bytes() as u64),
                 commas(pool.admission_fee(unix))
             ));
+            // (Said only where it is not all of them.)
+            if pool.held() < pool.bytes() {
+                lines.push(format!(
+                    "held whole: {} of them, {} bytes; the rest are known of, and to be had from other nodes",
+                    commas(pool.whole() as u64),
+                    commas(pool.held() as u64)
+                ));
+            }
             let mut entries: Vec<_> = pool.entries().collect();
             entries.sort_by_key(|e| (e.arrived, e.order));
             for e in entries.iter().take(50) {
@@ -2594,7 +2604,7 @@ mod tests {
             let (mut pooled, mut fees) = (Vec::new(), 0u64);
             self.hold.pool(&mut |pool| {
                 for entry in pool.entries() {
-                    pooled.push(entry.tx().to_transaction());
+                    pooled.push(entry.tx().expect("held whole").to_transaction());
                     fees += entry.fee;
                 }
             });

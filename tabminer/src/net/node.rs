@@ -4051,7 +4051,8 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         let mut best: Vec<(u128, Digest, u32)> = {
             let pool = self.shared.pool();
             let rate = |e: &crate::mempool::Entry| ((e.fee as u128) << 32) / e.size().max(1) as u128;
-            pool.entries().map(|e| (rate(e), e.txid, e.size() as u32)).collect()
+            // (What is held whole: only that can be given.)
+            pool.entries().filter(|e| e.whole()).map(|e| (rate(e), e.txid, e.size() as u32)).collect()
         };
         best.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         for (_, id, len) in best.into_iter().take(POOL_CATCHUP) {
@@ -5039,7 +5040,9 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
                     None
                 }
             },
-            Object::Tx(id) => self.shared.pool().entry(&id).map(|e| e.bytes().to_vec()),
+            // (Held whole; one only known of is not here to be given,
+            // which whoever asks takes for that and no more.)
+            Object::Tx(id) => self.shared.pool().entry(&id).and_then(|e| e.bytes().map(<[u8]>::to_vec)),
             Object::File(id) => self.chain.consensus_file_by_id(&id).ok().flatten(),
             // What a wallet announced: this node's own wallet's, by its
             // number, to the node it was made for; or, of a node that

@@ -303,6 +303,35 @@ should weigh more in the fee (19).
 
 ### 15. A pool that knows of more transactions than it holds
 
+- **Done, a first whole of it:**
+  - A pool's entry is a transaction held whole, or only known of: its
+    id, its size, what it pays and weighs, when it came, the outputs
+    it spends and the names it claims. Every transaction is whole
+    when it comes and is checked whole.
+  - A node that makes no blocks holds whole the most recent 8 MB,
+    and of the older ones its own share, 35%, in 128 MB at the most
+    (`--mempool-recent`, `--mempool-share`, `--mempool-older`). Which
+    of the older ones is by a hash of the id under a secret the node
+    takes when it starts. A node that makes blocks holds everything.
+  - `--mempool-size` is what the pool knows of, by size: 1 GB unless
+    said otherwise (it was 64 MB, of transactions all held).
+  - What is only known of keeps another from spending the same (and
+    is given way to by one that pays enough more), counts towards
+    what a payment should pay and what the pool holds, and goes when
+    a block spends what it spends, when it is too old, or when it
+    pays least and there is no room. It is not told of to a new peer,
+    is answered `not here` when asked for, is not put in a block, and
+    is not kept from one run to the next.
+  - `mempool` at the prompt says how many are held whole, where that
+    is not all; the node says how it is set when it starts.
+  - (`mempool::tests::of_what_is_known_some_is_held_whole`.)
+- **Left of the list below:** a miner that starts with nothing asking
+  several peers for the older ones (it has them as they are told of,
+  and no more); a node saying it holds everything, for miners to
+  prefer; what is done with one only known of whose names' state
+  changes (it stays until it is old); the entries' own bound, which
+  is that of the pool's size and no number of their own.
+
 - **Asked for:** to look into the pool. Ours is not the usual one: a
   transaction waiting is far larger than what it leaves on the chain
   (its signatures go into the block's proof and not into the block),

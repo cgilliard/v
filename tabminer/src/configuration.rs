@@ -172,7 +172,22 @@ is given (default 5)",
             Opt {
                 name: "mempool-size",
                 takes: Takes::Value("SIZE"),
-                help: "bytes of transactions waiting for a block that are kept at\nthe most: what pays least gives way to what pays more\n(default 64m)",
+                help: "bytes of transactions waiting for a block that are known of\nat the most: what pays least gives way to what pays more\n(default 1g). A node that makes blocks holds them all\nwhole; one that makes none holds whole the most recent and\na share of the older, and of the rest only what they\nspend and pay",
+            },
+            Opt {
+                name: "mempool-recent",
+                takes: Takes::Value("SIZE"),
+                help: "with --no-mine: bytes of the most recent transactions\nheld whole (default 8m)",
+            },
+            Opt {
+                name: "mempool-share",
+                takes: Takes::Value("PERCENT"),
+                help: "with --no-mine: the share of the older ones held whole,\nchosen by this node's own secret (default 35; 100: all)",
+            },
+            Opt {
+                name: "mempool-older",
+                takes: Takes::Value("SIZE"),
+                help: "with --no-mine: bytes of the older ones held whole at the\nmost (default 128m)",
             },
             Opt {
                 name: "min-fee",
@@ -865,6 +880,25 @@ impl Configuration {
             update: given.number("weight-update", 0)?.unwrap_or(was.weights.update).min(1 << 16),
         })
         .with_max_tx_size(given.size("max-tx-size", 1)?.map_or(was.max_tx_size, |bytes| bytes as usize));
+        // How much of what the pool knows of is held whole: all of it,
+        // by a node that makes blocks, which it makes of them; and by
+        // one that makes none, the most recent and a share of the rest.
+        let held = [given.one("mempool-recent"), given.one("mempool-share"), given.one("mempool-older")];
+        net.policy = match given.flag("no-mine") {
+            false if held.iter().any(Option::is_some) => {
+                return Err(Refused::Wrong(
+                    "each of --mempool-recent, --mempool-share and --mempool-older needs --no-mine: \
+                     a node that makes blocks holds every transaction whole"
+                        .into(),
+                ));
+            }
+            false => net.policy.holding_all(),
+            true => net.policy.holding(
+                given.size("mempool-recent", 1 << 20)?.map_or(was.whole_recent, |bytes| bytes as usize),
+                given.number("mempool-share", 0)?.map_or(was.whole_older_percent, |p| p.min(100) as usize),
+                given.size("mempool-older", 0)?.map_or(was.whole_older, |bytes| bytes as usize),
+            ),
+        };
         net.relay = given.flag("relay");
         // (Never fewer than whoever sends takes to go over, and one.)
         let least = u64::from(crate::consensus::SWITCH) + 1;
@@ -1047,6 +1081,18 @@ impl Configuration {
             ("Threads", if self.threads == 0 { "one a core".to_string() } else { commas(self.threads as u64) }),
             ("Request Queue Size", commas(self.net.request_queue as u64)),
             ("Mempool Size", format!("{} bytes", commas(self.net.pool as u64))),
+            (
+                "Mempool Held Whole",
+                match self.net.policy.whole_older_percent >= 100 && self.net.policy.whole_recent == usize::MAX {
+                    true => "all".to_string(),
+                    false => format!(
+                        "the most recent {} bytes, and {}% of the older in {} bytes at the most",
+                        commas(self.net.policy.whole_recent as u64),
+                        self.net.policy.whole_older_percent,
+                        commas(self.net.policy.whole_older as u64)
+                    ),
+                },
+            ),
             ("Min Fee", format!("{} a unit of weight", commas(self.net.policy.min_fee_per_unit))),
             ("Fee Half Life", format!("{} hours", commas(self.net.policy.half_life_secs / 3600))),
             ("Mempool Expiry", format!("{} days", commas(self.net.policy.expiry_secs / 86400))),
@@ -1211,11 +1257,20 @@ mod tests {
         let c = read(&[]).unwrap();
         assert_eq!((c.network, c.mine, c.threads, c.keep), (Network::Mainnet, true, 0, 1008));
         // The pool's policy: the default, or what is set of it.
-        assert_eq!(c.net.policy, crate::mempool::Policy::MAINNET);
+        // (A node that makes blocks holds every transaction whole.)
+        assert_eq!(c.net.policy, crate::mempool::Policy::MAINNET.holding_all());
         let set = read(&["--min-fee", "50", "--fee-half-life", "6", "--mempool-expiry", "3", "--reserve", "25"]);
-        assert_eq!(set.unwrap().net.policy, crate::mempool::Policy::set(50, 6, 3, 25));
+        assert_eq!(set.unwrap().net.policy, crate::mempool::Policy::set(50, 6, 3, 25).holding_all());
+        // One that makes none: the most recent, and a share of the
+        // older ones; as it is set, or by default.
+        assert_eq!(read(&["--no-mine"]).unwrap().net.policy, crate::mempool::Policy::MAINNET);
+        let held = read(&["--no-mine", "--mempool-recent", "2m", "--mempool-share", "50", "--mempool-older", "16m"]);
+        assert_eq!(held.unwrap().net.policy, crate::mempool::Policy::MAINNET.holding(2 << 20, 50, 16 << 20));
+        assert!(
+            matches!(read(&["--mempool-share", "50"]), Err(Refused::Wrong(what)) if what.contains("needs --no-mine"))
+        );
         let some = read(&["--reserve", "0"]).unwrap().net.policy;
-        assert_eq!(some, crate::mempool::Policy::set(crate::mempool::MIN_FEE_PER_UNIT, 12, 14, 0));
+        assert_eq!(some, crate::mempool::Policy::set(crate::mempool::MIN_FEE_PER_UNIT, 12, 14, 0).holding_all());
         assert!(read(&["--fee-half-life", "0"]).is_err() && read(&["--mempool-expiry", "0"]).is_err());
         // What a transaction's parts weigh, and the largest one taken.
         let weighed =
@@ -1235,7 +1290,10 @@ mod tests {
         assert_eq!(c.main_log, Path::new("/home/chris/.tabernacle/tabminer/tabernacle.log"));
         assert_eq!(c.request_log, Path::new("/home/chris/.tabernacle/tabminer/request.log"));
         assert_eq!(c.stat_log, Path::new("/home/chris/.tabernacle/tabminer/stat.log"));
-        assert_eq!((c.net.clone(), c.rotation, c.stats), (Net::default(), Rotation::default(), Every::default()));
+        // (But for the pool's holding everything whole, as a node that
+        // makes blocks does.)
+        let net = Net { policy: Net::default().policy.holding_all(), ..Net::default() };
+        assert_eq!((c.net.clone(), c.rotation, c.stats), (net, Rotation::default(), Every::default()));
         assert_eq!((c.request_log_queue, c.built_in_seeds, c.peers.len(), c.seeds.len()), (10_000, true, 0, 0));
         // Each network has a directory of its own.
         assert_eq!(read(&["--network", "dev"]).unwrap().data_dir, Path::new("/home/chris/.tabernacle/tabminer-dev"));
@@ -1580,7 +1638,7 @@ mod tests {
             let value = match takes {
                 "NAME" => Some("dev"),
                 "DIR" | "FILE" => Some("/somewhere/of/its/own"),
-                "N" | "TIME" | "SIZE" | "N[,S]" | "N[,K]" => Some("70"),
+                "N" | "TIME" | "SIZE" | "N[,S]" | "N[,K]" | "PERCENT" => Some("70"),
                 "HEX" => Some("0000000000000000000000000000000000000000000000000000000000000000"),
                 "ADDR:PORT" => Some("10.1.2.3:4000"),
                 "HOST:PORT" => Some("seed.example.org:4000"),
