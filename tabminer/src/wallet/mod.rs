@@ -49,6 +49,7 @@
 //! the chain's state holds is asked through [`Unspent`].
 
 pub mod follow;
+mod journal;
 pub mod list;
 pub mod names;
 pub mod records;
@@ -110,6 +111,10 @@ const T_PAYMENTS: usize = 16;
 const T_NOTES: usize = 17;
 /// The list of what the wallet has done and been paid ([`list`]).
 const T_LIST: usize = 18;
+/// What has changed of the outputs, and of the list, since each was
+/// last written whole ([`journal`]).
+const T_OUTPUTS_LOG: usize = 19;
+const T_LIST_LOG: usize = 20;
 
 /// A name this wallet has given out under a name it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -966,6 +971,13 @@ struct Tables {
     /// list's rows, and not kept (taken up when the list is next
     /// brought up to date, which is at once).
     located: Vec<(Id, u32)>,
+    /// How many of the list's first rows are at rest: done with, and
+    /// not looked at again when the list is brought up to date. Not
+    /// kept: found again as the list is gone through.
+    rest: usize,
+    /// Whether the unspent outputs have been looked through since the
+    /// list was last brought up to date: what was found wants rows.
+    scanned: bool,
 }
 
 /// A table of records each named by 32 bytes.
@@ -1064,7 +1076,7 @@ impl Tables {
         for (id, note) in get_entries(&table(T_NOTES)?).ok_or(WalletError::Corrupt("notes"))? {
             t.notes.insert(id, note.to_vec());
         }
-        t.list = list::decode(&table(T_LIST)?).ok_or(WalletError::Corrupt("list"))?;
+        t.list = list::decode(&table(T_LIST)?, &table(T_LIST_LOG)?).ok_or(WalletError::Corrupt("list"))?;
         for (at, word) in get_entries(&table(T_NAMES_SIGNED)?).ok_or(WalletError::Corrupt("names signed for"))? {
             t.names_signed.insert(at, word.to_vec());
         }
@@ -1078,6 +1090,17 @@ impl Tables {
         for (id, b) in get_entries(&table(T_OUTPUTS)?).ok_or(WalletError::Corrupt("outputs"))? {
             let o = commitment(&id).and_then(|c| Owned::from_bytes(c, b)).ok_or(WalletError::Corrupt("output"))?;
             t.outputs.insert(id, o);
+        }
+        // (And what has changed of them since that was written.)
+        let log = table(T_OUTPUTS_LOG)?;
+        for (id, b) in journal::entries(&log).ok_or(WalletError::Corrupt("outputs' log"))? {
+            match b {
+                Some(b) => {
+                    let o = commitment(&id).and_then(|c| Owned::from_bytes(c, b));
+                    t.outputs.insert(id, o.ok_or(WalletError::Corrupt("output"))?);
+                }
+                None => drop(t.outputs.remove(&id)),
+            }
         }
         for (id, b) in get_entries(&table(T_SLATES)?).ok_or(WalletError::Corrupt("slates"))? {
             t.slates.insert(id, Pending::from_bytes(b).ok_or(WalletError::Corrupt("slate"))?);
@@ -1126,6 +1149,8 @@ pub struct Wallet<B: Backend> {
     t: Tables,
     /// Blocks an output is to have been in before it is spent.
     min_confirmations: u32,
+    /// The logs of the outputs and of the list, as they are on disk.
+    logs: [journal::Log; 2],
 }
 
 impl<B: Backend> Wallet<B> {
@@ -1150,7 +1175,9 @@ impl<B: Backend> Wallet<B> {
                 (secret, Some(phrase))
             }
         };
-        Ok((Wallet { records, master: master_of(&secret.seed), t, min_confirmations: MIN_CONFIRMATIONS }, created))
+        let logs = Self::logs(&records)?;
+        let min_confirmations = MIN_CONFIRMATIONS;
+        Ok((Wallet { records, master: master_of(&secret.seed), t, min_confirmations, logs }, created))
     }
 
     /// [`Wallet::open_with`], with no password asked for or given.
@@ -1178,7 +1205,8 @@ impl<B: Backend> Wallet<B> {
         crate::random::fill(&mut drawn)?;
         t.address = (u64::from_le_bytes(drawn) >> 4).max(1);
         records.write(&[(T_META, &t.encode(T_META)), (T_ADDRESS, &t.encode(T_ADDRESS))])?;
-        Ok(Wallet { records, master: master_of(&secret.seed), t, min_confirmations: MIN_CONFIRMATIONS })
+        let logs = Self::logs(&records)?;
+        Ok(Wallet { records, master: master_of(&secret.seed), t, min_confirmations: MIN_CONFIRMATIONS, logs })
     }
 
     /// Puts `t` in place of what the wallet keeps: the tables `dirty` on
@@ -1186,13 +1214,82 @@ impl<B: Backend> Wallet<B> {
     fn commit(&mut self, mut t: Tables, dirty: &[usize]) -> Result<()> {
         // (The list of what the wallet has done follows from the rest:
         // brought up to it with every change, and kept with it.)
-        let listed = list::relist(&mut t);
-        let dirty: Vec<usize> = dirty.iter().copied().chain(listed.then_some(T_LIST)).collect();
-        let encoded: Vec<(usize, Vec<u8>)> = dirty.iter().map(|table| (*table, t.encode(*table))).collect();
+        list::relist(&mut t);
+        // (The list is held against what is kept whatever that found:
+        // a row may have been written to before it, by what was done.)
+        let mut dirty: Vec<usize> = dirty.iter().copied().chain([T_LIST]).collect();
+        dirty.sort_unstable();
+        dirty.dedup();
+        let mut encoded: Vec<(usize, Vec<u8>)> = Vec::new();
+        // The outputs and the list, which grow without end, are
+        // written as what has changed of them ([`journal`]); the rest
+        // whole.
+        let mut steps: Vec<(usize, journal::Step)> = Vec::new();
+        for table in dirty {
+            let (log, at, delta) = match table {
+                T_OUTPUTS => (T_OUTPUTS_LOG, 0, self.outputs_changed(&t)),
+                T_LIST => {
+                    let from = self.t.rest.min(self.t.list.len());
+                    (T_LIST_LOG, 1, list::changed(&self.t.list[from..], from, &t.list))
+                }
+                _ => {
+                    encoded.push((table, t.encode(table)));
+                    continue;
+                }
+            };
+            if delta.is_empty() {
+                continue;
+            }
+            let step = self.logs[at].step(&delta, || t.encode(table));
+            match &step {
+                journal::Step::Log(bytes) => encoded.push((log, bytes.clone())),
+                journal::Step::Whole(bytes) => encoded.extend([(table, bytes.clone()), (log, Vec::new())]),
+            }
+            steps.push((at, step));
+        }
         let changes: Vec<(usize, &[u8])> = encoded.iter().map(|(table, bytes)| (*table, &bytes[..])).collect();
         self.records.write(&changes)?;
+        for (at, step) in steps {
+            self.logs[at].written(step);
+        }
         self.t = t;
         Ok(())
+    }
+
+    /// The logs of the two tables that have one, as a file has them.
+    fn logs(records: &Records<B>) -> Result<[journal::Log; 2]> {
+        let log = |table: usize, log: usize| -> Result<journal::Log> {
+            Ok(journal::Log::new(records.read(table)?.len(), records.read(log)?))
+        };
+        Ok([log(T_OUTPUTS, T_OUTPUTS_LOG)?, log(T_LIST, T_LIST_LOG)?])
+    }
+
+    /// What of the outputs is other in `t` than in what the wallet
+    /// keeps, as entries of their log.
+    fn outputs_changed(&self, t: &Tables) -> Vec<u8> {
+        // (Both in the order of their ids, gone through side by side:
+        // this is done at every change, of every output there is.)
+        let mut delta = Vec::new();
+        let (mut was, mut now) = (self.t.outputs.iter().peekable(), t.outputs.iter().peekable());
+        loop {
+            match (was.peek(), now.peek()) {
+                (Some((a, _)), Some((b, o))) if a == b => {
+                    if was.next().map(|w| w.1) != Some(*o) {
+                        journal::put(&mut delta, b, Some(&o.to_bytes()));
+                    }
+                    now.next();
+                }
+                // (One that is no longer there; one that was not.)
+                (Some((a, _)), Some((b, _))) if a < b => journal::put(&mut delta, was.next().expect("peeked").0, None),
+                (Some(_), None) => journal::put(&mut delta, was.next().expect("peeked").0, None),
+                (_, Some((b, o))) => {
+                    journal::put(&mut delta, b, Some(&o.to_bytes()));
+                    now.next();
+                }
+                (None, None) => break,
+            }
+        }
+        delta
     }
 
     /// Has the wallet spend only outputs that have been in the chain for
@@ -1545,6 +1642,9 @@ impl<B: Backend> Wallet<B> {
 
     fn memo_scan(&mut self, chain: &impl Unspent, add: bool, now: u64) -> Result<(usize, u128)> {
         let mut t = self.t.clone();
+        // (What is found wants rows in the list, and anything in it
+        // may be other than it was: gone through whole, this once.)
+        (t.scanned, t.rest) = (true, 0);
         let (mut found, mut total) = (0usize, 0u128);
         let mut failed: Option<io::Error> = None;
         // A record at a time: the set may be far larger than memory.
@@ -2463,12 +2563,12 @@ impl<B: Backend> Wallet<B> {
         if let Some(row) = what.parse::<u32>().ok().and_then(|n| self.listed(n)) {
             return Ok(row);
         }
-        let what = what.to_ascii_lowercase();
-        let hex = |id: &Id| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let fits = |row: &&list::Row| {
-            !what.is_empty()
-                && (hex(&row.id).starts_with(&what) || row.transaction().is_some_and(|t| hex(&t).starts_with(&what)))
-        };
+        // (The digits, a number each: an id begins with them if its
+        // halves of bytes are those, with nothing made to compare.)
+        let digits: Option<Vec<u8>> = what.chars().map(|c| c.to_digit(16).map(|d| d as u8)).collect();
+        let Some(digits) = digits.filter(|d| !d.is_empty() && d.len() <= 64) else { return Err(Vec::new()) };
+        let begins = |id: &Id| digits.iter().enumerate().all(|(i, d)| (id[i / 2] >> (4 * (1 - i % 2))) & 15 == *d);
+        let fits = |row: &&list::Row| begins(&row.id) || row.transaction().is_some_and(|t| begins(&t));
         let found: Vec<&list::Row> = self.t.list.iter().filter(fits).collect();
         match found[..] {
             [one] => Ok(one),
@@ -2481,6 +2581,34 @@ impl<B: Backend> Wallet<B> {
     /// that has the output among those it makes, or the row of the
     /// output itself as it came; and a transaction it signed that has
     /// it among its inputs.
+    /// [`Wallet::rows_of_output`], of every output at once, by its
+    /// commitment: gone through once, however many there are.
+    pub fn rows_of_outputs(&self) -> BTreeMap<Id, (Option<u32>, Option<u32>)> {
+        let mut rows: BTreeMap<Id, (Option<u32>, Option<u32>)> = BTreeMap::new();
+        for row in &self.t.list {
+            let n = Some(row.number);
+            if row.is_output() {
+                let made = &mut rows.entry(row.id).or_default().0;
+                *made = made.or(n);
+            }
+            if let Some(sent) = self.t.sent.get(&row.txid) {
+                for o in &sent.tx.outputs {
+                    let made = &mut rows.entry(digest_to_bytes(&o.commitment)).or_default().0;
+                    *made = made.or(n);
+                }
+                // (The last of them: a payment taken back or sped up
+                // spends what the one before it did.)
+                if row.by == 0 {
+                    sent.inputs.iter().for_each(|c| rows.entry(digest_to_bytes(c)).or_default().1 = n);
+                }
+            }
+            if let Some(begun) = self.t.slates.get(&row.id) {
+                begun.inputs.iter().for_each(|c| rows.entry(digest_to_bytes(c)).or_default().1 = n);
+            }
+        }
+        rows
+    }
+
     pub fn rows_of_output(&self, commitment: &Commitment) -> (Option<u32>, Option<u32>) {
         let id = digest_to_bytes(commitment);
         let signed = |row: &&list::Row| self.t.sent.get(&row.txid);

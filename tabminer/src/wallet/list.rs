@@ -146,6 +146,22 @@ impl Row {
     }
 }
 
+/// The rows of `now` that are other than those of `was`, which is the
+/// list as it was from its row at `from` on (the first not at rest:
+/// the rows before never change): as entries of the list's log
+/// ([`super::journal`]).
+pub(super) fn changed(was: &[Row], from: usize, now: &[Row]) -> Vec<u8> {
+    let mut delta = Vec::new();
+    for (i, row) in now.iter().enumerate().skip(from) {
+        if was.get(i - from) != Some(row) {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&row.number.to_be_bytes());
+            super::journal::put(&mut delta, &id, Some(&row.to_bytes()));
+        }
+    }
+    delta
+}
+
 /// The rows as the wallet's file keeps them: by number.
 pub(super) fn encode(rows: &[Row]) -> Vec<u8> {
     let keyed: Vec<(Id, Vec<u8>)> = rows
@@ -161,7 +177,7 @@ pub(super) fn encode(rows: &[Row]) -> Vec<u8> {
 
 /// The rows a file keeps, in their order: `None` if they are not rows,
 /// or not numbered from one without a gap.
-pub(super) fn decode(bytes: &[u8]) -> Option<Vec<Row>> {
+pub(super) fn decode(bytes: &[u8], log: &[u8]) -> Option<Vec<Row>> {
     let mut rows = Vec::new();
     for (i, (id, bytes)) in super::get_entries(bytes)?.into_iter().enumerate() {
         let number = u32::from_be_bytes(id[..4].try_into().ok()?);
@@ -170,8 +186,23 @@ pub(super) fn decode(bytes: &[u8]) -> Option<Vec<Row>> {
         }
         rows.push(Row::from_bytes(number, bytes)?);
     }
+    // And the rows that have changed, or been added, since: each in
+    // the place of the one of its number, or after the last.
+    for (id, bytes) in super::journal::entries(log)? {
+        let number = u32::from_be_bytes(id[..4].try_into().ok()?);
+        let row = Row::from_bytes(number, bytes?)?;
+        match (number as usize).checked_sub(1)? {
+            at if at < rows.len() => rows[at] = row,
+            at if at == rows.len() => rows.push(row),
+            _ => return None,
+        }
+    }
     Some(rows)
 }
+
+/// How deep a block is that no branch a node goes over to undoes:
+/// twice what a node keeps to undo, by default.
+const DEEP: u32 = 2016;
 
 /// What a transaction is, by what it carries: a step of a name, if it
 /// carries an operation on one; else a payment.
@@ -185,8 +216,9 @@ fn kind_of(ops: &[NameOp]) -> (Kind, Vec<u8>) {
 }
 
 impl Tables {
+    /// (From the last: what is looked for is nearly always new.)
     fn row_of(&self, id: &Id) -> Option<usize> {
-        self.list.iter().position(|row| row.id == *id || row.txid == *id)
+        self.list.iter().rposition(|row| row.id == *id || row.txid == *id)
     }
 
     fn add(&mut self, kind: Kind, stage: Stage, id: Id, amount: u64, fee: u64, created: u64) -> usize {
@@ -230,7 +262,10 @@ impl Tables {
 /// Brings the list up to the tables as they are: a row for each record
 /// that has none, and each row's state. Whether anything changed.
 pub(super) fn relist(t: &mut Tables) -> bool {
-    let before = t.list.clone();
+    // (The rows at rest are not looked at: a miner's list is of every
+    // block it has made, and this is done at every change.)
+    t.rest = t.rest.min(t.list.len());
+    let (from, before) = (t.rest, t.list[t.rest..].to_vec());
     // Payments begun.
     let begun: Vec<(Id, u64, u64)> = t.slates.iter().map(|(id, p)| (*id, p.amount, p.fee)).collect();
     for (id, amount, fee) in begun {
@@ -259,8 +294,10 @@ pub(super) fn relist(t: &mut Tables) -> bool {
     let won: Vec<Id> = t.rewards.iter().filter(|(_, (_, block))| *block != [0; 32]).map(|(c, _)| *c).collect();
     // (Those in the order they lie in the chain: the list of a wallet
     // made again reads oldest first, as one that grew does.)
+    // (Only after such a look: there may be very many of them.)
+    let looked = std::mem::take(&mut t.scanned);
     let mut found: Vec<(Option<u64>, Id)> =
-        t.outputs.iter().filter(|(_, o)| o.recovered).map(|(c, o)| (o.position, *c)).collect();
+        t.outputs.iter().filter(|(_, o)| looked && o.recovered).map(|(c, o)| (o.position, *c)).collect();
     found.sort();
     let found: Vec<Id> = found.into_iter().map(|(_, c)| c).collect();
     for (kind, ids) in [(Kind::Received, coming), (Kind::Reward, won), (Kind::Received, found)] {
@@ -273,7 +310,7 @@ pub(super) fn relist(t: &mut Tables) -> bool {
         }
     }
     // Where each row stands.
-    for at in 0..t.list.len() {
+    for at in t.rest..t.list.len() {
         let row = t.list[at].clone();
         let (stage, height) = match row.is_output() {
             true => match t.outputs.get(&row.id) {
@@ -332,7 +369,7 @@ pub(super) fn relist(t: &mut Tables) -> bool {
     let mut waiting = Vec::new();
     for (id, height) in std::mem::take(&mut t.located) {
         let mut placed = false;
-        for at in 0..t.list.len() {
+        for at in t.rest..t.list.len() {
             let row = &t.list[at];
             let makes = |sent: &super::Sent| sent.tx.outputs.iter().any(|o| digest_to_bytes(&o.commitment) == id);
             if (row.is_output() && row.id == id) || (row.by == 0 && t.sent.get(&row.txid).is_some_and(makes)) {
@@ -347,6 +384,27 @@ pub(super) fn relist(t: &mut Tables) -> bool {
     // (No more of them than a node's branches are long.)
     let over = waiting.len().saturating_sub(4096);
     t.located = waiting.split_off(over);
+    // The first rows that are at rest now: done with, as they stand.
+    // Of a transaction, when the wallet has let go of its record; of
+    // an output, when it is gone, or so deep in the chain that no
+    // branch undoes it.
+    let tip = t.synced.map_or(0, |(height, _)| height);
+    while let Some(row) = t.list.get(t.rest) {
+        let resting = match (row.is_output(), t.outputs.get(&row.id)) {
+            (true, None) => true,
+            (true, Some(_)) => {
+                let deep = row.height > 0 && tip >= row.height.saturating_add(DEEP);
+                row.stage == Stage::Confirmed && deep && !t.lost.contains_key(&row.id)
+            }
+            (false, _) => !t.slates.contains_key(&row.id) && !t.sent.contains_key(&row.txid),
+        };
+        if !resting {
+            break;
+        }
+        t.rest += 1;
+    }
     let _ = State::Unspent;
-    t.list != before
+    // (What was at rest before is as it was: only the others are held
+    // against what they were.)
+    t.list[from..] != before[..]
 }

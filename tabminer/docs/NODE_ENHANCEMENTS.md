@@ -1402,6 +1402,37 @@ these had a test of its own.
 
 ### 36. A miner's wallet, at the size it grows to
 
+- **Done:**
+  - The test is `wallet::tests::a_miners_wallet_at_the_size_it_grows_to`:
+    a reward a block, a hundred outputs made one every hundred
+    blocks, for a year of blocks; what each thing then takes is
+    printed (`SCALE wallet: …`) and bounded. It runs on CI with the
+    slow tests. Tried here only at a quarter of a year, to find what
+    to change.
+  - The outputs and the list are written as what changed, after the
+    table as last written whole (`wallet/journal.rs`); whole again
+    when the changes have grown long. Before, every change wrote
+    both whole: megabytes, several times a block, after a year.
+  - The list's first rows that are done with (their records gone, or
+    their outputs too deep to be undone) are at rest and not gone
+    through again; a row is looked for from the last; `outputs`
+    finds every output's rows in one pass; a row by its id compares
+    digits without making text.
+  - `txs` lists the last thirty rows and says how many there are;
+    `txs --all` (and `txs mined --all`) lists every one.
+- **Measured at 12,000 blocks** (before, and with these): a block's
+  worth of the wallet's work 25 ms, now 11 ms; every output's rows
+  68 ms at 3,000, now 2 ms at 12,000; a row by its id 3.9 ms at
+  3,000, now 0.1 ms at 12,000. `balance` under a millisecond, the
+  file opened in 14 ms, the file 6 MB.
+- **What still grows with the wallet, and is left:** every change
+  copies all the wallet's tables in memory first (a millisecond at
+  12,000 blocks, four times a block: some 30 ms a block after a
+  year, on the wallet's own thread). It would want the tables
+  changed in place. And outputs spent are kept for good, as
+  `outputs --all` shows them; once a payment is long settled the
+  rows that made and spent its outputs are no longer known.
+
 - **Asked for:** to try the wallet at the size a miner's reaches. One
   reward a block is 144 rows and outputs a day, some 52,000 a year;
   the live test's miner had 166 rows and spent 142 outputs at once

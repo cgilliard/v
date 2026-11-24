@@ -912,3 +912,130 @@ fn a_payment_whose_input_moved_is_to_be_made_again() {
     // The list is there, as it was, when the file is opened again.
     assert_eq!(reopened(&alice, "").unwrap().list(), alice.list());
 }
+
+/// A miner's wallet at the size it grows to: a reward a block, spent
+/// down a hundred at a time into one output, for as many blocks as
+/// `TAB_WALLET_BLOCKS` says (a year's, if nothing does). What each
+/// thing then takes is printed, and none of it may have come to take
+/// long: what a wallet does at every block is done at every block for
+/// as long as the miner mines.
+#[test]
+#[ignore = "a year of a miner's blocks: run on CI"]
+fn a_miners_wallet_at_the_size_it_grows_to() {
+    use std::time::Instant;
+    let blocks: u32 = std::env::var("TAB_WALLET_BLOCKS").ok().and_then(|n| n.parse().ok()).unwrap_or(52_560);
+    let mut chain = Outputs::default();
+    chain.1 = 10;
+    let mut wallet = new();
+    let began = Instant::now();
+    // What one block costs the wallet, as the last thousand had it.
+    let mut last_thousand = Instant::now();
+    let mut a_block = std::time::Duration::ZERO;
+    for height in 1..=blocks {
+        // The block's reward: expected, made, known to be this
+        // wallet's; and the wallet held against the chain.
+        let out = wallet.reward(1500 * COIN, height, NOW).unwrap();
+        // (Made by the block of this height, which the wallet is told
+        // as a node tells it: the chain of these tests knows of one
+        // block only.)
+        let first = chain.0.len() as u64;
+        chain.0.push((out.commitment, out.memo, out.amount, true));
+        wallet.locate(first, &[out.commitment], height, &[height as u8; 32], first + 1).unwrap();
+        wallet.reward_found(&out.commitment, &[height as u8; 32]).unwrap();
+        wallet.reconcile(&chain, height, 10, None).unwrap();
+        // Rewards deep enough are done with.
+        if height > 10 {
+            for (c, h, _) in wallet.rewards() {
+                if h + 10 <= height {
+                    wallet.reward_settled(&c).unwrap();
+                }
+            }
+        }
+        // A hundred outputs made one, now and then: paid to itself.
+        if height % 100 == 0 {
+            let mut slate = wallet.send(100 * 1500 * COIN - COIN, None, &chain, NOW).unwrap();
+            wallet.receive_slate(&mut slate, NOW).unwrap();
+            let signed = wallet.finalize(&slate, NOW).unwrap();
+            for input in &signed.tx.inputs {
+                chain.0[input.position as usize].3 = false;
+            }
+            let first = chain.0.len() as u64;
+            chain.0.extend(signed.tx.outputs.iter().map(|o| (o.commitment, o.memo, o.amount, true)));
+            let made: Vec<Commitment> = signed.tx.outputs.iter().map(|o| o.commitment).collect();
+            wallet.locate(first, &made, height, &[height as u8; 32], first + made.len() as u64).unwrap();
+        }
+        if height % 1000 == 0 {
+            a_block = last_thousand.elapsed() / 1000;
+            last_thousand = Instant::now();
+        }
+    }
+    let all = began.elapsed();
+    let timed = |what: &mut dyn FnMut()| {
+        let t = Instant::now();
+        what();
+        t.elapsed()
+    };
+    let balance = timed(&mut || {
+        wallet.balance(&chain).unwrap();
+    });
+    let spendable = timed(&mut || drop(wallet.spendable(&chain).unwrap()));
+    let rows_of = timed(&mut || drop(wallet.rows_of_outputs()));
+    let found = timed(&mut || drop(wallet.row("ffffffffffffffffffff")));
+    let image = wallet.records.backend().image(Lost::None);
+    let opened = timed(&mut || drop(reopened(&wallet, "").unwrap()));
+    // (And it is the wallet that was: what was written a change at a
+    // time is what is read.)
+    let again = reopened(&wallet, "").unwrap();
+    assert!(again.list() == wallet.list() && again.outputs() == wallet.outputs());
+    let (rows, outputs) = (wallet.list().len(), wallet.outputs().len());
+    println!("SCALE wallet: {blocks} blocks in {:.1}s; a block at the end {:?}", all.as_secs_f64(), a_block);
+    println!("SCALE wallet: {rows} rows, {outputs} outputs kept, the file {} KB", image.len() / 1024);
+    println!("SCALE wallet: balance {balance:?}, what can be spent {spendable:?}, a row by its id {found:?}");
+    println!("SCALE wallet: every output's rows {rows_of:?}, opening the file {opened:?}");
+    // A block's worth of the wallet's work, and what is asked of it at
+    // the prompt, stay small however long it has mined.
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    assert!(ms(a_block) < 150.0, "a block takes the wallet {a_block:?}");
+    assert!(ms(balance) < 500.0 && ms(spendable) < 500.0 && ms(found) < 100.0, "{balance:?} {spendable:?} {found:?}");
+    assert!(ms(rows_of) < 2000.0 && ms(opened) < 2000.0, "{rows_of:?} {opened:?}");
+}
+
+/// The outputs and the list are written a change at a time, after
+/// the table as it was last written whole; and whole again when the
+/// changes have grown long. Whichever was last done, the wallet read
+/// from its file is the wallet that wrote it.
+#[test]
+fn what_is_written_a_change_at_a_time_is_what_is_read() {
+    let mut chain = Outputs::default();
+    let mut wallet = new();
+    let mut bob = new();
+    for round in 0..40u32 {
+        let out = wallet.receive(100 * COIN, NOW).unwrap();
+        chain.make(&[out], &mut [&mut wallet]);
+        // Paid on, taken back, begun and given up: rows written to
+        // more than once, outputs changed and forgotten.
+        let mut slate = wallet.send(COIN, None, &chain, NOW).unwrap();
+        match round % 3 {
+            0 => wallet.cancel_slate(&slate.id).unwrap(),
+            1 => {
+                bob.receive_slate(&mut slate, NOW).unwrap();
+                let signed = wallet.finalize(&slate, NOW).unwrap();
+                chain.take(&signed.tx, &mut [&mut wallet, &mut bob]);
+                wallet.reconcile(&chain, round, 2, None).unwrap();
+            }
+            _ => {
+                bob.receive_slate(&mut slate, NOW).unwrap();
+                let signed = wallet.finalize(&slate, NOW).unwrap();
+                let back = wallet.cancel_sent(&signed.tx.txid(), None, &chain, NOW).unwrap();
+                chain.take(&back.tx, &mut [&mut wallet]);
+                bob.prune_pending(&chain, &[]).unwrap();
+            }
+        }
+        for w in [&wallet, &bob] {
+            let again = reopened(w, "").unwrap();
+            assert!(again.list() == w.list() && again.outputs() == w.outputs(), "round {round}");
+            assert_eq!(again.balance(&chain).unwrap(), w.balance(&chain).unwrap(), "round {round}");
+        }
+    }
+    assert!(wallet.list().len() > 40 && bob.list().len() > 20);
+}

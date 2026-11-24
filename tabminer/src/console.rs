@@ -49,12 +49,13 @@ pub const HELP: &str = "commands:
                             undone. Rewards of such blocks are under `mining`)
   mining                    the blocks this node won of late, and those of them that
                             were orphaned: undone, for a longer chain without them
-  txs [ROW | pending | mined]
+  txs [ROW | pending | mined] [--all]
                             everything the wallet has done and been paid, a row each
                             with a number that stays: payments sent and received,
                             rewards, coins burned, the steps of names, and what was
-                            taken back or sped up. `txs N` says all of one; `txs
-                            pending` those in no block yet; `txs mined` the rewards
+                            taken back or sped up. `txs ROW` says all of one; `txs
+                            pending` those in no block yet; `txs mined` the rewards.
+                            The last thirty are listed, or with --all every one
   outputs [--all]           the wallet's outputs that are unspent (with --all, those
                             it has spent too): each one's block, where it lies
                             among the chain's outputs, how many of its eight
@@ -150,6 +151,9 @@ pub const HELP: &str = "commands:
 
 /// What is said after a payment sent has been taken back, and after one
 /// has been sped up.
+/// Rows `txs` lists, the last of them, unless all are asked for.
+const TXS_SHOWN: usize = 30;
+
 const CANCELLED: &str = "The transaction has been cancelled, but it could still end up in a block: \
 `txs` says which of the two did.";
 const BUMPED: &str = "The transaction has been replaced, but the one before it could still end up in a block: \
@@ -370,8 +374,10 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             ("address", []) => self.wallet().map(|wallet| wallet.address()),
             ("outputs", []) => self.outputs(false),
             ("outputs", ["--all"]) => self.outputs(true),
-            ("txs", []) => self.txs(None),
-            ("txs", [which]) => self.txs(Some(which)),
+            ("txs", []) => self.txs(None, false),
+            ("txs", ["--all"]) => self.txs(None, true),
+            ("txs", [which @ ("pending" | "mined"), "--all"]) => self.txs(Some(which), true),
+            ("txs", [which]) => self.txs(Some(which), false),
             ("mining", []) => self.mining(),
             ("send", [amount, to]) if !noted => self.send(amount, None, to, ""),
             ("send", [amount, to, note]) if noted => self.send(amount, None, to, note),
@@ -929,12 +935,14 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
         let mut outputs = wallet.outputs();
         outputs.sort_by_key(|o| (o.position.is_none(), o.position, o.created));
         let (mut rows, mut spent_ones) = (Vec::new(), 0u64);
+        // (Which rows made and spend each: found for all at once.)
+        let of_rows = wallet.rows_of_outputs();
         for o in outputs {
             let held = wallet.held(&o, &snap).map_err(|e| e.to_string())?;
             // The block that made it: the chain says, while it is
             // unspent there; of one spent, the row that made it does.
             let deep = o.position.and_then(|p| snap.confirmations(p, &o.commitment).ok().flatten());
-            let (made, spent) = wallet.rows_of_output(&o.commitment);
+            let (made, spent) = of_rows.get(&digest_to_bytes(&o.commitment)).copied().unwrap_or_default();
             let block = deep.map(|deep| u64::from(tip + 1 - deep.min(tip + 1))).or_else(|| {
                 let height = made.and_then(|n| wallet.listed(n)).map_or(0, |row| row.height);
                 (height > 0 && o.position.is_some()).then_some(u64::from(height))
@@ -1004,7 +1012,7 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
     /// The wallet's list of what it has done and been paid
     /// ([`crate::wallet::list`]): all of it, a part of it (`pending`,
     /// `mined`), or everything of one row.
-    fn txs(&self, which: Option<&&str>) -> Said {
+    fn txs(&self, which: Option<&&str>, all: bool) -> Said {
         use crate::wallet::Unspent;
         use crate::wallet::list::{Kind, Row, Stage};
         let wallet = self.wallet()?;
@@ -1107,13 +1115,17 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                 return Ok(out);
             }
         };
+        // The last of them, unless all are asked for: a miner's list
+        // is of every block it has made.
+        let earlier = if all { 0 } else { rows.len().saturating_sub(TXS_SHOWN) };
+        let rows = &rows[earlier..];
         let stages: Vec<String> = rows.iter().map(|row| stage(row)).collect();
         let wide = stages.iter().map(|s| s.len()).max().unwrap_or(0).max(16);
         let mut lines = vec![format!(
             "  {:>4}  {:<14}  {:<wide$}  {:>24}  {:>14}  {:>9}  {}",
             "#", "kind", "state", "amount", "fee", "block", "id"
         )];
-        for (row, stage) in rows.into_iter().zip(&stages) {
+        for (row, stage) in rows.iter().zip(&stages) {
             let name =
                 if row.name.is_empty() { String::new() } else { format!("  @{}", String::from_utf8_lossy(&row.name)) };
             lines.push(format!(
@@ -1130,6 +1142,14 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             (1, Some("pending")) => Ok("nothing pending".to_string()),
             (1, Some("mined")) => Ok("no rewards yet".to_string()),
             (1, _) => Ok("nothing yet".to_string()),
+            _ if earlier > 0 => {
+                let of = which.map_or(String::new(), |which| format!(" {which}"));
+                Ok(format!(
+                    "{}\nThe last {TXS_SHOWN} are listed, of {}: txs{of} --all lists every one.",
+                    lines.join("\n"),
+                    commas((earlier + rows.len()) as u64)
+                ))
+            }
             _ => Ok(lines.join("\n")),
         }
     }
