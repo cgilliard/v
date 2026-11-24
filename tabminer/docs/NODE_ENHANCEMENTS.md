@@ -1848,8 +1848,10 @@ these had a test of its own.
     signatures used of each key, and what it makes), `txs pending`,
     `txs mined`.
   - `outputs`: id, amount, state, block, position, sigs (the number
-    used, `*last*` beside it when one is left), made by, spent by (a
-    dash where the wallet does not know: an output found by a scan).
+    used, `*last*` beside it when one is left), made by tx, spent by
+    tx (rows of `txs`, said as `#17` so that they are not taken for
+    blocks; a dash where the wallet does not know: an output found by
+    a scan).
   - `cancel N`, `bump N`, `resend N` take a row's number (the first
     digits of an id still work). `cancel` refuses what a block has (a
     commit: "left unrevealed, it is swept later"), what is done with

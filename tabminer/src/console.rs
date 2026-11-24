@@ -1119,20 +1119,22 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
                     dash(block),
                     dash(o.position),
                     sigs,
-                    dash(made.map(u64::from)),
-                    dash(spent.map(u64::from)),
+                    // (Rows of `txs`, said as its numbers are: not
+                    // to be taken for blocks.)
+                    made.map_or("-".to_string(), |row| format!("#{row}")),
+                    spent.map_or("-".to_string(), |row| format!("#{row}")),
                 ],
                 note,
             ));
         }
         let wide = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(9);
         let mut lines = vec![format!(
-            "  {:<8}  {:>24}  {:<wide$}  {:>9}  {:>12}  {:<8}  {:>7}  {:>8}",
-            "id", "amount", "state", "block", "position", "sigs", "made by", "spent by"
+            "  {:<8}  {:>24}  {:<wide$}  {:>9}  {:>12}  {:<8}  {:>10}  {:>11}",
+            "id", "amount", "state", "block", "position", "sigs", "made by tx", "spent by tx"
         )];
         for (what, [id, amount, block, position, sigs, made, spent], note) in &rows {
             lines.push(format!(
-                "  {id}  {amount:>24}  {what:<wide$}  {block:>9}  {position:>12}  {sigs:<8}  {made:>7}  {spent:>8}{note}"
+                "  {id}  {amount:>24}  {what:<wide$}  {block:>9}  {position:>12}  {sigs:<8}  {made:>10}  {spent:>11}{note}"
             ));
         }
         let mut out = match rows.len() {
@@ -2960,8 +2962,8 @@ mod tests {
         // (In the order they lie in the chain; each with its block,
         // the row that made it and the row that spent it.)
         assert_eq!(spent.len(), 2, "{all}");
-        assert_eq!((spent[0][3], spent[0][6], spent[0][7]), ("1", "1", "3"), "{all}");
-        assert_eq!((spent[1][3], spent[1][6], spent[1][7]), ("2", "2", "3"), "{all}");
+        assert_eq!((spent[0][3], spent[0][6], spent[0][7]), ("1", "#1", "#3"), "{all}");
+        assert_eq!((spent[1][3], spent[1][6], spent[1][7]), ("2", "#2", "#3"), "{all}");
         assert!(!all.contains("not listed"), "{all}");
         // And the wallet that was paid lists what it has: that, and
         // the block's reward.
@@ -3273,7 +3275,7 @@ mod tests {
         assert_eq!((pending.lines().count(), row(&pending, 3)[2].as_str()), (2, "begun"), "{pending}");
         assert_eq!(said(&payer, "txs mined").lines().count(), 3);
         let outputs = said(&payer, "outputs");
-        assert!(outputs.lines().any(|l| l.contains("reserved") && l.trim_end().ends_with(" 3")), "{outputs}");
+        assert!(outputs.lines().any(|l| l.contains("reserved") && l.trim_end().ends_with(" #3")), "{outputs}");
         assert_eq!(said(&paid, "txs"), "nothing yet");
         // What comes that is no slate, or of no kind there is.
         assert_eq!(paid.take(&message(99, vec![], None)), Err("a message of a kind not known (99)".to_string()));
@@ -3288,7 +3290,7 @@ mod tests {
         assert_eq!(row(&coming, 1)[..4], ["1", "received", "pending", "5"], "{coming}");
         let outputs = said(&paid, "outputs");
         assert!(
-            outputs.lines().any(|l| l.contains("pending") && l.split_whitespace().rev().nth(1) == Some("1")),
+            outputs.lines().any(|l| l.contains("pending") && l.split_whitespace().rev().nth(1) == Some("#1")),
             "{outputs}"
         );
         // (A second payment begun to it, answered, and then no longer
