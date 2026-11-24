@@ -615,7 +615,9 @@ pub(crate) mod tests {
             body_commitment: body.commitment(),
             state_root,
             statement,
-            aux: [0; 32],
+            // (What the chain it is made on votes for, as a miner's
+            // header has it: nothing, unless a test set it.)
+            aux: chain.aux_root().unwrap(),
             mix: d(0),
             nonce: [0; 32],
         };

@@ -306,6 +306,42 @@ impl Current {
         Current { mode: Mode::Init, winner: None, file: None, skipped }
     }
 
+    /// What is still wanted before it is known which file is in force,
+    /// if anything is: the files voted for that are not held and would
+    /// be in force if they were sound, and how many blocks' votes are
+    /// missing where those could change which file has most, or
+    /// whether enough voted at all. `None`: it is known, whatever else
+    /// is lacking.
+    ///
+    /// A node that decided without these would hold another file to be
+    /// in force than the rest do, or none, for as long as it was kept
+    /// from them: so it does not decide, and keeps to what it knew.
+    /// (Where no more than half the window's blocks could have voted,
+    /// counting those whose votes are missing, nothing is in force and
+    /// nothing is waited for: a network that is beginning.)
+    pub fn undecided(&self, votes: &Votes, of: u32) -> Option<(Vec<Hash>, u32)> {
+        let (needed, cast, missing) = (Self::needed(of), votes.cast(), votes.missing.len() as u32);
+        if cast + missing < needed {
+            return None;
+        }
+        // (Votes that are missing matter if they could bring the count
+        // to what is needed, or take the first place from whichever
+        // has it: all of them for the second, or for one with none.)
+        let lead = match votes.counts[..] {
+            [] => 0,
+            [first] => first.1,
+            [first, second, ..] => first.1 - second.1,
+        };
+        let votes_wanted = if missing > 0 && (cast < needed || lead <= missing) { missing } else { 0 };
+        // (A file not held counts once enough have voted; before that,
+        // only the missing votes could make it count.)
+        let files: Vec<Hash> = match cast + votes_wanted >= needed {
+            true => self.unfetched().copied().collect(),
+            false => Vec::new(),
+        };
+        (!files.is_empty() || votes_wanted > 0).then_some((files, votes_wanted))
+    }
+
     /// The files to fetch: voted for more than the winner, not held.
     pub fn unfetched(&self) -> impl Iterator<Item = &Hash> {
         self.skipped.iter().filter(|s| s.2 == Skip::NotHeld).map(|s| &s.0)
@@ -340,6 +376,50 @@ mod tests {
         let more = Votes::tally((1, 3), [(id(1), 1, Some(b)), (id(2), 2, Some(b)), (id(3), 3, Some(a))].into_iter());
         assert_eq!(more.counts, vec![(b, 2, 2), (a, 1, 3)]);
         assert_eq!(Votes::tally((0, 0), std::iter::empty()), Votes { range: (0, 0), ..Votes::default() });
+    }
+
+    /// Which file is in force is not decided while a file that would
+    /// be is not held, or votes are missing that could change the
+    /// count; and is, when neither could matter.
+    #[test]
+    fn what_is_in_force_is_not_decided_while_it_could_be_otherwise() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let file = b"mode init\n".to_vec();
+        // Of a window of ten: `for_a` votes for a, `for_b` for b,
+        // `missing` blocks whose votes are not had, the rest for none.
+        let tally = |for_a: u32, for_b: u32, missing: u32| {
+            let blocks = (0..10u32).map(|i| {
+                let vote = match i {
+                    i if i < for_a => Some(a),
+                    i if i < for_a + for_b => Some(b),
+                    i if i < for_a + for_b + missing => None,
+                    _ => Some([0u8; 32]),
+                };
+                (id(i), i, vote)
+            });
+            Votes::tally((0, 9), blocks)
+        };
+        let decide = |votes: &Votes, held: &[Hash]| {
+            let current = Current::decide(votes, 10, |hash| held.contains(hash).then(|| file.clone()));
+            current.undecided(votes, 10)
+        };
+        // Nobody votes, or too few could have: known, with nothing had.
+        assert_eq!(decide(&tally(0, 0, 0), &[]), None);
+        assert_eq!(decide(&tally(3, 0, 2), &[]), None);
+        // Enough voted for a file that is not held: that file is wanted.
+        assert_eq!(decide(&tally(7, 0, 0), &[]), Some((vec![a], 0)));
+        assert_eq!(decide(&tally(7, 0, 0), &[a]), None);
+        // The most voted is not held, and a lesser one is: still wanted.
+        assert_eq!(decide(&tally(4, 2, 0), &[b]), Some((vec![a], 0)));
+        assert_eq!(decide(&tally(4, 2, 0), &[a]), None);
+        // Votes missing that could bring the count to what is needed.
+        assert_eq!(decide(&tally(4, 0, 3), &[a]), Some((vec![], 3)));
+        assert_eq!(decide(&tally(4, 0, 3), &[]), Some((vec![a], 3)));
+        // Votes missing that could change which has most; and that
+        // could not.
+        assert_eq!(decide(&tally(4, 3, 2), &[a, b]), Some((vec![], 2)));
+        assert_eq!(decide(&tally(6, 1, 2), &[a, b]), None);
+        assert_eq!(decide(&tally(6, 0, 2), &[a]), None);
     }
 
     #[test]

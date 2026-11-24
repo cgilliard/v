@@ -625,8 +625,34 @@ should weigh more in the fee (19).
     the file in force (it was not running when the other was); and
     whoever sends does not try the other file's nodes when the first
     do not answer.
-  - The rest of this entry (a file kept back from some nodes) is as
-    it was.
+- **Done, of what was decided above:**
+  - A node does not decide which file is in force while it could be
+    otherwise (`consensus::Current::undecided`): while a file voted
+    for is not held that would be in force if it were sound, or the
+    votes of blocks are missing that could bring the count to what
+    is needed or change which file has most. Where no more than half
+    the window could have voted, counting the missing, nothing is
+    waited for: init mode, for certain. And as soon as what is
+    missing could no longer change it, it is decided, with the rest
+    still to come.
+  - While it is not decided the node keeps to what it knew, and says
+    so once in its log, with what it waits for. `consensus` says
+    `Mode: not known yet`, the files and votes waited for, and
+    whether the node has a file it knew to go by. A node that never
+    knew sends nothing by the message layer, and `send` says why
+    (`send-file` works as ever).
+  - A file voted for and not held is asked of three peers at once,
+    each in turn; the votes as before, sixteen blocks' at a time.
+  - Never init mode by waiting: a node kept from the votes and the
+    file goes on not knowing. (`what_is_in_force_is_not_decided_without_the_votes_and_the_file`.)
+- **Not done:** a block's values travelling with the block (they are
+  still asked for after it); a node seeking further peers for a file
+  none of its own will give; the times, which are as they were (asked
+  again every 2 s). And what follows from never deciding by waiting:
+  a miner that makes enough of the blocks and gives nobody its votes
+  can keep the file in force as it was for as long as it does, where
+  the count is close; and nodes started meanwhile do not know. It
+  cannot bring in a file of its own that way.
 
 ### 19. How long a block takes to prove, and more with a transaction in it
 

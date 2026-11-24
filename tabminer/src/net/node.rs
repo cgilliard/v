@@ -459,6 +459,9 @@ const TAKEN: usize = 1024;
 
 /// Blocks whose leaves are asked for at one looking.
 const LEAVES_AT_ONCE: usize = 16;
+/// How many peers a consensus file that is voted for and not held is
+/// asked of at once.
+const FILE_ASKED_OF: usize = 3;
 
 /// Parts of a state put together at the most.
 const PARTS_AT_ONCE: usize = 64;
@@ -763,6 +766,11 @@ pub(crate) struct Shared {
     /// The consensus file last said to be in force: its mode, and the
     /// file's hash if there is one.
     consensus: Mutex<Option<(crate::consensus::Mode, Option<crate::consensus::Hash>)>>,
+    /// What is still wanted before it is known which consensus file is
+    /// in force, while that is not known: the files voted for and not
+    /// held, and how many blocks' votes are missing
+    /// ([`crate::consensus::Current::undecided`]).
+    undecided: Mutex<Option<(Vec<crate::consensus::Hash>, u32)>>,
     /// The peers of each worker that have answered it, as it last
     /// said: for whoever keeps them from one run to the next
     /// ([`Handle::answered`]).
@@ -917,6 +925,10 @@ pub enum Event {
     /// A message has come for this node's wallet
     /// ([`Handle::take_messages`]).
     Mail,
+    /// Which consensus file is in force is not known yet: these files
+    /// are voted for and not held, and the votes of so many blocks are
+    /// missing. The node keeps to what it knew.
+    ConsensusUnknown { files: Vec<crate::consensus::Hash>, votes: u32 },
     /// Another consensus file is in force, or none: the mode the
     /// message layer is in from here on.
     Consensus { mode: crate::consensus::Mode, file: Option<crate::consensus::Hash> },
@@ -934,6 +946,14 @@ pub type Told = Box<dyn Fn(&Event) + Send + Sync>;
 pub(crate) type Waker = Box<dyn Fn(usize) + Send + Sync>;
 
 impl Shared {
+    /// Whether the node has a consensus file to go by (or knows there
+    /// is none): what it decided, or, while that is not decided, what
+    /// it knew before. Not, of a node that has never known.
+    fn knows_consensus(&self) -> bool {
+        let undecided = self.undecided.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        !undecided || self.consensus.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
     /// The worker `addr` belongs to: by its host, whatever the port.
     fn owner(&self, addr: &SocketAddrV4) -> usize {
         if self.mail.len() == 1 {
@@ -2541,6 +2561,12 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
     /// node if it is not known.
     fn send_posts(&mut self, now: Micros, out: Out<'_>) {
         use super::sessions::POST_RETRY;
+        // (Not while it is not known by which nodes to send: a node
+        // that has never known which consensus file is in force. What
+        // waits to be sent waits.)
+        if !self.shared.knows_consensus() {
+            return;
+        }
         let relays = self.relays_to_send_by();
         if !relays.is_empty() {
             return self.send_posts_by_ways(now, &relays);
@@ -2806,10 +2832,28 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
         if self.votes.as_ref().is_none_or(|v| v.0 != key) {
             let Ok((current, decided)) = self.chain.consensus() else { return };
             let Ok(running) = self.chain.consensus_votes(WINDOW) else { return };
+            // Not known, while a file that would be in force is not
+            // held or votes are missing that could change the count:
+            // the node keeps to what it knew, and says so, and what it
+            // lacks is asked for below. (To decide without them would
+            // be to go by another file than the rest do, or by none,
+            // for as long as a peer cared to keep them back.)
+            let lacking = match self.shared.forced.load(Ordering::Relaxed) {
+                true => None,
+                false => current.undecided(&decided, WINDOW),
+            };
+            let was = std::mem::replace(
+                &mut *self.shared.undecided.lock().unwrap_or_else(|e| e.into_inner()),
+                lacking.clone(),
+            );
+            if lacking.is_some() && was != lacking {
+                let (files, votes) = lacking.clone().expect("it is some");
+                self.shared.say(Event::ConsensusUnknown { files, votes });
+            }
             // What is in force, said when it is another than was last said.
             let now_is = (current.mode, current.winner.map(|w| w.0));
             let mut said = self.shared.consensus.lock().unwrap_or_else(|e| e.into_inner());
-            if *said != Some(now_is) {
+            if lacking.is_none() && *said != Some(now_is) {
                 let changed = said.is_some();
                 // (Not of a node that has only just started, in init mode
                 // like every other: that is no news.)
@@ -2870,12 +2914,17 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Worker<B, V> {
             self.send(peer, &Message::GetLeaves { token, id: *id }, out);
         }
         // The files voted for that are not held: one at a time.
+        // (Of a few peers at once, each in its turn: one that keeps it
+        // back, or does not have it, does not hold the others up.)
         if let Some(hash) = wanted {
             let object = Object::File(file_id(&hash));
-            if !self.fetches.iter().any(|f| f.object == object) {
+            for _ in 0..FILE_ASKED_OF.min(peers.len()) {
                 self.votes_turn = self.votes_turn.wrapping_add(1);
                 let peer = peers[self.votes_turn % peers.len()].0;
-                self.fetch_object(now, object, peer, MAX_CONSENSUS as u32);
+                let asked = self.fetches.iter().filter(|f| f.object == object);
+                if asked.clone().count() < FILE_ASKED_OF && !asked.clone().any(|f| f.from == peer) {
+                    self.fetch_object(now, object, peer, MAX_CONSENSUS as u32);
+                }
             }
         }
     }
@@ -5538,6 +5587,7 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Node<B, V> {
             delivering: Mutex::default(),
             givers: Mutex::default(),
             forced: AtomicBool::new(false),
+            undecided: Mutex::default(),
             leaving: Mutex::default(),
             key: u64::from_le_bytes(derive(&secret, b'h', 0)[..8].try_into().unwrap()),
             token_secret: derive(&secret, b'T', 0),
@@ -6041,6 +6091,15 @@ impl<B: Backend + 'static, V: ProofVerifier + Sync> Handle<B, V> {
     #[cfg(test)]
     pub(crate) fn node_number(&self) -> u64 {
         self.shared.node
+    }
+
+    /// What is still wanted before it is known which consensus file is
+    /// in force, if it is not known: the files voted for and not held,
+    /// how many blocks' votes are missing, and whether the node has
+    /// something to go by meanwhile (what it knew before).
+    pub fn consensus_lacking(&self) -> Option<(Vec<crate::consensus::Hash>, u32, bool)> {
+        let lacking = self.shared.undecided.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        lacking.map(|(files, votes)| (files, votes, self.shared.knows_consensus()))
     }
 
     /// Says what a name says, in the chain's place.

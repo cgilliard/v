@@ -781,6 +781,23 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             skip => format!(" ({skip})"),
         };
         let height = self.hold.read().height;
+        // While it is not known which file is in force (one that would
+        // be is not held, or votes are missing that could change the
+        // count), that is what is said: with what is waited for, and
+        // whether the node has what it knew before to go by.
+        if let Some((files, missing, goes_by)) = self.hold.consensus_lacking() {
+            let mut lines = vec!["Mode: not known yet".to_string()];
+            lines.extend(files.iter().map(|hash| format!("Waiting for file: {}", hex(hash))));
+            if missing > 0 {
+                lines.push(format!("Waiting for votes: of {} blocks", commas(missing as u64)));
+            }
+            lines.push(match goes_by {
+                true => "Until then: the node goes by the file it knew".to_string(),
+                false => "Until then: nothing is sent by the message layer".to_string(),
+            });
+            lines.push(format!("Next decision block: {}", commas((boundary(height) + WINDOW) as u64)));
+            return Ok(lines.join("\n"));
+        }
         let mut lines = vec![format!("Mode: {}", current.mode)];
         if let Some((hash, _)) = &current.winner {
             lines.push(format!("File: {}", hex(hash)));
@@ -1678,6 +1695,12 @@ impl<B: Backend + 'static, W: Backend, V: crate::chain::verify::ProofVerifier + 
             Some(n) => n,
             None => self.whom(to)?,
         };
+        // (Not while the node does not know by which nodes to send.)
+        if let Some((_, _, false)) = self.hold.consensus_lacking() {
+            return Err("the node does not know yet which consensus file is in force, and so not by which nodes \
+                        to send: wait until it does (see consensus), or pay by file (send-file)"
+                .into());
+        }
         let fee = self.fee(fee)?;
         // (To this wallet itself, if that is what is asked: a payment
         // that shows the wallet is reached, or makes its outputs one.)

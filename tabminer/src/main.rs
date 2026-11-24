@@ -197,6 +197,18 @@ fn said(event: &Event) -> Option<String> {
             hash[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()
         ),
         Event::Mail => return None,
+        Event::ConsensusUnknown { files, votes } => {
+            let mut wanted: Vec<String> =
+                files.iter().map(|hash| format!("the consensus file {}", hex(hash))).collect();
+            if *votes > 0 {
+                wanted.push(format!("the votes of {} blocks", commas(*votes as u64)));
+            }
+            format!(
+                "Which consensus file is in force is not known yet: {} voted for and not had. \
+                 Asked of the peers; until then the node goes by what it knew",
+                wanted.join(", and ")
+            )
+        }
         Event::Consensus { mode, file: None } => {
             format!("The message layer is in {mode} mode: no consensus file is in force")
         }

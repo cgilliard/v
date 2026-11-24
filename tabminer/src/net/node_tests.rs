@@ -2667,6 +2667,62 @@ fn wallets_by_ways(loss: u64) {
     assert_eq!(posted, [(nobody, crate::msg::KIND_SLATE, [9; 32], Posted::Offline)]);
 }
 
+/// A node does not decide which consensus file is in force while it
+/// could be otherwise: while the votes of blocks are missing that
+/// could change the count, or the file with the votes is not held. It
+/// says that it does not know, sends nothing by the message layer if
+/// it never knew, and asks its peers; kept from the votes and the
+/// file, it goes on not knowing, and does not take up init mode for
+/// want of them. When it has them, it knows.
+#[test]
+fn what_is_in_force_is_not_decided_without_the_votes_and_the_file() {
+    use crate::consensus::{Mode, WINDOW};
+    let chains = vec![chain_of(easy()), chain_of(easy())];
+    // The first makes a window of blocks that vote for a file it has.
+    let relays: String =
+        (1..=3u8).map(|i| format!("relay {} 10.0.0.{i}:3737\n", crate::address::encode(&[i; 32]))).collect();
+    let file = format!("mode onion\n{relays}");
+    let vote = chains[0].put_consensus_file(file.as_bytes()).unwrap();
+    chains[0].set_aux_leaf(0, vote).unwrap();
+    let leaves = chains[0].aux_leaves().unwrap();
+    let made = grow(&chains[0], WINDOW as usize + 1, 1);
+    for block in &made {
+        let id = crate::block::BlockRef::from_bytes(block).unwrap().header().hash();
+        chains[0].put_aux_leaves(&id, &leaves).unwrap();
+    }
+    assert_eq!(chains[0].consensus().unwrap().0.mode, Mode::Onion);
+    // The second has the blocks, and neither their votes nor the file.
+    give(&chains[1], &made);
+    let mut w = World::with(chains.clone(), &Config::default());
+    w.nodes[1].add_peer(at(0), false, 0);
+    w.nodes[0].add_peer(at(1), false, 0);
+    // Its one peer says nothing of them.
+    w.mute = vec![0];
+    w.run(60 * SECOND);
+    let hold = w.nodes[1].hold();
+    assert_eq!(hold.consensus_lacking(), Some((vec![], WINDOW, false)));
+    // (Left to itself it would have counted nobody as voting, and
+    // taken up init mode: which here is to be wrong for as long as a
+    // peer cares to say nothing.)
+    assert_eq!(chains[1].consensus().unwrap().0.mode, Mode::Init);
+    // The peer gives: the votes, then the file they are for.
+    w.mute.clear();
+    let began = w.now;
+    while hold.consensus_lacking().is_some() {
+        assert!(w.now - began < 300 * SECOND, "still not known: {:?}", hold.consensus_lacking());
+        w.run(SECOND);
+    }
+    // (As soon as the votes still missing could not change it: with
+    // more for the file than there are left to come.)
+    let (current, votes) = chains[1].consensus().unwrap();
+    let (file, for_it) = current.winner.unwrap();
+    assert_eq!((current.mode, file), (Mode::Onion, vote));
+    assert!(for_it > votes.missing.len() as u32 && for_it >= crate::consensus::Current::needed(WINDOW));
+    // And the rest of the votes come all the same.
+    w.run(60 * SECOND);
+    assert_eq!(chains[1].consensus().unwrap().1.missing.len(), 0);
+}
+
 /// One consensus file gives way to the next at a block, and each node
 /// goes over when it has that block: not all at the same moment. So
 /// for a few blocks a wallet is reached by the relays of both, and
